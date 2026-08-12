@@ -562,5 +562,9 @@ def build_project_scenes(storage, project_id: object, parse_srt: Callable[[str],
         raise SceneConstructionError("Accepted lyrics metadata does not match the project SRT file.")
 
     scenes = build_scenes(cues, master_audio["duration_ms"])
-    candidate = {**project, "scenes": scenes}
-    return storage.save_project(project_id, candidate)
+    candidate = {
+        **project,
+        "scenes": scenes,
+        "storyboard": {"request_fingerprint": None, "scenes": []},
+    }
+    return storage.save_project(project_id, candidate, allow_storyboard_change=True)

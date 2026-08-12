@@ -25,7 +25,7 @@ class ProjectStorageTests(unittest.TestCase):
     def test_schema_validation_accepts_new_project_and_rejects_invalid_values(self):
         project = self.storage.create_project("  Valid Project  ")
         self.assertEqual(project["name"], "Valid Project")
-        self.assertEqual(project["schema_version"], 3)
+        self.assertEqual(project["schema_version"], 4)
         self.assertEqual(project["source"], {"master_audio": None, "lyrics_srt": None})
         self.assertEqual(project["scenes"], [])
         self.assertEqual(project["characters"], [])

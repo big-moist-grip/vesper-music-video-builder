@@ -85,7 +85,7 @@ class ProjectSchemaV2Tests(Phase2TestCase):
 
         loaded = self.storage.load_project(project["project_id"])
 
-        self.assertEqual(loaded["schema_version"], 3)
+        self.assertEqual(loaded["schema_version"], 4)
         self.assertEqual(loaded["project_id"], legacy["project_id"])
         self.assertEqual(loaded["created_at"], legacy["created_at"])
         self.assertEqual(loaded["updated_at"], legacy["updated_at"])
@@ -95,7 +95,7 @@ class ProjectSchemaV2Tests(Phase2TestCase):
         self.assertEqual(loaded["locations"], [])
         self.assertEqual(json.loads(project_file.read_text(encoding="utf-8")), legacy)
 
-    def test_legacy_save_upgrades_to_v3(self):
+    def test_legacy_save_upgrades_to_v4(self):
         project = self.storage.create_project("Legacy Save")
         project_file = self.projects_root / project["project_id"] / "project.json"
         legacy = {
@@ -109,9 +109,9 @@ class ProjectSchemaV2Tests(Phase2TestCase):
 
         saved = self.storage.save_project(project["project_id"], {**legacy, "name": "Upgraded"})
 
-        self.assertEqual(saved["schema_version"], 3)
+        self.assertEqual(saved["schema_version"], 4)
         self.assertEqual(saved["name"], "Upgraded")
-        self.assertEqual(json.loads(project_file.read_text(encoding="utf-8"))["schema_version"], 3)
+        self.assertEqual(json.loads(project_file.read_text(encoding="utf-8"))["schema_version"], 4)
 
     def test_invalid_current_source_and_scene_data_is_rejected(self):
         project = self.storage.create_project("Invalid v2")

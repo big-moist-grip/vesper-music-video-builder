@@ -18,9 +18,10 @@ from .scenes import SceneValidationError, validate_scene_list
 
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LEGACY_SCHEMA_VERSION = 1
 LEGACY_SCHEMA_VERSION_2 = 2
+LEGACY_SCHEMA_VERSION_3 = 3
 PROJECT_FILENAME = "project.json"
 DEFAULT_PROJECTS_ROOT = Path(
     r"D:\User Folders\Documents\Projects\vesper-music-video-builder\projects"
@@ -43,7 +44,7 @@ REQUIRED_PROJECT_DIRECTORIES = (
 SUPPORTED_AUDIO_EXTENSIONS = frozenset({".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus"})
 LEGACY_PROJECT_FIELDS = ("schema_version", "project_id", "name", "created_at", "updated_at")
 V2_PROJECT_FIELDS = LEGACY_PROJECT_FIELDS + ("source", "scenes")
-PROJECT_FIELDS = (
+V3_PROJECT_FIELDS = (
     "schema_version",
     "project_id",
     "name",
@@ -54,6 +55,7 @@ PROJECT_FIELDS = (
     "characters",
     "locations",
 )
+PROJECT_FIELDS = V3_PROJECT_FIELDS + ("story_direction", "storyboard")
 SOURCE_FIELDS = ("master_audio", "lyrics_srt")
 MASTER_AUDIO_FIELDS = ("stored_name", "original_name", "duration_ms")
 LYRICS_SRT_FIELDS = ("stored_name", "original_name", "cue_count")
@@ -64,6 +66,14 @@ CHARACTER_ROLES = frozenset({"performer", "band_member", "extra"})
 _MASTER_AUDIO_NAME_PATTERN = re.compile(r"^master_audio\.[a-z0-9]+$")
 _REFERENCE_EXTENSIONS = frozenset({".png", ".jpg", ".webp"})
 _INVALID_PROJECT_SIGNATURE_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _empty_story_direction() -> dict[str, str]:
+    return {
+        "storyboard_mode": "loose",
+        "story_brief": "",
+        "visual_notes": "",
+    }
 
 
 class ProjectError(Exception):
@@ -242,6 +252,8 @@ def _validate_legacy_project(document: dict[str, object]) -> dict[str, object]:
         "scenes": [],
         "characters": [],
         "locations": [],
+        "story_direction": _empty_story_direction(),
+        "storyboard": {"request_fingerprint": None, "scenes": []},
     }
 
 
@@ -269,6 +281,41 @@ def _validate_v2_project(document: dict[str, object]) -> dict[str, object]:
         "scenes": scenes,
         "characters": [],
         "locations": [],
+        "story_direction": _empty_story_direction(),
+        "storyboard": {"request_fingerprint": None, "scenes": []},
+    }
+
+
+def _validate_v3_project(document: dict[str, object]) -> dict[str, object]:
+    schema_version = document.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != LEGACY_SCHEMA_VERSION_3:
+        raise ProjectValidationError("Unsupported project schema version.")
+
+    base = _validate_base_project(document, V3_PROJECT_FIELDS)
+    source = _validate_source(document.get("source"))
+    scenes = document.get("scenes")
+    if not isinstance(scenes, list):
+        raise ProjectValidationError("Project scenes must be an array.")
+    if scenes:
+        if source["master_audio"] is None or source["lyrics_srt"] is None:
+            raise ProjectValidationError("Built scenes require master audio and lyrics SRT metadata.")
+        try:
+            validate_scene_list(scenes, source["master_audio"]["duration_ms"])
+        except SceneValidationError as error:
+            raise ProjectValidationError(str(error)) from error
+    characters, locations = _validate_entity_lists(
+        document.get("characters"),
+        document.get("locations"),
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        **base,
+        "source": source,
+        "scenes": scenes,
+        "characters": characters,
+        "locations": locations,
+        "story_direction": _empty_story_direction(),
+        "storyboard": {"request_fingerprint": None, "scenes": []},
     }
 
 
@@ -438,6 +485,8 @@ def validate_project_document(
         normalized = _validate_legacy_project(document)
     elif schema_version == LEGACY_SCHEMA_VERSION_2:
         normalized = _validate_v2_project(document)
+    elif schema_version == LEGACY_SCHEMA_VERSION_3:
+        normalized = _validate_v3_project(document)
     elif schema_version == SCHEMA_VERSION:
         base = _validate_base_project(document, PROJECT_FIELDS)
         source = _validate_source(document.get("source"))
@@ -455,6 +504,15 @@ def validate_project_document(
             document.get("characters"),
             document.get("locations"),
         )
+        from .storyboard import validate_applied_storyboard, validate_story_direction
+
+        story_direction = validate_story_direction(document.get("story_direction"))
+        storyboard = validate_applied_storyboard(
+            document.get("storyboard"),
+            scenes,
+            characters,
+            locations,
+        )
         normalized = {
             "schema_version": SCHEMA_VERSION,
             **base,
@@ -462,6 +520,8 @@ def validate_project_document(
             "scenes": scenes,
             "characters": characters,
             "locations": locations,
+            "story_direction": story_direction,
+            "storyboard": storyboard,
         }
     else:
         raise ProjectValidationError("Unsupported project schema version.")
@@ -536,6 +596,8 @@ class ProjectStorage:
             "scenes": [],
             "characters": [],
             "locations": [],
+            "story_direction": _empty_story_direction(),
+            "storyboard": {"request_fingerprint": None, "scenes": []},
         }
         project_directory = self.projects_root / project_id
         project_file = project_directory / PROJECT_FILENAME
@@ -629,13 +691,20 @@ class ProjectStorage:
         project_directory = self.project_directory(canonical_id)
         return self._read_project(project_directory, canonical_id)
 
-    def save_project(self, project_id: object, document: object) -> dict[str, object]:
+    def save_project(
+        self,
+        project_id: object,
+        document: object,
+        *,
+        allow_storyboard_change: bool = False,
+    ) -> dict[str, object]:
         canonical_id = validate_project_id(project_id)
         project_directory = self.project_directory(canonical_id)
         current = self._read_project(project_directory, canonical_id)
         if isinstance(document, dict) and document.get("schema_version") in {
             LEGACY_SCHEMA_VERSION,
             LEGACY_SCHEMA_VERSION_2,
+            LEGACY_SCHEMA_VERSION_3,
         }:
             current_has_state = (
                 current["source"]["master_audio"] is not None
@@ -643,11 +712,15 @@ class ProjectStorage:
                 or current["scenes"]
                 or current["characters"]
                 or current["locations"]
+                or current["story_direction"] != _empty_story_direction()
+                or current["storyboard"]["scenes"]
             )
             if current_has_state:
                 raise ProjectValidationError("Legacy project data cannot overwrite current project state.")
 
         candidate = validate_project_document(document, expected_project_id=canonical_id)
+        if not allow_storyboard_change:
+            candidate["storyboard"] = current["storyboard"]
         candidate["created_at"] = current["created_at"]
 
         current_updated_at = parse_timestamp(current["updated_at"])

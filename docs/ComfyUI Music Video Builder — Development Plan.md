@@ -147,10 +147,20 @@ Each location contains:
 
 ## Stage D — Story direction
 
-Optional:
+Persisted Story Direction contains:
 
-- Short music-video story brief.
-- Overall visual/directional notes.
+- `storyboard_mode`:
+  - `loose` — default. Lyrics provide emotional information, broad narrative/theme information, song structure, and intensity/pacing cues. The Director may construct a coherent song-level concept that is not a literal scene-by-scene lyric illustration; mundane lyrical nouns do not automatically require matching props or locations.
+  - `strict` — lyrics have close visual influence. Concrete lyrical events, objects, environments, and changes should materially inform corresponding scenes where practical while preserving coherence and continuity.
+  - `band_performance` — the storyboard has no narrative storyline. Every scene allocation is `performance`, focused on vocal/instrumental performance, performer or band-member coverage, shot scale, camera movement, physical intensity, staging, lighting, atmosphere, and musical pacing. Lyrics may guide performance intensity, expression, emphasis, and pacing but do not create narrative objects, events, symbolic reenactments, or unrelated story scenes.
+- `story_brief`.
+- `visual_notes`.
+
+Default:
+
+- `storyboard_mode = loose`.
+
+The mode is creative storyboard direction and participates in the deterministic storyboard-request fingerprint. It is not the later per-scene generation-method choice. Phase 5 independently selects `keyframe_i2v` or `reference2video` for each scene.
 
 Builder produces a strict storyboard-request JSON payload.
 
@@ -179,6 +189,8 @@ Returned JSON allocates:
 - Continuity notes.
 - References relevant to the scene.
 - Keyframe instructions where useful for the default keyframe workflow.
+
+When `storyboard_mode = band_performance`, response validation requires every scene allocation to use `scene_type = performance`.
 
 Importer must reject before mutation:
 
@@ -1125,7 +1137,9 @@ Implement:
 
 Implement:
 
+- Persisted Story Direction with `storyboard_mode` values `loose`, `strict`, and `band_performance`; default `loose`.
 - Story brief.
+- Visual/directional notes.
 - Storyboard request JSON.
 - Copy.
 - Response paste/import.
@@ -1135,7 +1149,9 @@ Implement:
 - Persistence.
 - Visual/reference instructions that remain usable by either later generation method.
 
-The ChatGPT storyboard relay does not own the final generation-method choice.
+`storyboard_mode` participates in the request fingerprint and communicates the creative direction to the dedicated Storyboard Director. `band_performance` remains storyboard-level creative direction and requires performance-only scene allocations; it is not `generation_method`.
+
+The ChatGPT storyboard relay does not own the final generation-method choice. Phase 5 independently chooses `keyframe_i2v` or `reference2video` per scene.
 
 Visuals defaults scenes to `keyframe_i2v`; the user can later override any scene to `reference2video`.
 

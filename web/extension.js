@@ -5,6 +5,11 @@ const NODE_CLASS = "MusicVideoBuilder";
 const STYLESHEET_ID = "music-video-builder-styles";
 const PROJECTS_PATH = "/music-video-builder/projects";
 const AUTOSAVE_DELAY_MS = 700;
+const STORYBOARD_MODE_HELP = {
+    loose: "Interpret the song freely; lyrics guide emotion and structure rather than dictating each shot.",
+    strict: "Keep the visuals closely aligned to the lyrical content and sequence.",
+    band_performance: "Build a performance-only video with no narrative storyline.",
+};
 
 const NODE_COLORS = {
     title: "#73572d",
@@ -79,9 +84,11 @@ function hasValidHealthPayload(payload) {
 
 function hasProjectDocument(payload) {
     const source = payload?.source;
+    const storyDirection = payload?.story_direction;
+    const storyboard = payload?.storyboard;
     return payload !== null
         && typeof payload === "object"
-        && payload.schema_version === 3
+        && payload.schema_version === 4
         && typeof payload.project_id === "string"
         && typeof payload.name === "string"
         && typeof payload.created_at === "string"
@@ -93,7 +100,19 @@ function hasProjectDocument(payload) {
         && Object.prototype.hasOwnProperty.call(source, "lyrics_srt")
         && Array.isArray(payload.scenes)
         && Array.isArray(payload.characters)
-        && Array.isArray(payload.locations);
+        && Array.isArray(payload.locations)
+        && storyDirection !== null
+        && typeof storyDirection === "object"
+        && Object.keys(storyDirection).length === 3
+        && typeof storyDirection.storyboard_mode === "string"
+        && Object.prototype.hasOwnProperty.call(STORYBOARD_MODE_HELP, storyDirection.storyboard_mode)
+        && typeof storyDirection.story_brief === "string"
+        && typeof storyDirection.visual_notes === "string"
+        && storyboard !== null
+        && typeof storyboard === "object"
+        && Object.keys(storyboard).length === 2
+        && (storyboard.request_fingerprint === null || typeof storyboard.request_fingerprint === "string")
+        && Array.isArray(storyboard.scenes);
 }
 
 async function fetchJson(path, options = {}) {
@@ -180,6 +199,12 @@ function setCurrentProject(root, project) {
     builderState.setupState = project ? "ready" : "empty";
     builderState.setupMessage = "";
     builderState.storyboardMessage = "";
+    builderState.storyboardRequest = null;
+    builderState.storyboardRequestStale = Boolean(project?.storyboard?.scenes?.length);
+    builderState.storyboardResponseText = "";
+    builderState.storyboardPreview = null;
+    builderState.storyboardRelayMessage = "";
+    builderState.storyboardRelayState = "ready";
     builderState.deleteConfirm = null;
 }
 
@@ -512,6 +537,223 @@ function appendLocationCard(root, location) {
     return card;
 }
 
+function findCharacter(project, characterId) {
+    return project.characters.find((character) => character.character_id === characterId) || null;
+}
+
+function findLocation(project, locationId) {
+    return project.locations.find((location) => location.location_id === locationId) || null;
+}
+
+function storyboardStatus(project) {
+    if (!project?.storyboard?.scenes?.length) {
+        return "No storyboard applied";
+    }
+    return builderState.storyboardRequestStale ? "Out of date" : "Applied";
+}
+
+function setStoryboardRelayMessage(message, state = "success") {
+    builderState.storyboardRelayMessage = message;
+    builderState.storyboardRelayState = message ? state : "ready";
+}
+
+function invalidateStoryboardRequestForDirectionEdit() {
+    builderState.storyboardRequest = null;
+    builderState.storyboardPreview = null;
+    builderState.storyboardRequestStale = Boolean(builderState.currentProject?.storyboard?.scenes?.length);
+    setStoryboardRelayMessage("");
+}
+
+function appendStoryboardPreviewField(parent, label, value) {
+    const field = document.createElement("div");
+    field.className = "mvb-storyboard-preview-field";
+    const labelElement = document.createElement("span");
+    labelElement.className = "mvb-storyboard-preview-label";
+    labelElement.textContent = label;
+    const valueElement = document.createElement("span");
+    valueElement.className = "mvb-storyboard-preview-value";
+    valueElement.textContent = value || "—";
+    field.append(labelElement, valueElement);
+    parent.append(field);
+}
+
+function renderStoryboardPreview(root) {
+    if (!isActive(root)) {
+        return;
+    }
+
+    const preview = root.querySelector("[data-mvb-storyboard-preview]");
+    const empty = root.querySelector("[data-mvb-storyboard-preview-empty]");
+    const rows = root.querySelector("[data-mvb-storyboard-preview-rows]");
+    const previewState = root.querySelector("[data-mvb-storyboard-preview-state]");
+    if (!preview || !empty || !rows || !previewState) {
+        return;
+    }
+
+    const project = builderState.currentProject;
+    const storyboard = builderState.storyboardPreview || project?.storyboard;
+    const storyboardScenes = storyboard?.scenes || [];
+    rows.replaceChildren();
+    preview.hidden = false;
+    empty.hidden = storyboardScenes.length > 0;
+    previewState.textContent = builderState.storyboardPreview
+        ? "Validated preview — not yet applied"
+        : storyboardScenes.length
+            ? storyboardStatus(project)
+            : "No applied scene allocations";
+    previewState.dataset.state = builderState.storyboardPreview
+        ? "preview"
+        : storyboardScenes.length && builderState.storyboardRequestStale
+            ? "warning"
+            : "ready";
+
+    if (!project) {
+        return;
+    }
+
+    const scenesById = new Map(project.scenes.map((scene) => [scene.scene_id, scene]));
+    for (const [index, storyboardScene] of storyboardScenes.entries()) {
+        const renderScene = scenesById.get(storyboardScene.scene_id);
+        const card = document.createElement("article");
+        card.className = "mvb-storyboard-preview-scene";
+
+        const heading = document.createElement("div");
+        heading.className = "mvb-storyboard-preview-heading";
+        const title = document.createElement("h4");
+        title.textContent = `Scene ${String(index + 1).padStart(2, "0")}`;
+        const timeline = document.createElement("span");
+        timeline.textContent = renderScene
+            ? `${formatTimelineMs(renderScene.timeline_start_ms)} → ${formatTimelineMs(renderScene.timeline_end_ms)}`
+            : "Timeline unavailable";
+        heading.append(title, timeline);
+        card.append(heading);
+
+        const context = document.createElement("p");
+        context.className = "mvb-storyboard-preview-context";
+        context.textContent = renderScene
+            ? renderScene.source_kind === "lyric"
+                ? `Lyric · ${renderScene.lyric || "No lyric text"}`
+                : "Instrumental"
+            : "Current render scene unavailable";
+        card.append(context);
+
+        const fields = document.createElement("div");
+        fields.className = "mvb-storyboard-preview-fields";
+        appendStoryboardPreviewField(fields, "Type", storyboardScene.scene_type);
+        appendStoryboardPreviewField(
+            fields,
+            "Characters",
+            storyboardScene.character_ids
+                .map((characterId) => findCharacter(project, characterId)?.name || "Unknown character")
+                .join(", "),
+        );
+        appendStoryboardPreviewField(
+            fields,
+            "Location",
+            storyboardScene.location_id
+                ? findLocation(project, storyboardScene.location_id)?.name || "Unknown location"
+                : "—",
+        );
+        appendStoryboardPreviewField(fields, "Action", storyboardScene.action);
+        appendStoryboardPreviewField(fields, "Visual", storyboardScene.visual_instructions);
+        appendStoryboardPreviewField(fields, "Camera", storyboardScene.camera_direction);
+        appendStoryboardPreviewField(fields, "Motion", storyboardScene.motion_direction);
+        appendStoryboardPreviewField(fields, "Continuity", storyboardScene.continuity_notes);
+        appendStoryboardPreviewField(
+            fields,
+            "References",
+            storyboardScene.required_references.map((selector) => {
+                const entity = selector.entity_type === "character"
+                    ? findCharacter(project, selector.entity_id)
+                    : findLocation(project, selector.entity_id);
+                const reference = entity?.references.find((item) => item.reference_id === selector.reference_id);
+                return entity && reference ? `${entity.name} · ${reference.original_name}` : "Unknown reference";
+            }).join(", "),
+        );
+        card.append(fields);
+        rows.append(card);
+    }
+}
+
+function renderStoryboardRelay(root) {
+    if (!isActive(root)) {
+        return;
+    }
+
+    const project = builderState.currentProject;
+    const direction = project?.story_direction || {
+        storyboard_mode: "loose",
+        story_brief: "",
+        visual_notes: "",
+    };
+    const brief = root.querySelector("[data-mvb-story-brief]");
+    const visualNotes = root.querySelector("[data-mvb-visual-notes]");
+    const storyboardMode = root.querySelector("[data-mvb-storyboard-mode]");
+    const storyboardModeHelp = root.querySelector("[data-mvb-storyboard-mode-help]");
+    const requestPreview = root.querySelector("[data-mvb-request-json]");
+    const responseInput = root.querySelector("[data-mvb-response-json]");
+    const requestButton = root.querySelector("[data-mvb-generate-request]");
+    const copyButton = root.querySelector("[data-mvb-copy-request]");
+    const validateButton = root.querySelector("[data-mvb-validate-response]");
+    const clearPasteButton = root.querySelector("[data-mvb-clear-paste]");
+    const applyButton = root.querySelector("[data-mvb-apply-storyboard]");
+    const clearButton = root.querySelector("[data-mvb-clear-storyboard]");
+    const status = root.querySelector("[data-mvb-storyboard-relay-status]");
+    if (!brief || !visualNotes || !storyboardMode || !storyboardModeHelp || !requestPreview || !responseInput || !requestButton || !copyButton || !validateButton || !clearPasteButton || !applyButton || !clearButton || !status) {
+        return;
+    }
+
+    if (document.activeElement !== storyboardMode && storyboardMode.value !== direction.storyboard_mode) {
+        storyboardMode.value = direction.storyboard_mode;
+    }
+    if (document.activeElement !== brief && brief.value !== direction.story_brief) {
+        brief.value = direction.story_brief;
+    }
+    if (document.activeElement !== visualNotes && visualNotes.value !== direction.visual_notes) {
+        visualNotes.value = direction.visual_notes;
+    }
+    if (document.activeElement !== responseInput && responseInput.value !== builderState.storyboardResponseText) {
+        responseInput.value = builderState.storyboardResponseText;
+    }
+    storyboardModeHelp.textContent = STORYBOARD_MODE_HELP[direction.storyboard_mode] || STORYBOARD_MODE_HELP.loose;
+    requestPreview.value = builderState.storyboardRequest
+        ? JSON.stringify(builderState.storyboardRequest, null, 2)
+        : "Generate a request to preview its JSON.";
+
+    const blocked = !project || builderState.closing || builderState.transitioning || Boolean(builderState.operation);
+    storyboardMode.disabled = blocked;
+    brief.disabled = blocked;
+    visualNotes.disabled = blocked;
+    requestButton.disabled = blocked || !project.scenes.length;
+    copyButton.disabled = !builderState.storyboardRequest || builderState.storyboardRequestStale || blocked;
+    validateButton.disabled = blocked || !builderState.storyboardResponseText.trim();
+    clearPasteButton.disabled = !builderState.storyboardResponseText;
+    applyButton.disabled = blocked || !builderState.storyboardPreview;
+    clearButton.disabled = blocked || !project?.storyboard?.scenes?.length;
+
+    const relayMessage = builderState.storyboardRelayMessage;
+    const relayOperation = builderState.operation === "storyboard-request"
+        ? "Generating request…"
+        : builderState.operation === "storyboard-validate"
+            ? "Validating response…"
+            : builderState.operation === "storyboard-apply"
+                ? "Applying storyboard…"
+                : builderState.operation === "storyboard-clear"
+                    ? "Clearing storyboard…"
+                    : "";
+    status.textContent = relayMessage || relayOperation || (project ? storyboardStatus(project) : "");
+    status.dataset.state = relayMessage
+        ? builderState.storyboardRelayState
+        : builderState.storyboardPreview
+            ? "preview"
+            : project?.storyboard?.scenes?.length && builderState.storyboardRequestStale
+                ? "warning"
+                : builderState.operation
+                    ? "working"
+                    : "ready";
+    renderStoryboardPreview(root);
+}
+
 function renderStoryboardState(root) {
     if (!isActive(root)) {
         return;
@@ -532,6 +774,7 @@ function renderStoryboardState(root) {
         characterEmpty.hidden = true;
         locationEmpty.hidden = true;
         status.textContent = "";
+        renderStoryboardRelay(root);
         return;
     }
 
@@ -554,6 +797,7 @@ function renderStoryboardState(root) {
                 : "";
     status.textContent = operationLabel || builderState.storyboardMessage || "";
     status.dataset.state = builderState.storyboardMessage ? "error" : builderState.operation ? "working" : "ready";
+    renderStoryboardRelay(root);
 }
 
 function closeResourceDialogs(root) {
@@ -619,6 +863,9 @@ async function runResourceMutation(root, operation, task, failureMessage) {
         builderState.activeView = activeView;
         builderState.deleteConfirm = null;
         void loadProjectList(root);
+        if (project.storyboard?.scenes?.length) {
+            void loadStoryboardRequest(root, true);
+        }
         succeeded = true;
         return true;
     } catch (error) {
@@ -1214,6 +1461,7 @@ function closeProjectDialogs(root) {
     root.querySelector("[data-mvb-new-dialog]").hidden = true;
     root.querySelector("[data-mvb-open-dialog]").hidden = true;
     closeProjectDeleteDialog(root);
+    closeStoryboardClearDialog(root);
 }
 
 function closeProjectDeleteDialog(root) {
@@ -1376,6 +1624,7 @@ async function createProject(root) {
         setCurrentProject(root, project);
         closeProjectDialogs(root);
         renderProjectState(root);
+        void loadStoryboardRequest(root, true);
         void loadProjectList(root);
     } catch (error) {
         if (!isActive(root)) {
@@ -1452,6 +1701,9 @@ async function openProject(root, projectId) {
         setCurrentProject(root, project);
         closeProjectDialogs(root);
         renderProjectState(root);
+        if (project.scenes?.length && project.storyboard?.scenes?.length) {
+            void loadStoryboardRequest(root, true);
+        }
     } catch (error) {
         if (!isActive(root)) {
             return;
@@ -1591,6 +1843,258 @@ async function buildProjectScenes(root) {
         }),
         "Scenes built.",
     );
+}
+
+function storyboardRequestPath(projectId, suffix = "request") {
+    const suffixPath = suffix ? `/${suffix}` : "";
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/storyboard${suffixPath}`;
+}
+
+async function loadStoryboardRequest(root, silent = false) {
+    if (!isActive(root) || !builderState.currentProject?.scenes?.length) {
+        return false;
+    }
+    const projectId = builderState.currentProject.project_id;
+    try {
+        const request = await fetchJson(storyboardRequestPath(projectId));
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        if (!request || typeof request !== "object" || typeof request.request_fingerprint !== "string") {
+            throw new Error("Storyboard request response was invalid.");
+        }
+        builderState.storyboardRequest = request;
+        builderState.storyboardRequestStale = Boolean(builderState.currentProject.storyboard?.scenes?.length)
+            && builderState.currentProject.storyboard.request_fingerprint !== request.request_fingerprint;
+        if (!silent) {
+            setStoryboardRelayMessage("Request refreshed.");
+        }
+        renderProjectState(root);
+        return true;
+    } catch (error) {
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        console.error("[Music Video Builder] Storyboard request load failed.", error);
+        if (!silent) {
+            setStoryboardRelayMessage(error instanceof Error
+                ? error.message
+                : "Storyboard request could not be built.", "error");
+            renderProjectState(root);
+        }
+        return false;
+    }
+}
+
+async function generateStoryboardRequest(root) {
+    if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
+        return;
+    }
+    builderState.operation = "storyboard-request";
+    setStoryboardRelayMessage("");
+    renderProjectState(root);
+    const projectId = builderState.currentProject.project_id;
+    try {
+        if (!await flushCurrentProject(root)) {
+            setStoryboardRelayMessage("Save the current project before generating a request.", "error");
+            return;
+        }
+        const request = await fetchJson(storyboardRequestPath(projectId));
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return;
+        }
+        if (!request || typeof request !== "object" || typeof request.request_fingerprint !== "string") {
+            throw new Error("Storyboard request response was invalid.");
+        }
+        builderState.storyboardRequest = request;
+        builderState.storyboardRequestStale = Boolean(builderState.currentProject.storyboard?.scenes?.length)
+            && builderState.currentProject.storyboard.request_fingerprint !== request.request_fingerprint;
+        builderState.storyboardResponseText = "";
+        builderState.storyboardPreview = null;
+        setStoryboardRelayMessage("Request ready to copy.");
+    } catch (error) {
+        if (!isActive(root)) {
+            return;
+        }
+        console.error("[Music Video Builder] Storyboard request generation failed.", error);
+        setStoryboardRelayMessage(error instanceof Error
+            ? error.message
+            : "Storyboard request could not be built.", "error");
+    } finally {
+        if (isActive(root)) {
+            builderState.operation = null;
+            renderProjectState(root);
+        }
+    }
+}
+
+async function copyStoryboardRequest(root) {
+    if (!isActive(root) || !builderState.storyboardRequest) {
+        return;
+    }
+    const requestJson = JSON.stringify(builderState.storyboardRequest, null, 2);
+    try {
+        if (!navigator.clipboard?.writeText) {
+            throw new Error("Clipboard access is unavailable; select the visible request JSON to copy it.");
+        }
+        await navigator.clipboard.writeText(requestJson);
+        setStoryboardRelayMessage("Request JSON copied.");
+    } catch (error) {
+        console.error("[Music Video Builder] Storyboard request copy failed.", error);
+        setStoryboardRelayMessage(error instanceof Error
+            ? error.message
+            : "Request JSON could not be copied; select the visible payload.", "error");
+    }
+    renderProjectState(root);
+}
+
+async function validateStoryboardResponseInput(root) {
+    if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
+        return;
+    }
+    const responseText = builderState.storyboardResponseText;
+    let response;
+    try {
+        response = JSON.parse(responseText);
+    } catch (error) {
+        console.error("[Music Video Builder] Storyboard response JSON parse failed.", error);
+        builderState.storyboardPreview = null;
+        setStoryboardRelayMessage("Response JSON is not valid JSON.", "error");
+        renderProjectState(root);
+        return;
+    }
+
+    builderState.operation = "storyboard-validate";
+    setStoryboardRelayMessage("");
+    renderProjectState(root);
+    const projectId = builderState.currentProject.project_id;
+    try {
+        const preview = await fetchJson(storyboardRequestPath(projectId, "validate"), {
+            method: "POST",
+            body: JSON.stringify(response),
+        });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return;
+        }
+        builderState.storyboardPreview = preview;
+        setStoryboardRelayMessage("");
+    } catch (error) {
+        if (!isActive(root)) {
+            return;
+        }
+        console.error("[Music Video Builder] Storyboard response validation failed.", error);
+        builderState.storyboardPreview = null;
+        setStoryboardRelayMessage(error instanceof Error
+            ? error.message
+            : "Storyboard response could not be validated.", "error");
+    } finally {
+        if (isActive(root)) {
+            builderState.operation = null;
+            renderProjectState(root);
+        }
+    }
+}
+
+async function applyStoryboard(root) {
+    if (!isActive(root) || !builderState.currentProject || !builderState.storyboardPreview || builderState.operation || builderState.transitioning || builderState.closing) {
+        return;
+    }
+    let response;
+    try {
+        response = JSON.parse(builderState.storyboardResponseText);
+    } catch (error) {
+        setStoryboardRelayMessage("Response JSON is not valid JSON.", "error");
+        renderProjectState(root);
+        return;
+    }
+
+    builderState.operation = "storyboard-apply";
+    setStoryboardRelayMessage("");
+    renderProjectState(root);
+    const projectId = builderState.currentProject.project_id;
+    const request = builderState.storyboardRequest;
+    try {
+        if (!await flushCurrentProject(root)) {
+            setStoryboardRelayMessage("Save the current project before applying the storyboard.", "error");
+            return;
+        }
+        const project = await fetchJson(storyboardRequestPath(projectId, "apply"), {
+            method: "POST",
+            body: JSON.stringify(response),
+        });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId || !hasProjectDocument(project)) {
+            throw new Error("Storyboard apply response was invalid.");
+        }
+        setCurrentProject(root, project);
+        builderState.storyboardRequest = request;
+        builderState.storyboardRequestStale = false;
+        setStoryboardRelayMessage("Storyboard applied.");
+        void loadProjectList(root);
+    } catch (error) {
+        if (!isActive(root)) {
+            return;
+        }
+        console.error("[Music Video Builder] Storyboard apply failed.", error);
+        setStoryboardRelayMessage(error instanceof Error
+            ? error.message
+            : "Storyboard could not be applied.", "error");
+    } finally {
+        if (isActive(root)) {
+            builderState.operation = null;
+            renderProjectState(root);
+        }
+    }
+}
+
+function openStoryboardClearDialog(root) {
+    if (!isActive(root) || !builderState.currentProject?.storyboard?.scenes?.length || builderState.operation || builderState.transitioning || builderState.closing) {
+        return;
+    }
+    root.querySelector("[data-mvb-clear-storyboard-dialog]").hidden = false;
+    root.querySelector("[data-mvb-cancel-clear-storyboard]").focus();
+}
+
+function closeStoryboardClearDialog(root) {
+    if (!isActive(root)) {
+        return;
+    }
+    root.querySelector("[data-mvb-clear-storyboard-dialog]").hidden = true;
+}
+
+async function clearAppliedStoryboard(root) {
+    if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
+        return;
+    }
+    builderState.operation = "storyboard-clear";
+    setStoryboardRelayMessage("");
+    renderProjectState(root);
+    const projectId = builderState.currentProject.project_id;
+    try {
+        if (!await flushCurrentProject(root)) {
+            setStoryboardRelayMessage("Save the current project before clearing the storyboard.", "error");
+            return;
+        }
+        const project = await fetchJson(storyboardRequestPath(projectId, ""), { method: "DELETE" });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId || !hasProjectDocument(project)) {
+            throw new Error("Storyboard clear response was invalid.");
+        }
+        setCurrentProject(root, project);
+        setStoryboardRelayMessage("Storyboard cleared.");
+        closeStoryboardClearDialog(root);
+    } catch (error) {
+        if (!isActive(root)) {
+            return;
+        }
+        console.error("[Music Video Builder] Storyboard clear failed.", error);
+        setStoryboardRelayMessage(error instanceof Error
+            ? error.message
+            : "Storyboard could not be cleared.", "error");
+    } finally {
+        if (isActive(root)) {
+            builderState.operation = null;
+            renderProjectState(root);
+        }
+    }
 }
 
 function scheduleAutosave(root) {
@@ -1791,7 +2295,7 @@ function openBuilder() {
                     <div class="mvb-brand" data-mvb-landing-header>
                         <span class="mvb-brand-rule" aria-hidden="true"></span>
                         <div>
-                            <p class="mvb-phase">Phase 3 · Characters, locations, and references</p>
+                            <p class="mvb-phase">Phase 4 · Storyboard relay</p>
                             <h1 id="mvb-title">Vesper Music Video Builder</h1>
                             <p class="mvb-subtitle">A local project space for organised music-video work.</p>
                         </div>
@@ -1948,6 +2452,77 @@ function openBuilder() {
                             <div class="mvb-resource-list" data-mvb-location-list></div>
                         </section>
                     </div>
+                    <section class="mvb-storyboard-relay" aria-labelledby="mvb-direction-heading">
+                        <div class="mvb-relay-heading">
+                            <div>
+                                <p class="mvb-eyebrow">Direction</p>
+                                <h3 id="mvb-direction-heading">Story direction</h3>
+                            </div>
+                            <span class="mvb-storyboard-relay-status" data-mvb-storyboard-relay-status aria-live="polite"></span>
+                        </div>
+                        <div class="mvb-direction-mode-row">
+                            <label class="mvb-field mvb-storyboard-mode-field">
+                                <span>Storyboard mode</span>
+                                <select data-mvb-storyboard-mode aria-describedby="mvb-storyboard-mode-help">
+                                    <option value="loose">Loose</option>
+                                    <option value="strict">Strict</option>
+                                    <option value="band_performance">Band Performance</option>
+                                </select>
+                            </label>
+                            <p class="mvb-field-help" data-mvb-storyboard-mode-help id="mvb-storyboard-mode-help"></p>
+                        </div>
+                        <div class="mvb-direction-grid">
+                            <label class="mvb-field">
+                                <span>Story brief</span>
+                                <textarea data-mvb-story-brief rows="4" maxlength="8000" placeholder="The story, emotional arc, or lyrical idea."></textarea>
+                            </label>
+                            <label class="mvb-field">
+                                <span>Visual / directional notes</span>
+                                <textarea data-mvb-visual-notes rows="4" maxlength="8000" placeholder="Overall visual language and directorial notes."></textarea>
+                            </label>
+                        </div>
+                    </section>
+                    <section class="mvb-storyboard-relay" aria-labelledby="mvb-relay-heading">
+                        <div class="mvb-relay-heading">
+                            <div>
+                                <p class="mvb-eyebrow">ChatGPT relay</p>
+                                <h3 id="mvb-relay-heading">Storyboard request</h3>
+                            </div>
+                            <div class="mvb-relay-actions">
+                                <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-generate-request type="button">Generate / Refresh Request</button>
+                                <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-copy-request type="button" disabled>Copy Request JSON</button>
+                            </div>
+                        </div>
+                        <label class="mvb-field mvb-relay-json-field">
+                            <span>Request JSON</span>
+                            <textarea data-mvb-request-json rows="8" readonly spellcheck="false">Generate a request to preview its JSON.</textarea>
+                        </label>
+                        <div class="mvb-relay-response-heading">
+                            <label class="mvb-field mvb-relay-json-field">
+                                <span>Paste response JSON</span>
+                                <textarea data-mvb-response-json rows="10" spellcheck="false" placeholder="Paste the dedicated GPT storyboard response here."></textarea>
+                            </label>
+                            <div class="mvb-relay-actions mvb-relay-response-actions">
+                                <button class="mvb-button mvb-button-primary mvb-button-small" data-mvb-validate-response type="button">Validate Response</button>
+                                <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-clear-paste type="button">Clear Paste</button>
+                            </div>
+                        </div>
+                        <div class="mvb-storyboard-preview" data-mvb-storyboard-preview>
+                            <div class="mvb-relay-heading">
+                                <div>
+                                    <p class="mvb-eyebrow">Validated preview / applied storyboard</p>
+                                    <h3>Scene allocations</h3>
+                                </div>
+                                <span class="mvb-storyboard-preview-state" data-mvb-storyboard-preview-state aria-live="polite"></span>
+                            </div>
+                            <p class="mvb-relay-empty" data-mvb-storyboard-preview-empty>No applied scene allocations.</p>
+                            <div class="mvb-storyboard-preview-rows" data-mvb-storyboard-preview-rows></div>
+                            <div class="mvb-relay-actions mvb-relay-apply-actions">
+                                <button class="mvb-button mvb-button-primary mvb-button-small" data-mvb-apply-storyboard type="button" disabled>Apply Storyboard</button>
+                                <button class="mvb-button mvb-button-danger mvb-button-small" data-mvb-clear-storyboard type="button" disabled>Clear Storyboard</button>
+                            </div>
+                        </div>
+                    </section>
                 </section>
             </main>
 
@@ -2075,6 +2650,22 @@ function openBuilder() {
                     </form>
                 </section>
             </div>
+            <div class="mvb-modal-backdrop" data-mvb-clear-storyboard-dialog hidden>
+                <section class="mvb-dialog" role="dialog" aria-modal="true" aria-labelledby="mvb-clear-storyboard-heading">
+                    <div class="mvb-dialog-heading">
+                        <div>
+                            <p class="mvb-eyebrow">Clear storyboard</p>
+                            <h2 id="mvb-clear-storyboard-heading">Clear applied storyboard?</h2>
+                        </div>
+                        <button class="mvb-dialog-close" data-mvb-cancel-clear-storyboard type="button">Cancel</button>
+                    </div>
+                    <p class="mvb-dialog-note">This removes scene allocations but preserves source scenes, direction, Characters, Locations, and references.</p>
+                    <div class="mvb-dialog-actions">
+                        <button class="mvb-button mvb-button-secondary" data-mvb-cancel-clear-storyboard type="button">Cancel</button>
+                        <button class="mvb-button mvb-button-danger" data-mvb-confirm-clear-storyboard type="button">Clear Storyboard</button>
+                    </div>
+                </section>
+            </div>
         </section>
     `;
 
@@ -2097,6 +2688,12 @@ function openBuilder() {
         setupState: "empty",
         setupMessage: "",
         storyboardMessage: "",
+        storyboardRequest: null,
+        storyboardRequestStale: false,
+        storyboardResponseText: "",
+        storyboardPreview: null,
+        storyboardRelayMessage: "",
+        storyboardRelayState: "ready",
         activeView: "setup",
         deleteConfirm: null,
         newProjectBusy: false,
@@ -2132,6 +2729,18 @@ function openBuilder() {
     const locationForm = root.querySelector("[data-mvb-location-form]");
     const cancelCharacterButtons = root.querySelectorAll("[data-mvb-cancel-character]");
     const cancelLocationButtons = root.querySelectorAll("[data-mvb-cancel-location]");
+    const storyboardMode = root.querySelector("[data-mvb-storyboard-mode]");
+    const storyBrief = root.querySelector("[data-mvb-story-brief]");
+    const visualNotes = root.querySelector("[data-mvb-visual-notes]");
+    const requestButton = root.querySelector("[data-mvb-generate-request]");
+    const copyRequestButton = root.querySelector("[data-mvb-copy-request]");
+    const responseInput = root.querySelector("[data-mvb-response-json]");
+    const validateResponseButton = root.querySelector("[data-mvb-validate-response]");
+    const clearPasteButton = root.querySelector("[data-mvb-clear-paste]");
+    const applyStoryboardButton = root.querySelector("[data-mvb-apply-storyboard]");
+    const clearStoryboardButton = root.querySelector("[data-mvb-clear-storyboard]");
+    const cancelClearStoryboardButton = root.querySelector("[data-mvb-cancel-clear-storyboard]");
+    const confirmClearStoryboardButton = root.querySelector("[data-mvb-confirm-clear-storyboard]");
 
     closeButton.addEventListener("click", () => void closeBuilder(root));
     maximizeButton.addEventListener("click", () => toggleMaximize(root));
@@ -2172,6 +2781,76 @@ function openBuilder() {
             scheduleAutosave(root);
         }
     });
+    storyboardMode.addEventListener("change", () => {
+        if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
+            return;
+        }
+        const value = storyboardMode.value;
+        if (builderState.currentProject.story_direction.storyboard_mode === value) {
+            return;
+        }
+        builderState.currentProject.story_direction.storyboard_mode = value;
+        builderState.editRevision += 1;
+        builderState.saveState = "dirty";
+        builderState.saveMessage = "";
+        invalidateStoryboardRequestForDirectionEdit();
+        renderProjectState(root);
+        scheduleAutosave(root);
+    });
+    storyBrief.addEventListener("input", () => {
+        if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
+            return;
+        }
+        const value = storyBrief.value;
+        if (builderState.currentProject.story_direction.story_brief === value) {
+            return;
+        }
+        builderState.currentProject.story_direction.story_brief = value;
+        builderState.editRevision += 1;
+        builderState.saveState = "dirty";
+        builderState.saveMessage = "";
+        invalidateStoryboardRequestForDirectionEdit();
+        renderProjectState(root);
+        scheduleAutosave(root);
+    });
+    visualNotes.addEventListener("input", () => {
+        if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
+            return;
+        }
+        const value = visualNotes.value;
+        if (builderState.currentProject.story_direction.visual_notes === value) {
+            return;
+        }
+        builderState.currentProject.story_direction.visual_notes = value;
+        builderState.editRevision += 1;
+        builderState.saveState = "dirty";
+        builderState.saveMessage = "";
+        invalidateStoryboardRequestForDirectionEdit();
+        renderProjectState(root);
+        scheduleAutosave(root);
+    });
+    responseInput.addEventListener("input", () => {
+        if (!isActive(root)) {
+            return;
+        }
+        builderState.storyboardResponseText = responseInput.value;
+        builderState.storyboardPreview = null;
+        setStoryboardRelayMessage("");
+        renderStoryboardRelay(root);
+    });
+    requestButton.addEventListener("click", () => void generateStoryboardRequest(root));
+    copyRequestButton.addEventListener("click", () => void copyStoryboardRequest(root));
+    validateResponseButton.addEventListener("click", () => void validateStoryboardResponseInput(root));
+    clearPasteButton.addEventListener("click", () => {
+        builderState.storyboardResponseText = "";
+        builderState.storyboardPreview = null;
+        setStoryboardRelayMessage("");
+        renderStoryboardRelay(root);
+    });
+    applyStoryboardButton.addEventListener("click", () => void applyStoryboard(root));
+    clearStoryboardButton.addEventListener("click", () => openStoryboardClearDialog(root));
+    cancelClearStoryboardButton.addEventListener("click", () => closeStoryboardClearDialog(root));
+    confirmClearStoryboardButton.addEventListener("click", () => void clearAppliedStoryboard(root));
     newForm.addEventListener("submit", (event) => {
         event.preventDefault();
         void createProject(root);

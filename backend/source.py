@@ -297,8 +297,13 @@ def _replace_source_file(
             **current_project,
             "source": {**current_project["source"], source_key: metadata},
             "scenes": [],
+            "storyboard": {"request_fingerprint": None, "scenes": []},
         }
-        saved_project = storage.save_project(project_id, candidate_project)
+        saved_project = storage.save_project(
+            project_id,
+            candidate_project,
+            allow_storyboard_change=True,
+        )
     except (ProjectPersistenceError, ProjectValidationError):
         _restore_source_files(backups, target_path, installed)
         raise

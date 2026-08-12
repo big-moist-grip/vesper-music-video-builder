@@ -33,6 +33,11 @@ from .source import (
     import_master_audio,
     parse_srt,
 )
+from .storyboard import (
+    build_storyboard_request,
+    empty_storyboard,
+    validate_storyboard_response,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -161,6 +166,107 @@ def register_routes():
             LOGGER.exception("Could not save Music Video Builder project.")
             return api_error("Project could not be saved.", 500)
         return web.json_response(project)
+
+    @PromptServer.instance.routes.get("/music-video-builder/projects/{project_id}/storyboard/request")
+    async def music_video_builder_storyboard_request(request):
+        project_id = request.match_info["project_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+
+        try:
+            project = PROJECT_STORAGE.load_project(project_id)
+            storyboard_request = build_storyboard_request(project)
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not build the Music Video Builder storyboard request.")
+            return api_error("Storyboard request could not be built.", 500)
+        return web.json_response(storyboard_request)
+
+    async def read_storyboard_response(request):
+        payload = await read_json(request)
+        if not isinstance(payload, dict):
+            return None, api_error("Request body must be a storyboard response JSON object.", 400)
+        return payload, None
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/storyboard/validate")
+    async def music_video_builder_validate_storyboard(request):
+        project_id = request.match_info["project_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+
+        payload, error_response = await read_storyboard_response(request)
+        if error_response is not None:
+            return error_response
+        try:
+            project = PROJECT_STORAGE.load_project(project_id)
+            preview = validate_storyboard_response(project, payload)
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not load the project for storyboard validation.")
+            return api_error("Storyboard response could not be validated.", 500)
+        return web.json_response(preview)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/storyboard/apply")
+    async def music_video_builder_apply_storyboard(request):
+        project_id = request.match_info["project_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+
+        payload, error_response = await read_storyboard_response(request)
+        if error_response is not None:
+            return error_response
+        try:
+            project = PROJECT_STORAGE.load_project(project_id)
+            storyboard = validate_storyboard_response(project, payload)
+            saved_project = PROJECT_STORAGE.save_project(
+                project_id,
+                {**project, "storyboard": storyboard},
+                allow_storyboard_change=True,
+            )
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not apply the Music Video Builder storyboard.")
+            return api_error("Storyboard could not be applied.", 500)
+        return web.json_response(saved_project)
+
+    @PromptServer.instance.routes.delete("/music-video-builder/projects/{project_id}/storyboard")
+    async def music_video_builder_clear_storyboard(request):
+        project_id = request.match_info["project_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+
+        try:
+            project = PROJECT_STORAGE.load_project(project_id)
+            saved_project = PROJECT_STORAGE.save_project(
+                project_id,
+                {**project, "storyboard": empty_storyboard()},
+                allow_storyboard_change=True,
+            )
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not clear the Music Video Builder storyboard.")
+            return api_error("Storyboard could not be cleared.", 500)
+        return web.json_response(saved_project)
 
     @PromptServer.instance.routes.delete("/music-video-builder/projects/{project_id}")
     async def music_video_builder_delete_project(request):
