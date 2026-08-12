@@ -5,16 +5,20 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .scenes import SceneValidationError, validate_scene_list
+
 
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 PROJECT_FILENAME = "project.json"
 DEFAULT_PROJECTS_ROOT = Path(
     r"D:\User Folders\Documents\Projects\vesper-music-video-builder\projects"
@@ -29,7 +33,21 @@ REQUIRED_PROJECT_DIRECTORIES = (
     "renders",
     "export",
 )
-PROJECT_FIELDS = ("schema_version", "project_id", "name", "created_at", "updated_at")
+SUPPORTED_AUDIO_EXTENSIONS = frozenset({".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus"})
+LEGACY_PROJECT_FIELDS = ("schema_version", "project_id", "name", "created_at", "updated_at")
+PROJECT_FIELDS = (
+    "schema_version",
+    "project_id",
+    "name",
+    "created_at",
+    "updated_at",
+    "source",
+    "scenes",
+)
+SOURCE_FIELDS = ("master_audio", "lyrics_srt")
+MASTER_AUDIO_FIELDS = ("stored_name", "original_name", "duration_ms")
+LYRICS_SRT_FIELDS = ("stored_name", "original_name", "cue_count")
+_MASTER_AUDIO_NAME_PATTERN = re.compile(r"^master_audio\.[a-z0-9]+$")
 
 
 class ProjectError(Exception):
@@ -37,7 +55,7 @@ class ProjectError(Exception):
 
 
 class ProjectValidationError(ProjectError):
-    """The project or an input value does not satisfy the Phase 1 schema."""
+    """The project or an input value does not satisfy the project schema."""
 
 
 class ProjectNotFoundError(ProjectError):
@@ -78,6 +96,16 @@ def validate_project_name(name: object) -> str:
     return trimmed
 
 
+def validate_original_name(name: object) -> str:
+    if not isinstance(name, str):
+        raise ProjectValidationError("Original filename must be a string.")
+    if any(ord(character) < 32 or ord(character) == 127 for character in name):
+        raise ProjectValidationError("Original filename contains unsupported control characters.")
+    if not name or len(name) > 255 or "/" in name or "\\" in name:
+        raise ProjectValidationError("Original filename must be a local filename.")
+    return name
+
+
 def parse_timestamp(value: object) -> datetime:
     if not isinstance(value, str):
         raise ProjectValidationError("Project timestamps must be ISO-8601 strings.")
@@ -98,26 +126,11 @@ def utc_timestamp(value: datetime | None = None) -> str:
     return timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def validate_project_document(
-    document: object,
-    expected_project_id: str | None = None,
-) -> dict[str, object]:
-    if not isinstance(document, dict):
-        raise ProjectValidationError("Project document must be a JSON object.")
-
-    if set(document) != set(PROJECT_FIELDS):
+def _validate_base_project(document: dict[str, object], fields: tuple[str, ...]) -> dict[str, object]:
+    if set(document) != set(fields):
         raise ProjectValidationError("Project document has unsupported or missing fields.")
 
-    schema_version = document.get("schema_version")
-    if isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION:
-        raise ProjectValidationError("Unsupported project schema version.")
-
     project_id = validate_project_id(document.get("project_id"))
-    if expected_project_id is not None:
-        expected = validate_project_id(expected_project_id)
-        if project_id != expected:
-            raise ProjectValidationError("Project ID does not match the requested project.")
-
     name = validate_project_name(document.get("name"))
     created_at = document.get("created_at")
     updated_at = document.get("updated_at")
@@ -127,12 +140,120 @@ def validate_project_document(
         raise ProjectValidationError("Project updated_at cannot precede created_at.")
 
     return {
-        "schema_version": SCHEMA_VERSION,
         "project_id": project_id,
         "name": name,
         "created_at": created_at,
         "updated_at": updated_at,
     }
+
+
+def _validate_legacy_project(document: dict[str, object]) -> dict[str, object]:
+    schema_version = document.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != LEGACY_SCHEMA_VERSION:
+        raise ProjectValidationError("Unsupported project schema version.")
+
+    base = _validate_base_project(document, LEGACY_PROJECT_FIELDS)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        **base,
+        "source": {"master_audio": None, "lyrics_srt": None},
+        "scenes": [],
+    }
+
+
+def _validate_master_audio(metadata: object) -> dict[str, object] | None:
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict) or set(metadata) != set(MASTER_AUDIO_FIELDS):
+        raise ProjectValidationError("Master-audio metadata is invalid.")
+
+    stored_name = metadata.get("stored_name")
+    if (
+        not isinstance(stored_name, str)
+        or stored_name != stored_name.lower()
+        or not _MASTER_AUDIO_NAME_PATTERN.fullmatch(stored_name)
+        or Path(stored_name).suffix not in SUPPORTED_AUDIO_EXTENSIONS
+    ):
+        raise ProjectValidationError("Master-audio stored filename is invalid.")
+
+    original_name = validate_original_name(metadata.get("original_name"))
+    duration_ms = metadata.get("duration_ms")
+    if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms <= 0:
+        raise ProjectValidationError("Master-audio duration_ms must be a positive integer.")
+
+    return {
+        "stored_name": stored_name,
+        "original_name": original_name,
+        "duration_ms": duration_ms,
+    }
+
+
+def _validate_lyrics_srt(metadata: object) -> dict[str, object] | None:
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict) or set(metadata) != set(LYRICS_SRT_FIELDS):
+        raise ProjectValidationError("Lyrics SRT metadata is invalid.")
+
+    if metadata.get("stored_name") != "lyrics.srt":
+        raise ProjectValidationError("Lyrics SRT stored filename is invalid.")
+    original_name = validate_original_name(metadata.get("original_name"))
+    cue_count = metadata.get("cue_count")
+    if isinstance(cue_count, bool) or not isinstance(cue_count, int) or cue_count < 0:
+        raise ProjectValidationError("Lyrics SRT cue_count must be a non-negative integer.")
+
+    return {
+        "stored_name": "lyrics.srt",
+        "original_name": original_name,
+        "cue_count": cue_count,
+    }
+
+
+def _validate_source(source: object) -> dict[str, object]:
+    if not isinstance(source, dict) or set(source) != set(SOURCE_FIELDS):
+        raise ProjectValidationError("Project source state is invalid.")
+    return {
+        "master_audio": _validate_master_audio(source.get("master_audio")),
+        "lyrics_srt": _validate_lyrics_srt(source.get("lyrics_srt")),
+    }
+
+
+def validate_project_document(
+    document: object,
+    expected_project_id: str | None = None,
+) -> dict[str, object]:
+    if not isinstance(document, dict):
+        raise ProjectValidationError("Project document must be a JSON object.")
+
+    schema_version = document.get("schema_version")
+    if schema_version == LEGACY_SCHEMA_VERSION:
+        normalized = _validate_legacy_project(document)
+    elif schema_version == SCHEMA_VERSION:
+        base = _validate_base_project(document, PROJECT_FIELDS)
+        source = _validate_source(document.get("source"))
+        scenes = document.get("scenes")
+        if not isinstance(scenes, list):
+            raise ProjectValidationError("Project scenes must be an array.")
+        if scenes:
+            if source["master_audio"] is None or source["lyrics_srt"] is None:
+                raise ProjectValidationError("Built scenes require master audio and lyrics SRT metadata.")
+            try:
+                validate_scene_list(scenes, source["master_audio"]["duration_ms"])
+            except SceneValidationError as error:
+                raise ProjectValidationError(str(error)) from error
+        normalized = {
+            "schema_version": SCHEMA_VERSION,
+            **base,
+            "source": source,
+            "scenes": scenes,
+        }
+    else:
+        raise ProjectValidationError("Unsupported project schema version.")
+
+    if expected_project_id is not None:
+        expected = validate_project_id(expected_project_id)
+        if normalized["project_id"] != expected:
+            raise ProjectValidationError("Project ID does not match the requested project.")
+    return normalized
 
 
 def atomic_write_json(destination: Path, document: dict[str, object]) -> None:
@@ -184,6 +305,8 @@ class ProjectStorage:
             "name": validated_name,
             "created_at": created_at,
             "updated_at": created_at,
+            "source": {"master_audio": None, "lyrics_srt": None},
+            "scenes": [],
         }
         project_directory = self.projects_root / project_id
         project_file = project_directory / PROJECT_FILENAME
@@ -203,6 +326,13 @@ class ProjectStorage:
         except OSError as error:
             self._clean_incomplete_directory(project_directory, project_file, created_directory)
             raise ProjectPersistenceError("Could not create project storage.") from error
+
+    def project_directory(self, project_id: object) -> Path:
+        canonical_id = validate_project_id(project_id)
+        project_directory = self.projects_root / canonical_id
+        if not project_directory.is_dir() or project_directory.is_symlink():
+            raise ProjectNotFoundError("Project was not found.")
+        return project_directory
 
     def list_projects(self) -> dict[str, list[dict[str, object]]]:
         projects: list[dict[str, object]] = []
@@ -240,18 +370,20 @@ class ProjectStorage:
 
     def load_project(self, project_id: object) -> dict[str, object]:
         canonical_id = validate_project_id(project_id)
-        project_directory = self.projects_root / canonical_id
-        if not project_directory.is_dir() or project_directory.is_symlink():
-            raise ProjectNotFoundError("Project was not found.")
+        project_directory = self.project_directory(canonical_id)
         return self._read_project(project_directory, canonical_id)
 
     def save_project(self, project_id: object, document: object) -> dict[str, object]:
         canonical_id = validate_project_id(project_id)
-        project_directory = self.projects_root / canonical_id
-        if not project_directory.is_dir() or project_directory.is_symlink():
-            raise ProjectNotFoundError("Project was not found.")
-
+        project_directory = self.project_directory(canonical_id)
         current = self._read_project(project_directory, canonical_id)
+        if (
+            isinstance(document, dict)
+            and document.get("schema_version") == LEGACY_SCHEMA_VERSION
+            and (current["source"]["master_audio"] is not None or current["source"]["lyrics_srt"] is not None or current["scenes"])
+        ):
+            raise ProjectValidationError("Legacy project data cannot overwrite Phase 2 project state.")
+
         candidate = validate_project_document(document, expected_project_id=canonical_id)
         candidate["created_at"] = current["created_at"]
 

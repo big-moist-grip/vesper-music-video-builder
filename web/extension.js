@@ -37,8 +37,36 @@ function updateStatus(root, text, state) {
     }
 
     const status = root.querySelector("[data-mvb-status]");
-    status.textContent = text;
+    if (!status) {
+        return;
+    }
+
+    const isError = state === "error";
+    status.hidden = !isError;
+    status.textContent = isError ? text : "";
     status.dataset.state = state;
+}
+
+function renderMaximizeState(root) {
+    if (!isActive(root)) {
+        return;
+    }
+
+    const button = root.querySelector("[data-mvb-maximize]");
+    const maximized = Boolean(builderState.maximized);
+    root.classList.toggle("mvb-overlay-maximized", maximized);
+    button.textContent = maximized ? "Restore" : "Maximise";
+    button.setAttribute("aria-label", maximized ? "Restore compact builder" : "Maximise builder");
+    button.setAttribute("aria-pressed", String(maximized));
+}
+
+function toggleMaximize(root) {
+    if (!isActive(root)) {
+        return;
+    }
+
+    builderState.maximized = !builderState.maximized;
+    renderMaximizeState(root);
 }
 
 function hasValidHealthPayload(payload) {
@@ -50,22 +78,31 @@ function hasValidHealthPayload(payload) {
 }
 
 function hasProjectDocument(payload) {
+    const source = payload?.source;
     return payload !== null
         && typeof payload === "object"
-        && typeof payload.schema_version === "number"
+        && payload.schema_version === 2
         && typeof payload.project_id === "string"
         && typeof payload.name === "string"
         && typeof payload.created_at === "string"
-        && typeof payload.updated_at === "string";
+        && typeof payload.updated_at === "string"
+        && source !== null
+        && typeof source === "object"
+        && Object.keys(source).length === 2
+        && Object.prototype.hasOwnProperty.call(source, "master_audio")
+        && Object.prototype.hasOwnProperty.call(source, "lyrics_srt")
+        && Array.isArray(payload.scenes);
 }
 
 async function fetchJson(path, options = {}) {
+    const isMultipart = typeof FormData !== "undefined" && options.body instanceof FormData;
+    const headers = { ...(options.headers || {}) };
+    if (!isMultipart && !Object.keys(headers).some((key) => key.toLowerCase() === "content-type")) {
+        headers["Content-Type"] = "application/json";
+    }
     const response = await api.fetchApi(path, {
         ...options,
-        headers: {
-            "Content-Type": "application/json",
-            ...(options.headers || {}),
-        },
+        headers,
     });
 
     let payload = null;
@@ -90,7 +127,7 @@ async function closeBuilder(root) {
         root.remove();
         return;
     }
-    if (builderState.closing || builderState.transitioning) {
+    if (builderState.closing || builderState.transitioning || builderState.operation) {
         return;
     }
 
@@ -116,15 +153,15 @@ async function closeBuilder(root) {
 function saveStateLabel(state) {
     switch (state.saveState) {
         case "saved":
-            return "Saved";
+            return "";
         case "dirty":
-            return "Unsaved changes";
+            return "Unsaved";
         case "saving":
             return "Saving…";
         case "error":
             return state.saveMessage || "Save failed — retry Save";
         default:
-            return "No project open";
+            return "";
     }
 }
 
@@ -138,6 +175,8 @@ function setCurrentProject(root, project) {
     builderState.editRevision = 0;
     builderState.saveState = project ? "saved" : "empty";
     builderState.saveMessage = "";
+    builderState.setupState = project ? "ready" : "empty";
+    builderState.setupMessage = "";
 }
 
 function cancelAutosave(root) {
@@ -157,40 +196,179 @@ function hasPendingProjectSave(state) {
             || state.saveState === "error");
 }
 
+function formatDurationMs(durationMs) {
+    const totalSeconds = Math.floor(durationMs / 1000);
+    const milliseconds = durationMs % 1000;
+    const seconds = totalSeconds % 60;
+    const totalMinutes = Math.floor(totalSeconds / 60);
+    const minutes = totalMinutes % 60;
+    const hours = Math.floor(totalMinutes / 60);
+    const base = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(milliseconds).padStart(3, "0")}`;
+    return hours > 0 ? `${hours}:${base}` : base;
+}
+
+function formatTimelineMs(value) {
+    return formatDurationMs(value);
+}
+
+function renderSceneReview(root) {
+    if (!isActive(root)) {
+        return;
+    }
+
+    const scenes = builderState.currentProject?.scenes || [];
+    const empty = root.querySelector("[data-mvb-scenes-empty]");
+    const table = root.querySelector("[data-mvb-scene-table]");
+    const rows = root.querySelector("[data-mvb-scene-rows]");
+    const summary = root.querySelector("[data-mvb-scene-summary]");
+    rows.replaceChildren();
+    table.hidden = scenes.length === 0;
+    empty.hidden = scenes.length > 0;
+    summary.textContent = scenes.length > 0
+        ? `${scenes.length} scene${scenes.length === 1 ? "" : "s"} · read-only timing review`
+        : "No scenes built yet.";
+
+    for (const [index, scene] of scenes.entries()) {
+        const row = document.createElement("tr");
+        const values = [
+            String(index + 1).padStart(2, "0"),
+            scene.source_kind === "lyric" ? "Lyric" : "Instrumental",
+            formatTimelineMs(scene.timeline_start_ms),
+            formatTimelineMs(scene.timeline_end_ms),
+            formatDurationMs(scene.exact_duration_ms),
+            `${scene.split_index} / ${scene.split_count}`,
+            Array.isArray(scene.source_cue_numbers) && scene.source_cue_numbers.length > 0
+                ? scene.source_cue_numbers.join(", ")
+                : "—",
+            scene.lyric || "—",
+        ];
+        for (const [cellIndex, value] of values.entries()) {
+            const cell = document.createElement(cellIndex === 0 ? "th" : "td");
+            if (cellIndex === 0) {
+                cell.scope = "row";
+            }
+            cell.textContent = value;
+            row.append(cell);
+        }
+        rows.append(row);
+    }
+}
+
+function renderSetupState(root) {
+    if (!isActive(root)) {
+        return;
+    }
+
+    const state = builderState;
+    const project = state.currentProject;
+    const operationActive = Boolean(state.operation);
+    const transitionActive = state.transitioning || state.closing;
+    const controlsBlocked = !project || operationActive || transitionActive;
+    const audio = project?.source?.master_audio;
+    const lyrics = project?.source?.lyrics_srt;
+    const audioInput = root.querySelector("[data-mvb-audio-file]");
+    const audioButton = root.querySelector("[data-mvb-import-audio]");
+    const audioMeta = root.querySelector("[data-mvb-audio-meta]");
+    const audioStatus = root.querySelector("[data-mvb-audio-status]");
+    const srtInput = root.querySelector("[data-mvb-srt-file]");
+    const srtButton = root.querySelector("[data-mvb-import-srt]");
+    const srtMeta = root.querySelector("[data-mvb-srt-meta]");
+    const srtStatus = root.querySelector("[data-mvb-srt-status]");
+    const buildButton = root.querySelector("[data-mvb-build-scenes]");
+    const setupStatus = root.querySelector("[data-mvb-setup-status]");
+
+    audioInput.disabled = controlsBlocked;
+    audioButton.disabled = controlsBlocked || !audioInput.files?.length;
+    srtInput.disabled = controlsBlocked;
+    srtButton.disabled = controlsBlocked || !srtInput.files?.length;
+    buildButton.disabled = controlsBlocked || !audio || !lyrics;
+    buildButton.textContent = project?.scenes?.length ? "Rebuild Scenes" : "Build Scenes";
+
+    audioMeta.textContent = audio
+        ? `${audio.original_name} · ${formatDurationMs(audio.duration_ms)}`
+        : "No master audio imported.";
+    srtMeta.textContent = lyrics
+        ? `${lyrics.original_name} · ${lyrics.cue_count} cue${lyrics.cue_count === 1 ? "" : "s"}`
+        : "No lyrics SRT imported.";
+
+    const operationLabel = state.operation === "audio"
+        ? "Importing master audio…"
+        : state.operation === "srt"
+            ? "Importing lyrics SRT…"
+            : state.operation === "scenes"
+                ? "Building scenes…"
+                : "";
+    audioStatus.textContent = state.operation === "audio" ? operationLabel : audio ? "Imported" : "Waiting for source";
+    srtStatus.textContent = state.operation === "srt" ? operationLabel : lyrics ? "Imported" : "Waiting for source";
+    audioStatus.dataset.state = state.operation === "audio" ? "working" : audio ? "success" : "empty";
+    srtStatus.dataset.state = state.operation === "srt" ? "working" : lyrics ? "success" : "empty";
+    setupStatus.textContent = operationLabel || state.setupMessage || "";
+    setupStatus.dataset.state = state.operation ? "working" : state.setupState;
+    renderSceneReview(root);
+}
+
 function renderProjectState(root) {
     if (!isActive(root)) {
         return;
     }
 
     const state = builderState;
+    renderMaximizeState(root);
     const currentProject = state.currentProject;
-    const editor = root.querySelector("[data-mvb-project-editor]");
-    const emptyState = root.querySelector("[data-mvb-project-empty]");
+    const landingHeader = root.querySelector("[data-mvb-landing-header]");
+    const projectToolbar = root.querySelector("[data-mvb-project-toolbar]");
+    const landing = root.querySelector("[data-mvb-landing]");
+    const setup = root.querySelector("[data-mvb-setup]");
+    const sceneReview = root.querySelector("[data-mvb-scene-review]");
     const nameInput = root.querySelector("[data-mvb-project-name]");
     const saveButton = root.querySelector("[data-mvb-save]");
-    const projectTitle = root.querySelector("[data-mvb-current-project]");
+    const projectsButton = root.querySelector("[data-mvb-projects]");
+    const newButtons = root.querySelectorAll("[data-mvb-new]");
+    const openButtons = root.querySelectorAll("[data-mvb-open]");
     const saveState = root.querySelector("[data-mvb-save-state]");
 
     if (!currentProject) {
-        editor.hidden = true;
-        emptyState.hidden = false;
+        root.classList.remove("mvb-project-open");
+        landingHeader.hidden = false;
+        projectToolbar.hidden = true;
+        landing.hidden = false;
+        setup.hidden = true;
+        sceneReview.hidden = true;
         nameInput.value = "";
         nameInput.disabled = true;
         saveButton.disabled = true;
-        projectTitle.textContent = "No project open";
+        projectsButton.disabled = true;
     } else {
-        editor.hidden = false;
-        emptyState.hidden = true;
+        root.classList.add("mvb-project-open");
+        landingHeader.hidden = true;
+        projectToolbar.hidden = false;
+        landing.hidden = true;
+        setup.hidden = false;
+        sceneReview.hidden = false;
         if (nameInput.value !== currentProject.name) {
             nameInput.value = currentProject.name;
         }
-        nameInput.disabled = false;
-        saveButton.disabled = state.saving || state.closing || state.transitioning;
-        projectTitle.textContent = currentProject.name || "Unnamed project";
+        nameInput.disabled = Boolean(state.operation) || state.closing || state.transitioning;
+        saveButton.disabled = state.saving || state.closing || state.transitioning || Boolean(state.operation);
+        projectsButton.disabled = state.closing || state.transitioning || Boolean(state.operation) || state.newProjectBusy;
     }
 
-    saveState.textContent = saveStateLabel(state);
+    for (const button of newButtons) {
+        button.disabled = state.closing || state.transitioning || Boolean(state.operation) || state.newProjectBusy;
+    }
+    for (const button of openButtons) {
+        button.disabled = state.closing || state.transitioning || Boolean(state.operation) || state.newProjectBusy;
+    }
+    const saveLabel = saveStateLabel(state);
+    saveState.textContent = saveLabel;
+    saveState.hidden = !saveLabel;
     saveState.dataset.state = state.saveState;
+    renderRecentProjectList(root);
+    if (currentProject) {
+        renderSetupState(root);
+    } else {
+        renderSceneReview(root);
+    }
 }
 
 function updateProjectListSummary(root) {
@@ -199,6 +377,9 @@ function updateProjectListSummary(root) {
     }
 
     const summary = root.querySelector("[data-mvb-list-summary]");
+    if (!summary) {
+        return;
+    }
     const state = builderState;
     if (state.projectListState === "loading") {
         summary.textContent = "Loading saved projects…";
@@ -212,16 +393,17 @@ function updateProjectListSummary(root) {
     }
 
     const count = state.projects.length;
+    const invalidCount = state.invalidProjectsDismissed ? 0 : state.invalidProjects.length;
     const projectLabel = count === 1 ? "project" : "projects";
-    const invalidSuffix = state.invalidProjects.length > 0
-        ? ` · ${state.invalidProjects.length} invalid entry`
+    const invalidSuffix = invalidCount > 0
+        ? " · " + invalidCount + " invalid " + (invalidCount === 1 ? "entry" : "entries")
         : "";
     summary.textContent = count > 0
         ? `${count} saved ${projectLabel}${invalidSuffix}`
-        : state.invalidProjects.length > 0
-            ? `${state.invalidProjects.length} invalid project entry`
+        : invalidCount > 0
+            ? invalidCount + " invalid project " + (invalidCount === 1 ? "entry" : "entries")
             : "No saved projects yet";
-    summary.dataset.state = state.invalidProjects.length > 0 ? "warning" : "ready";
+    summary.dataset.state = invalidCount > 0 ? "warning" : "ready";
 }
 
 function formatUpdatedAt(timestamp) {
@@ -233,6 +415,180 @@ function formatUpdatedAt(timestamp) {
         dateStyle: "medium",
         timeStyle: "short",
     }).format(date)}`;
+}
+
+function recentProjects(projects) {
+    return [...projects]
+        .sort((left, right) => {
+            const leftTime = Date.parse(left.updated_at);
+            const rightTime = Date.parse(right.updated_at);
+            const leftValid = Number.isFinite(leftTime);
+            const rightValid = Number.isFinite(rightTime);
+            if (leftValid && rightValid && leftTime !== rightTime) {
+                return rightTime - leftTime;
+            }
+            if (leftValid !== rightValid) {
+                return leftValid ? -1 : 1;
+            }
+            const nameOrder = String(left.name).localeCompare(String(right.name));
+            if (nameOrder !== 0) {
+                return nameOrder;
+            }
+            return String(left.project_id).localeCompare(String(right.project_id));
+        })
+        .slice(0, 5);
+}
+
+function invalidProjectsSignature(projects) {
+    return JSON.stringify(
+        projects
+            .map((project) => [
+                typeof project?.folder_name === "string" ? project.folder_name : "",
+                typeof project?.error === "string" ? project.error : "",
+            ])
+            .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+    );
+}
+
+function appendInvalidProjectNotice(root, list, location) {
+    if (!isActive(root) || builderState.invalidProjects.length === 0 || builderState.invalidProjectsDismissed) {
+        return;
+    }
+
+    const count = builderState.invalidProjects.length;
+    const item = document.createElement("li");
+    item.className = "mvb-invalid-projects";
+    item.setAttribute("data-mvb-invalid-warning", "");
+    item.setAttribute("role", "status");
+
+    const message = document.createElement("p");
+    message.className = "mvb-invalid-projects-message";
+    message.textContent = String(count) + " project " + (count === 1 ? "entry" : "entries") + " could not be read.";
+
+    const actions = document.createElement("div");
+    actions.className = "mvb-invalid-projects-actions";
+
+    const detailsId = "mvb-invalid-project-details-" + location;
+    const detailsButton = document.createElement("button");
+    detailsButton.className = "mvb-button mvb-button-secondary";
+    detailsButton.type = "button";
+    detailsButton.textContent = "Details";
+    detailsButton.setAttribute("aria-controls", detailsId);
+    detailsButton.setAttribute("aria-expanded", "false");
+
+    const dismissButton = document.createElement("button");
+    dismissButton.className = "mvb-button mvb-button-secondary";
+    dismissButton.type = "button";
+    dismissButton.textContent = "Dismiss";
+
+    const details = document.createElement("div");
+    details.className = "mvb-invalid-project-details";
+    details.id = detailsId;
+    details.hidden = true;
+
+    for (const invalidProject of builderState.invalidProjects) {
+        const entry = document.createElement("article");
+        entry.className = "mvb-invalid-project-entry";
+
+        const folderLabel = document.createElement("span");
+        folderLabel.className = "mvb-invalid-project-label";
+        folderLabel.textContent = "Folder";
+
+        const folderValue = document.createElement("span");
+        folderValue.className = "mvb-invalid-project-value";
+        folderValue.textContent = typeof invalidProject.folder_name === "string"
+            ? invalidProject.folder_name
+            : "Unknown project entry";
+
+        const problemLabel = document.createElement("span");
+        problemLabel.className = "mvb-invalid-project-label";
+        problemLabel.textContent = "Problem";
+
+        const problemValue = document.createElement("span");
+        problemValue.className = "mvb-invalid-project-value";
+        problemValue.textContent = typeof invalidProject.error === "string"
+            ? invalidProject.error
+            : "Project entry could not be read.";
+
+        entry.append(folderLabel, folderValue, problemLabel, problemValue);
+        details.append(entry);
+    }
+
+    detailsButton.addEventListener("click", () => {
+        const expanded = details.hidden;
+        details.hidden = !expanded;
+        detailsButton.textContent = expanded ? "Hide Details" : "Details";
+        detailsButton.setAttribute("aria-expanded", String(expanded));
+    });
+    dismissButton.addEventListener("click", () => {
+        if (!isActive(root)) {
+            return;
+        }
+        builderState.invalidProjectsDismissed = true;
+        renderProjectState(root);
+        renderOpenProjectList(root);
+    });
+
+    actions.append(detailsButton, dismissButton);
+    item.append(message, actions, details);
+    list.append(item);
+}
+
+function renderRecentProjectList(root) {
+    if (!isActive(root)) {
+        return;
+    }
+
+    const state = builderState;
+    const list = root.querySelector("[data-mvb-recent-project-list]");
+    const listStatus = root.querySelector("[data-mvb-landing-status]");
+    list.replaceChildren();
+
+    if (state.projectListState === "loading") {
+        listStatus.textContent = "Loading recent projects…";
+        listStatus.dataset.state = "loading";
+        return;
+    }
+    if (state.projectListState === "error") {
+        listStatus.textContent = state.projectListMessage || "Projects could not be loaded.";
+        listStatus.dataset.state = "error";
+        return;
+    }
+
+    const projects = recentProjects(state.projects);
+    if (projects.length === 0) {
+        listStatus.textContent = state.invalidProjects.length > 0
+            ? "No valid projects are available."
+            : "No projects yet. Create a project to begin.";
+        listStatus.dataset.state = state.invalidProjects.length > 0 ? "error" : "empty";
+    } else {
+        listStatus.textContent = "Open a recent project or use Open Project to see the complete list.";
+        listStatus.dataset.state = "ready";
+    }
+
+    for (const project of projects) {
+        const item = document.createElement("li");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "mvb-project-choice";
+        button.dataset.projectId = project.project_id;
+        button.disabled = state.openingProject || state.transitioning || state.closing;
+
+        const name = document.createElement("span");
+        name.className = "mvb-project-choice-name";
+        name.textContent = project.name;
+
+        const updated = document.createElement("span");
+        updated.className = "mvb-project-choice-meta";
+        updated.textContent = formatUpdatedAt(project.updated_at);
+
+        button.append(name, updated);
+        button.addEventListener("click", () => void openProject(root, project.project_id));
+        item.append(button);
+        list.append(item);
+    }
+
+    appendInvalidProjectNotice(root, list, "landing");
 }
 
 function renderOpenProjectList(root) {
@@ -287,12 +643,7 @@ function renderOpenProjectList(root) {
         list.append(item);
     }
 
-    if (state.invalidProjects.length > 0) {
-        const invalidNotice = document.createElement("li");
-        invalidNotice.className = "mvb-invalid-projects";
-        invalidNotice.textContent = `${state.invalidProjects.length} project ${state.invalidProjects.length === 1 ? "entry" : "entries"} could not be read.`;
-        list.append(invalidNotice);
-    }
+    appendInvalidProjectNotice(root, list, "open");
 
     for (const button of openButtons) {
         button.disabled = state.projectListState === "loading" || state.openingProject;
@@ -307,6 +658,7 @@ async function loadProjectList(root) {
     builderState.projectListState = "loading";
     builderState.projectListMessage = "";
     updateProjectListSummary(root);
+    renderRecentProjectList(root);
     renderOpenProjectList(root);
 
     try {
@@ -316,6 +668,11 @@ async function loadProjectList(root) {
         }
         if (!payload || !Array.isArray(payload.projects) || !Array.isArray(payload.invalid_projects)) {
             throw new Error("Project list response was invalid.");
+        }
+        const invalidSignature = invalidProjectsSignature(payload.invalid_projects);
+        if (invalidSignature !== builderState.invalidProjectsSignature) {
+            builderState.invalidProjectsDismissed = false;
+            builderState.invalidProjectsSignature = invalidSignature;
         }
         builderState.projects = payload.projects;
         builderState.invalidProjects = payload.invalid_projects;
@@ -331,6 +688,7 @@ async function loadProjectList(root) {
     }
 
     updateProjectListSummary(root);
+    renderRecentProjectList(root);
     renderOpenProjectList(root);
 }
 
@@ -346,7 +704,7 @@ function showNewProjectError(root, message) {
 }
 
 async function openNewProjectDialog(root) {
-    if (!isActive(root) || builderState.transitioning || builderState.closing || builderState.newProjectBusy) {
+    if (!isActive(root) || builderState.transitioning || builderState.closing || builderState.newProjectBusy || builderState.operation) {
         return;
     }
 
@@ -376,7 +734,7 @@ async function openNewProjectDialog(root) {
 }
 
 async function createProject(root) {
-    if (!isActive(root) || builderState.newProjectBusy || builderState.transitioning || builderState.closing) {
+    if (!isActive(root) || builderState.newProjectBusy || builderState.transitioning || builderState.closing || builderState.operation) {
         return;
     }
 
@@ -433,7 +791,7 @@ async function createProject(root) {
 }
 
 async function openProjectDialog(root) {
-    if (!isActive(root) || builderState.transitioning || builderState.closing || builderState.newProjectBusy) {
+    if (!isActive(root) || builderState.transitioning || builderState.closing || builderState.newProjectBusy || builderState.operation) {
         return;
     }
 
@@ -460,7 +818,7 @@ async function openProjectDialog(root) {
 }
 
 async function openProject(root, projectId) {
-    if (!isActive(root) || builderState.openingProject || builderState.transitioning || builderState.closing) {
+    if (!isActive(root) || builderState.openingProject || builderState.transitioning || builderState.closing || builderState.operation) {
         return;
     }
 
@@ -493,8 +851,10 @@ async function openProject(root, projectId) {
             return;
         }
         console.error("[Music Video Builder] Project open failed.", error);
+        builderState.projectListState = "error";
+        builderState.projectListMessage = error instanceof Error ? error.message : "Project could not be opened.";
         const listStatus = root.querySelector("[data-mvb-project-list-status]");
-        listStatus.textContent = error instanceof Error ? error.message : "Project could not be opened.";
+        listStatus.textContent = builderState.projectListMessage;
         listStatus.dataset.state = "error";
     } finally {
         if (isActive(root)) {
@@ -504,6 +864,127 @@ async function openProject(root, projectId) {
             renderProjectState(root);
         }
     }
+}
+
+function uploadFormData(file) {
+    const formData = new FormData();
+    formData.append("file", file, file.name);
+    return formData;
+}
+
+async function runProjectMutation(root, operation, task, successMessage) {
+    if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
+        return false;
+    }
+
+    builderState.operation = operation;
+    builderState.setupState = "working";
+    builderState.setupMessage = "";
+    renderProjectState(root);
+    let succeeded = false;
+    try {
+        if (!await flushCurrentProject(root)) {
+            builderState.setupState = "error";
+            builderState.setupMessage = "Save the current project before continuing.";
+            return false;
+        }
+        if (!isActive(root)) {
+            return false;
+        }
+
+        const project = await task();
+        if (!hasProjectDocument(project)) {
+            throw new Error("Project mutation response was invalid.");
+        }
+        setCurrentProject(root, project);
+        builderState.setupState = "success";
+        builderState.setupMessage = successMessage;
+        succeeded = true;
+        void loadProjectList(root);
+        return true;
+    } catch (error) {
+        if (!isActive(root)) {
+            return false;
+        }
+        console.error(`[Music Video Builder] ${operation} operation failed.`, error);
+        builderState.setupState = "error";
+        builderState.setupMessage = operation === "audio"
+            ? "Audio import failed."
+            : operation === "srt"
+                ? "SRT import failed."
+                : "Scene build failed.";
+        return false;
+    } finally {
+        if (isActive(root)) {
+            builderState.operation = null;
+            if (!succeeded && builderState.setupState === "working") {
+                builderState.setupState = "error";
+            }
+            renderProjectState(root);
+        }
+    }
+}
+
+async function importMasterAudio(root) {
+    const input = root.querySelector("[data-mvb-audio-file]");
+    const file = input.files?.[0];
+    if (!file) {
+        builderState.setupState = "error";
+        builderState.setupMessage = "Choose a master audio file first.";
+        renderProjectState(root);
+        return;
+    }
+
+    const imported = await runProjectMutation(
+        root,
+        "audio",
+        () => fetchJson(`${PROJECTS_PATH}/${encodeURIComponent(builderState.currentProject.project_id)}/source/audio`, {
+            method: "POST",
+            body: uploadFormData(file),
+        }),
+        "Master audio imported.",
+    );
+    if (imported && isActive(root)) {
+        input.value = "";
+        renderSetupState(root);
+    }
+}
+
+async function importLyricsSrt(root) {
+    const input = root.querySelector("[data-mvb-srt-file]");
+    const file = input.files?.[0];
+    if (!file) {
+        builderState.setupState = "error";
+        builderState.setupMessage = "Choose an SRT file first.";
+        renderProjectState(root);
+        return;
+    }
+
+    const imported = await runProjectMutation(
+        root,
+        "srt",
+        () => fetchJson(`${PROJECTS_PATH}/${encodeURIComponent(builderState.currentProject.project_id)}/source/srt`, {
+            method: "POST",
+            body: uploadFormData(file),
+        }),
+        "Lyrics SRT imported.",
+    );
+    if (imported && isActive(root)) {
+        input.value = "";
+        renderSetupState(root);
+    }
+}
+
+async function buildProjectScenes(root) {
+    await runProjectMutation(
+        root,
+        "scenes",
+        () => fetchJson(`${PROJECTS_PATH}/${encodeURIComponent(builderState.currentProject.project_id)}/scenes/build`, {
+            method: "POST",
+            body: JSON.stringify({}),
+        }),
+        "Scenes built.",
+    );
 }
 
 function scheduleAutosave(root) {
@@ -641,7 +1122,7 @@ async function checkBackend(root) {
     healthController = controller;
     updateStatus(root, "Checking…", "checking");
 
-    let visibleFailure = "Connection failed";
+    let visibleFailure = "Backend unavailable — project operations may not work.";
 
     try {
         const response = await api.fetchApi("/music-video-builder/health", {
@@ -650,7 +1131,6 @@ async function checkBackend(root) {
         });
 
         if (!response.ok) {
-            visibleFailure = `Unavailable (HTTP ${response.status})`;
             throw new Error(`Health endpoint returned HTTP ${response.status} ${response.statusText}.`);
         }
 
@@ -658,12 +1138,10 @@ async function checkBackend(root) {
         try {
             payload = await response.json();
         } catch (error) {
-            visibleFailure = "Invalid response";
             throw new Error("Health endpoint did not return valid JSON.", { cause: error });
         }
 
         if (!hasValidHealthPayload(payload)) {
-            visibleFailure = "Invalid response";
             throw new Error(`Health endpoint returned an invalid payload: ${JSON.stringify(payload)}`);
         }
 
@@ -701,76 +1179,134 @@ function openBuilder() {
     const root = document.createElement("div");
     root.className = "mvb-overlay";
     root.innerHTML = `
-        <section class="mvb-panel" role="dialog" aria-modal="true" aria-labelledby="mvb-title">
+        <section class="mvb-panel" role="dialog" aria-modal="true" aria-label="Vesper Music Video Builder">
             <header class="mvb-header">
-                <div class="mvb-brand">
-                    <span class="mvb-brand-rule" aria-hidden="true"></span>
-                    <div>
-                        <p class="mvb-phase">Phase 1 · Project persistence</p>
-                        <h1 id="mvb-title">Vesper Music Video Builder</h1>
-                        <p class="mvb-subtitle">A local workspace for organised music-video projects.</p>
+                <div class="mvb-header-main">
+                    <div class="mvb-brand" data-mvb-landing-header>
+                        <span class="mvb-brand-rule" aria-hidden="true"></span>
+                        <div>
+                            <p class="mvb-phase">Phase 2 · Audio, lyrics, and scenes</p>
+                            <h1 id="mvb-title">Vesper Music Video Builder</h1>
+                            <p class="mvb-subtitle">A local project space for organised music-video work.</p>
+                        </div>
+                    </div>
+                    <div class="mvb-project-toolbar" data-mvb-project-toolbar hidden>
+                        <label class="mvb-project-name-field">
+                            <span class="mvb-sr-only">Project name</span>
+                            <input data-mvb-project-name type="text" maxlength="200" autocomplete="off" aria-label="Project name" disabled>
+                        </label>
+                        <div class="mvb-project-toolbar-actions">
+                            <span class="mvb-save-state" data-mvb-save-state data-state="empty" aria-live="polite" hidden></span>
+                            <button class="mvb-button mvb-button-secondary" data-mvb-save type="button" disabled>Save</button>
+                            <button class="mvb-button mvb-button-secondary" data-mvb-projects type="button">Projects</button>
+                        </div>
                     </div>
                 </div>
-                <button class="mvb-close" type="button">Close</button>
+                <div class="mvb-header-actions">
+                    <button class="mvb-maximize" data-mvb-maximize type="button" aria-pressed="false">Maximise</button>
+                    <button class="mvb-close" type="button">Close</button>
+                </div>
             </header>
 
             <main class="mvb-content">
-                <section class="mvb-health" aria-label="Backend status">
-                    <div>
-                        <p class="mvb-eyebrow">Service connection</p>
-                        <span class="mvb-health-label">Music Video Builder backend</span>
+                <div class="mvb-health-banner" data-mvb-health-banner data-mvb-status data-state="checking" role="status" aria-live="polite" hidden></div>
+
+                <section class="mvb-landing" data-mvb-landing aria-labelledby="mvb-landing-heading" hidden>
+                    <div class="mvb-landing-heading">
+                        <div>
+                            <p class="mvb-eyebrow">Project landing</p>
+                            <h2 id="mvb-landing-heading">Recent Projects</h2>
+                            <p class="mvb-landing-subtitle">Open a saved project or create a new project to begin.</p>
+                        </div>
+                        <div class="mvb-project-actions mvb-landing-actions">
+                            <button class="mvb-button mvb-button-primary" data-mvb-new type="button">New Project</button>
+                            <button class="mvb-button mvb-button-secondary" data-mvb-open type="button">Open Project</button>
+                        </div>
                     </div>
-                    <span class="mvb-health-value" data-mvb-status data-state="checking" aria-live="polite">Checking…</span>
+                    <p class="mvb-landing-status" data-mvb-landing-status aria-live="polite">Loading recent projects…</p>
+                    <ul class="mvb-project-list mvb-recent-project-list" data-mvb-recent-project-list></ul>
                 </section>
 
-                <section class="mvb-project-card" aria-labelledby="mvb-project-heading">
-                    <div class="mvb-section-heading">
+                <section class="mvb-setup" data-mvb-setup aria-labelledby="mvb-setup-heading">
+                    <div class="mvb-setup-heading">
                         <div>
-                            <p class="mvb-eyebrow">Workspace</p>
-                            <h2 id="mvb-project-heading">Project persistence</h2>
+                            <p class="mvb-eyebrow">Setup</p>
+                            <h2 id="mvb-setup-heading">Sources</h2>
                         </div>
-                        <span class="mvb-save-state" data-mvb-save-state data-state="empty" aria-live="polite">No project open</span>
+                        <span class="mvb-setup-status" data-mvb-setup-status data-state="empty" aria-live="polite"></span>
                     </div>
 
-                    <div class="mvb-project-empty" data-mvb-project-empty>
-                        <p class="mvb-empty-title">No project open</p>
-                        <p>Create a new project or open an existing one to begin.</p>
+                    <div class="mvb-source-grid">
+                        <article class="mvb-source-card">
+                            <div class="mvb-source-heading">
+                                <div>
+                                    <p class="mvb-eyebrow">01 · Audio</p>
+                                    <h3>Master Audio Track</h3>
+                                </div>
+                                <span class="mvb-source-status" data-mvb-audio-status data-state="empty">Waiting for source</span>
+                            </div>
+                            <p class="mvb-source-meta" data-mvb-audio-meta>No master audio imported.</p>
+                            <label class="mvb-file-field">
+                                <span>Select audio file</span>
+                                <input data-mvb-audio-file type="file" accept=".wav,.mp3,.flac,.m4a,.aac,.ogg,.opus,audio/*" disabled>
+                            </label>
+                            <button class="mvb-button mvb-button-secondary" data-mvb-import-audio type="button" disabled>Import Master Audio</button>
+                        </article>
+
+                        <article class="mvb-source-card">
+                            <div class="mvb-source-heading">
+                                <div>
+                                    <p class="mvb-eyebrow">02 · Lyrics</p>
+                                    <h3>Lyrics SRT</h3>
+                                </div>
+                                <span class="mvb-source-status" data-mvb-srt-status data-state="empty">Waiting for source</span>
+                            </div>
+                            <p class="mvb-source-meta" data-mvb-srt-meta>No lyrics SRT imported.</p>
+                            <label class="mvb-file-field">
+                                <span>Select SRT file</span>
+                                <input data-mvb-srt-file type="file" accept=".srt,text/plain" disabled>
+                            </label>
+                            <button class="mvb-button mvb-button-secondary" data-mvb-import-srt type="button" disabled>Import SRT</button>
+                        </article>
                     </div>
 
-                    <div class="mvb-project-editor" data-mvb-project-editor hidden>
-                        <div class="mvb-current-project-heading">
-                            <p class="mvb-eyebrow">Current project</p>
-                            <h3 data-mvb-current-project>No project open</h3>
+                    <div class="mvb-scene-build">
+                        <div>
+                            <p class="mvb-eyebrow">03 · Scenes</p>
+                            <p>Build the timing review from the imported sources.</p>
                         </div>
-                        <label class="mvb-field">
-                            <span>Project name</span>
-                            <input data-mvb-project-name type="text" maxlength="200" autocomplete="off" disabled>
-                        </label>
-                        <button class="mvb-button mvb-button-primary" data-mvb-save type="button" disabled>Save</button>
+                        <button class="mvb-button mvb-button-primary" data-mvb-build-scenes type="button" disabled>Build Scenes</button>
                     </div>
-
-                    <div class="mvb-project-actions">
-                        <button class="mvb-button mvb-button-primary" data-mvb-new type="button">New Project</button>
-                        <button class="mvb-button mvb-button-secondary" data-mvb-open type="button">Open Project</button>
-                    </div>
-                    <p class="mvb-list-summary" data-mvb-list-summary aria-live="polite">Loading saved projects…</p>
                 </section>
 
-                <section class="mvb-stages" aria-labelledby="mvb-stages-heading">
-                    <div class="mvb-section-heading">
+                <section class="mvb-scene-review" data-mvb-scene-review aria-labelledby="mvb-scene-review-heading" hidden>
+                    <div class="mvb-scene-review-heading">
                         <div>
-                            <p class="mvb-eyebrow">Pipeline</p>
-                            <h2 id="mvb-stages-heading">Builder stages</h2>
+                            <p class="mvb-eyebrow">Timing Review</p>
+                            <h2 id="mvb-scene-review-heading">Scenes</h2>
                         </div>
-                        <span class="mvb-stage-note">Stage navigation follows in later phases</span>
+                        <span class="mvb-scene-summary" data-mvb-scene-summary>No scenes built yet.</span>
                     </div>
-                    <ol class="mvb-stage-list" aria-label="Builder stages">
-                        <li><span class="mvb-stage-number">01</span><span>Setup</span></li>
-                        <li><span class="mvb-stage-number">02</span><span>Storyboard</span></li>
-                        <li><span class="mvb-stage-number">03</span><span>Keyframes</span></li>
-                        <li><span class="mvb-stage-number">04</span><span>Prompts</span></li>
-                        <li><span class="mvb-stage-number">05</span><span>Render</span></li>
-                    </ol>
+                    <div class="mvb-scenes-empty" data-mvb-scenes-empty>
+                        <p>Build scenes after both sources are imported.</p>
+                    </div>
+                    <div class="mvb-scene-table-wrap" data-mvb-scene-table hidden>
+                        <table class="mvb-scene-table">
+                            <thead>
+                                <tr>
+                                    <th scope="col">#</th>
+                                    <th scope="col">Type</th>
+                                    <th scope="col">Start</th>
+                                    <th scope="col">End</th>
+                                    <th scope="col">Duration</th>
+                                    <th scope="col">Split</th>
+                                    <th scope="col">Cue IDs</th>
+                                    <th scope="col">Lyric</th>
+                                </tr>
+                            </thead>
+                            <tbody data-mvb-scene-rows></tbody>
+                        </table>
+                    </div>
                 </section>
             </main>
 
@@ -778,7 +1314,7 @@ function openBuilder() {
                 <section class="mvb-dialog" role="dialog" aria-modal="true" aria-labelledby="mvb-new-heading">
                     <div class="mvb-dialog-heading">
                         <div>
-                            <p class="mvb-eyebrow">New workspace</p>
+                            <p class="mvb-eyebrow">New project</p>
                             <h2 id="mvb-new-heading">Create project</h2>
                         </div>
                         <button class="mvb-dialog-close" data-mvb-cancel-new type="button">Cancel</button>
@@ -801,13 +1337,16 @@ function openBuilder() {
                 <section class="mvb-dialog mvb-open-dialog" role="dialog" aria-modal="true" aria-labelledby="mvb-open-heading">
                     <div class="mvb-dialog-heading">
                         <div>
-                            <p class="mvb-eyebrow">Saved workspaces</p>
-                            <h2 id="mvb-open-heading">Open project</h2>
+                            <p class="mvb-eyebrow">Projects</p>
+                            <h2 id="mvb-open-heading">Projects</h2>
                         </div>
                         <button class="mvb-dialog-close" data-mvb-close-open type="button">Close</button>
                     </div>
                     <p class="mvb-dialog-status" data-mvb-project-list-status aria-live="polite">Loading saved projects…</p>
                     <ul class="mvb-project-list" data-mvb-project-list></ul>
+                    <div class="mvb-dialog-actions">
+                        <button class="mvb-button mvb-button-primary" data-mvb-dialog-new type="button">New Project</button>
+                    </div>
                 </section>
             </div>
         </section>
@@ -828,23 +1367,47 @@ function openBuilder() {
         saving: false,
         closing: false,
         transitioning: false,
+        operation: null,
+        setupState: "empty",
+        setupMessage: "",
         newProjectBusy: false,
         openingProject: false,
+        maximized: false,
+        invalidProjectsDismissed: false,
+        invalidProjectsSignature: "",
     };
 
     const closeButton = root.querySelector(".mvb-close");
-    const newButton = root.querySelector("[data-mvb-new]");
-    const openButton = root.querySelector("[data-mvb-open]");
+    const maximizeButton = root.querySelector("[data-mvb-maximize]");
+    const projectsButton = root.querySelector("[data-mvb-projects]");
+    const newButtons = root.querySelectorAll("[data-mvb-new]");
+    const openButtons = root.querySelectorAll("[data-mvb-open]");
     const saveButton = root.querySelector("[data-mvb-save]");
     const projectName = root.querySelector("[data-mvb-project-name]");
+    const audioFile = root.querySelector("[data-mvb-audio-file]");
+    const importAudioButton = root.querySelector("[data-mvb-import-audio]");
+    const srtFile = root.querySelector("[data-mvb-srt-file]");
+    const importSrtButton = root.querySelector("[data-mvb-import-srt]");
+    const buildScenesButton = root.querySelector("[data-mvb-build-scenes]");
     const newForm = root.querySelector("[data-mvb-new-form]");
     const cancelNewButtons = root.querySelectorAll("[data-mvb-cancel-new]");
     const closeOpenButton = root.querySelector("[data-mvb-close-open]");
 
     closeButton.addEventListener("click", () => void closeBuilder(root));
-    newButton.addEventListener("click", () => openNewProjectDialog(root));
-    openButton.addEventListener("click", () => void openProjectDialog(root));
+    maximizeButton.addEventListener("click", () => toggleMaximize(root));
+    projectsButton.addEventListener("click", () => void openProjectDialog(root));
+    for (const button of newButtons) {
+        button.addEventListener("click", () => void openNewProjectDialog(root));
+    }
+    for (const button of openButtons) {
+        button.addEventListener("click", () => void openProjectDialog(root));
+    }
     saveButton.addEventListener("click", () => void saveCurrentProject(root));
+    audioFile.addEventListener("change", () => renderSetupState(root));
+    importAudioButton.addEventListener("click", () => void importMasterAudio(root));
+    srtFile.addEventListener("change", () => renderSetupState(root));
+    importSrtButton.addEventListener("click", () => void importLyricsSrt(root));
+    buildScenesButton.addEventListener("click", () => void buildProjectScenes(root));
     projectName.addEventListener("input", () => {
         if (!isActive(root) || !builderState.currentProject) {
             return;
@@ -877,6 +1440,7 @@ function openBuilder() {
         button.addEventListener("click", () => closeProjectDialogs(root));
     }
     closeOpenButton.addEventListener("click", () => closeProjectDialogs(root));
+    root.querySelector("[data-mvb-dialog-new]").addEventListener("click", () => void openNewProjectDialog(root));
 
     overlay = root;
     builderState = state;

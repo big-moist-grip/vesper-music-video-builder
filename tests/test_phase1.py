@@ -25,13 +25,16 @@ class ProjectStorageTests(unittest.TestCase):
     def test_schema_validation_accepts_new_project_and_rejects_invalid_values(self):
         project = self.storage.create_project("  Valid Project  ")
         self.assertEqual(project["name"], "Valid Project")
+        self.assertEqual(project["schema_version"], 2)
+        self.assertEqual(project["source"], {"master_audio": None, "lyrics_srt": None})
+        self.assertEqual(project["scenes"], [])
         self.assertEqual(validate_project_document(project), project)
 
         malformed_uuid = {**project, "project_id": "not-a-uuid"}
         with self.assertRaises(ProjectValidationError):
             validate_project_document(malformed_uuid)
 
-        unsupported_version = {**project, "schema_version": 2}
+        unsupported_version = {**project, "schema_version": 3}
         with self.assertRaises(ProjectValidationError):
             validate_project_document(unsupported_version)
 
