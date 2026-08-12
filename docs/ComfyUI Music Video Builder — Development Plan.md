@@ -72,6 +72,13 @@ Purpose:
 
 Turn a master audio track and SRT lyrics into an organised storyboard and a queue of local MiniMax H3 scene generations that can later be assembled in DaVinci Resolve.
 
+The MVP supports two first-class per-scene H3 visual-conditioning methods:
+
+- `keyframe_i2v` — Keyframe / Image-to-Video. This is the default and primary workflow.
+- `reference2video` — Reference-to-Video using selected project-local character/location still-image references through H3 REF2VA.
+
+Generic Text-to-Video is not part of the Music Video Builder MVP.
+
 Target machine:
 
 - Windows.
@@ -166,11 +173,12 @@ Returned JSON allocates:
 - Locations.
 - Scene type.
 - Scene action.
-- Keyframe instructions.
+- Visual-generation instructions.
 - Camera direction.
 - Motion direction.
 - Continuity notes.
-- References required to create the keyframe.
+- References relevant to the scene.
+- Keyframe instructions where useful for the default keyframe workflow.
 
 Importer must reject before mutation:
 
@@ -183,9 +191,25 @@ Importer must reject before mutation:
 
 No partial application after validation failure.
 
+Storyboard import does not make the final per-scene generation-method choice. The Visuals stage defaults every scene to `keyframe_i2v`; the user may override an individual scene to `reference2video`.
+
 ---
 
-## Stage F — Keyframes
+## Stage F — Visuals
+
+Visuals owns the authoritative per-scene generation method.
+
+Each scene stores:
+
+- `generation_method`
+  - `keyframe_i2v`
+  - `reference2video`
+
+Default:
+
+`keyframe_i2v`
+
+Changing generation method must not destructively delete assets or metadata belonging to the inactive method.
 
 Each scene card shows:
 
@@ -195,13 +219,19 @@ Each scene card shows:
 - SRT lyric or instrumental status.
 - Assigned characters.
 - Assigned location.
-- Required reference images.
-- Keyframe-generation instructions.
-- Copyable image prompt.
+- Generation Method.
+- Relevant project-local reference images.
+- Visual-generation instructions.
 
-The user generates keyframe images externally.
+### Keyframe / Image-to-Video
 
-The user then assigns the accepted image to the scene.
+When `generation_method = keyframe_i2v`:
+
+- Show keyframe-generation instructions.
+- Show a copyable external-image prompt.
+- The user generates the keyframe image externally.
+- The user assigns the accepted image to the scene.
+- The accepted keyframe is the primary H3 visual-conditioning input.
 
 Store separately:
 
@@ -211,11 +241,30 @@ Store separately:
 
 The accepted image itself is authoritative.
 
+### Reference-to-Video
+
+When `generation_method = reference2video`:
+
+- An accepted keyframe is not required.
+- The user selects one or more existing project-local Character and/or Location reference images.
+- Store an ordered reference selection including the owning entity ID and reference ID.
+- Map selected still images deterministically to H3 `<Picture N>` inputs.
+- Build deterministic `<Subject N>` / location definitions from the selected project resources and storyboard context.
+- The final H3 prompt may use those picture/subject tags directly.
+
+Reference-to-Video is a first-class MVP mode, not an experimental hidden branch.
+
+Do not expose generic T2V.
+
+Do not expose H3 video-reference or motion-transfer inputs in MVP merely because REF2VA can technically accept them.
+
 ---
 
 ## Stage G — H3 prompt generation
 
-Final H3 prompts are built using:
+Final H3 prompts branch by the scene's `generation_method`.
+
+For `keyframe_i2v`, prompt construction uses:
 
 - Actual keyframe description.
 - Character continuity information.
@@ -225,6 +274,20 @@ Final H3 prompts are built using:
 - Motion direction.
 - Scene duration.
 - Relevant audio/performance requirements.
+
+For `reference2video`, prompt construction uses:
+
+- Ordered selected project-local references.
+- Deterministic `<Picture N>` / `<Subject N>` mapping.
+- Character continuity information.
+- Location information.
+- Scene action.
+- Camera direction.
+- Motion direction.
+- Scene duration.
+- Relevant audio/performance requirements.
+
+Both paths produce one final editable H3 prompt string before render.
 
 ### Prompt-helper architecture
 
@@ -247,21 +310,65 @@ The final editable prompt stored in the scene is authoritative.
 
 ---
 
+## MVP builder tabs
+
+The user-facing production sequence is:
+
+`Setup -> Storyboard -> Visuals -> Prompts -> Render`
+
+Responsibilities:
+
+- Setup — master audio, SRT, scene timing/provenance.
+- Storyboard — characters, locations, references, story direction, ChatGPT relay/import.
+- Visuals — per-scene Generation Method plus Keyframe or Reference-to-Video visual inputs.
+- Prompts — final editable H3 prompt review and generation settings.
+- Render — single-scene and batch H3 execution, takes, status, upscale and Resolve handoff.
+
+Only functional tabs are shown. Do not add future-stage placeholder navigation.
+
+---
+
 # 3. H3 production architecture
 
-## Primary generation mode
+## Scene generation methods
 
-Default MVP generation path:
+The MVP has two first-class per-scene generation methods.
+
+### `keyframe_i2v` — Keyframe / Image-to-Video
+
+Default and primary path:
 
 `accepted keyframe -> H3 I2V/FL2VA -> output video`
+
+The accepted keyframe is the primary visual-conditioning input.
+
+### `reference2video` — Reference-to-Video
+
+Alternate path:
+
+`selected project-local still references -> H3 REF2VA -> output video`
+
+This mode does not require an accepted keyframe.
+
+It uses ordered Character and/or Location reference images selected in Visuals and maps them deterministically into H3 picture/subject references.
+
+### Shared rules
+
+- Generation method is selected per scene.
+- New scenes default to `keyframe_i2v`.
+- Switching methods must not destructively delete inactive-method assets or metadata.
+- Both methods use the exact scene audio extracted from the master song as authoritative source audio.
+- Both methods share the same storyboard action/camera/motion/continuity context.
+- Both methods produce a final editable prompt before rendering.
+- Both methods produce the same take/status/output model.
 
 Do not build a general H3 interface.
 
 Do not expose T2V in the Music Video Builder.
 
-REF2VA is not an MVP requirement unless workflow qualification demonstrates a concrete need that cannot be satisfied by the accepted keyframe.
+Do not expose H3 video-reference/motion-transfer inputs in MVP.
 
-The generated storyboard keyframe is the primary visual-conditioning input.
+Production integration must qualify both FL2VA/I2V and REF2VA. If their minimum stable graphs differ materially, prefer separate stripped production templates/manifests rather than retaining a large generic multi-mode donor graph.
 
 ---
 
@@ -305,8 +412,8 @@ Do not reproduce their UI groups, notes, toggles or convenience infrastructure.
 Use as the primary reference for:
 
 - H3 FL2VA/I2V generation.
-- Optional REF2VA mechanics if later required.
-- Source-audio latent replacement.
+- H3 REF2VA generation.
+- Source-audio latent replacement for both supported generation methods where compatible.
 - Turbo LoRA.
 - Sage Attention.
 - Sol Attention.
@@ -321,7 +428,6 @@ Potential features in this donor that are not automatically adopted:
 - EasyCache.
 - RIFE.
 - T2V.
-- REF2VA.
 - Generic LoRA controls.
 
 Qualification determines whether an optimization provides enough measurable benefit to retain.
@@ -379,12 +485,15 @@ Reference for:
 - Half-resolution generation.
 - NVIDIA VSR integration.
 - LTX 2× upscale behaviour.
-- Large REF2VA input handling.
-- Audio/video/image reference conventions.
+- REF2VA still-image input handling.
+- Ordered `<Picture N>` / `<Subject N>` reference conventions.
+- Audio/video/image reference mechanics as research evidence.
 
 It is deliberately too broad to be the production graph.
 
 Do not use it as the builder workflow.
+
+MVP Reference-to-Video adopts only the qualified still-image REF2VA subset plus the authoritative scene-audio path. Video-reference/motion-transfer UI remains excluded.
 
 ---
 
@@ -392,7 +501,7 @@ Do not use it as the builder workflow.
 
 Target builder UI:
 
-### Generation mode
+### Quality mode
 
 - `Draft`
 - `Final`
@@ -520,12 +629,18 @@ A node used only to make a manually operated workflow more convenient is not aut
 
 # 9. Workflow manifest
 
-Production workflow-specific identifiers live in one manifest.
+Production workflow-specific identifiers live in a small manifest registry keyed by supported scene generation method.
 
-Example concept:
+Expected production entries:
+
+- `keyframe_i2v`
+- `reference2video`
+
+Conceptual I2V entry:
 
 ```json
 {
+  "generation_method": "keyframe_i2v",
   "workflow_id": "h3_music_video_i2v_v1",
   "workflow_file": "h3_music_video_i2v_api.json",
   "required_node_types": [],
@@ -543,17 +658,44 @@ Example concept:
 }
 ```
 
+Conceptual REF2VA entry:
+
+```json
+{
+  "generation_method": "reference2video",
+  "workflow_id": "h3_music_video_ref2va_v1",
+  "workflow_file": "h3_music_video_ref2va_api.json",
+  "required_node_types": [],
+  "required_models": [],
+  "inputs": {
+    "pictures": {},
+    "audio": {},
+    "prompt": {},
+    "seed": {},
+    "width": {},
+    "height": {},
+    "frame_count": {},
+    "filename_prefix": {}
+  }
+}
+```
+
+Exact REF2VA picture-slot mappings are frozen only after donor qualification.
+
 Never scatter node IDs through Python source.
 
 Every render:
 
-1. Loads the immutable production template.
-2. Deep-copies it.
-3. Patches declared manifest inputs.
-4. Validates it.
-5. Queues the fresh copy.
+1. Selects the manifest from the scene's `generation_method`.
+2. Loads that immutable production template.
+3. Deep-copies it.
+4. Patches only declared manifest inputs.
+5. Validates it.
+6. Queues the fresh copy.
 
-Never mutate the stored workflow template.
+Never mutate a stored workflow template.
+
+Do not force both supported methods into one large generic donor graph if separate stripped graphs are smaller or more stable.
 
 ---
 
@@ -613,11 +755,15 @@ Project state must include:
 - locations
 - reference assets
 - storyboard allocation
-- keyframes
+- per-scene `generation_method`
+- keyframe assets/metadata
+- ordered Reference-to-Video selections/mappings
 - prompts
 - render settings
 - render status
 - output metadata
+
+Generation-method switching is non-destructive: inactive keyframe or Reference-to-Video data remains stored unless the user explicitly removes it.
 
 Save atomically:
 
@@ -626,6 +772,18 @@ Save atomically:
 Do not build a generic schema-migration framework.
 
 A simple integer schema version and narrowly scoped migration functions are enough if a migration ever becomes necessary.
+
+### Project-management safety
+
+The no-project landing may delete a valid project only through:
+
+- an explicit in-app confirmation
+- validated project ID
+- backend-confined deletion of that project's directory
+
+Never accept an arbitrary filesystem path from the frontend.
+
+Unreadable-project warnings may be persistently ignored by storing an application-local invalid-entry signature outside project JSON. Ignoring a warning must not delete or modify the malformed project. If the invalid condition changes, the new failure may surface again.
 
 ---
 
@@ -708,6 +866,7 @@ Do not implement:
 - Generic H3 playground.
 - Generic ComfyUI workflow editor.
 - T2V UI.
+- H3 video-reference/motion-transfer UI.
 - Built-in image generation.
 - Built-in image editing.
 - Vision model.
@@ -797,9 +956,13 @@ Required automated coverage eventually includes:
 - save/load.
 - failed atomic write handling.
 - GPT import validation.
-- prompt construction.
+- prompt construction for both supported generation methods.
+- generation-method default/enum validation.
+- non-destructive generation-method switching.
+- deterministic Reference-to-Video picture/subject mapping.
 - frame calculation.
-- manifest patching.
+- generation-method manifest selection.
+- manifest patching for I2V and REF2VA.
 - workflow-template immutability.
 - output filenames.
 - queue state transitions.
@@ -812,7 +975,8 @@ Manual testing is reserved for:
 - frontend appearance.
 - file pickers.
 - reference previews.
-- real H3 rendering.
+- real H3 rendering in Keyframe / Image-to-Video mode.
+- real H3 rendering in Reference-to-Video mode.
 - GPU/VRAM behaviour.
 - speed/quality comparison.
 - RTX VSR.
@@ -969,22 +1133,47 @@ Implement:
 - Preview.
 - Apply.
 - Persistence.
+- Visual/reference instructions that remain usable by either later generation method.
+
+The ChatGPT storyboard relay does not own the final generation-method choice.
+
+Visuals defaults scenes to `keyframe_i2v`; the user can later override any scene to `reference2video`.
 
 No API.
 
 ---
 
-## PHASE 5 — Keyframe workflow
+## PHASE 5 — Visuals workflow
 
 Implement:
 
+- Visuals tab.
 - Scene cards.
+- Per-scene Generation Method selector.
+- Default `keyframe_i2v`.
+- Alternate `reference2video`.
+- Non-destructive method switching.
+
+For `keyframe_i2v`:
+
 - Reference instructions.
 - Keyframe prompt.
 - Copy controls.
 - Accepted-image assignment.
 - Actual keyframe description.
-- Scene readiness.
+- Keyframe readiness.
+
+For `reference2video`:
+
+- Select one or more existing project-local Character/Location still references.
+- Preserve ordered owning-entity/reference IDs.
+- Preview selected references.
+- Deterministic planned `<Picture N>` / `<Subject N>` mapping.
+- Reference-to-Video readiness without requiring a keyframe.
+
+No H3 rendering yet.
+
+Do not expose T2V or video-reference/motion-transfer UI.
 
 ---
 
@@ -1004,14 +1193,25 @@ Secondary donors:
 - `SeedVR2 v4`
 - `All Inputs beta`
 
-### 6A — Extract minimum H3 core
+### 6A — Extract minimum H3 cores
 
-Identify exact nodes required for:
+Identify exact common and method-specific nodes required for both supported production paths.
+
+Keyframe / Image-to-Video:
 
 - FL2VA/I2V.
+- First-frame/keyframe image input.
+
+Reference-to-Video:
+
+- REF2VA.
+- Ordered still-image reference inputs.
+- Picture/subject prompt mapping.
+
+Common:
+
 - Prompt.
-- First-frame image.
-- H3 model.
+- H3 model(s).
 - text encoder.
 - video VAE.
 - audio VAE.
@@ -1024,9 +1224,15 @@ Identify exact nodes required for:
 
 Strip all graph UI/QoL infrastructure.
 
-### 6B — Acceleration qualification
+Do not qualify T2V as a product mode.
 
-Measure only realistic combinations on RTX 4080 SUPER:
+Do not add video-reference/motion-transfer product inputs.
+
+### 6B — Generation and acceleration qualification
+
+Both `keyframe_i2v` and `reference2video` must successfully execute on the target RTX 4080 SUPER before production mappings are frozen.
+
+For each supported method, measure only realistic combinations:
 
 - Base.
 - Turbo.
@@ -1054,11 +1260,18 @@ Test:
 
 Do not test LTX refine unless Sol explicitly reopens it.
 
-### 6D — Production graph
+### 6D — Production graphs
 
-Create the smallest stable production API-format workflow from the winning pieces.
+Create the smallest stable production API-format workflow(s) from the winning pieces.
 
-Create workflow manifest.
+The finished production integration must support:
+
+- `keyframe_i2v`
+- `reference2video`
+
+Prefer separate stripped templates when that is smaller/safer than a generic multi-mode graph.
+
+Create the manifest registry and one approved manifest entry per supported method.
 
 Freeze node mappings after approval.
 
@@ -1068,14 +1281,15 @@ Freeze node mappings after approval.
 
 Implement:
 
-- Production-workflow dependency scan.
-- Required model scan.
+- Production-workflow dependency scan across both approved generation-method manifests.
+- Required model scan for both supported methods.
 - FFmpeg scan.
 - Optional RTX VSR scan.
 - Optional SeedVR2 scan.
 - Optional Ollama scan.
 - Local Ollama H3 prompt helper.
-- Deterministic fallback prompt builder.
+- Deterministic fallback prompt builder for `keyframe_i2v`.
+- Deterministic fallback prompt builder for `reference2video`, including stable picture/subject tags.
 - Editable final prompt.
 
 Do not report dependencies inherited from unused donor branches.
@@ -1088,7 +1302,9 @@ Implement:
 
 - Exact master-audio segment extraction.
 - H3 render-frame calculation.
-- Production-workflow patching.
+- Production workflow/manifest selection from `generation_method`.
+- Keyframe input patching for `keyframe_i2v`.
+- Ordered REF2VA picture input patching for `reference2video`.
 - Source-audio conditioning.
 - Local queue submission.
 - Progress.
@@ -1099,7 +1315,10 @@ Implement:
 - optional selected upscale.
 - output association.
 
-One real H3 scene must pass before batch work begins.
+Before batch work begins, one real H3 scene must pass in each supported generation method:
+
+- Keyframe / Image-to-Video.
+- Reference-to-Video.
 
 ---
 
@@ -1107,7 +1326,7 @@ One real H3 scene must pass before batch work begins.
 
 Implement:
 
-- Sequential scene queue.
+- Sequential scene queue supporting mixed `keyframe_i2v` and `reference2video` scenes in the same project.
 - Persistent states.
 - Stop after current.
 - retry.

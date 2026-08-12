@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -17,12 +18,18 @@ from .scenes import SceneValidationError, validate_scene_list
 
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEGACY_SCHEMA_VERSION = 1
+LEGACY_SCHEMA_VERSION_2 = 2
 PROJECT_FILENAME = "project.json"
 DEFAULT_PROJECTS_ROOT = Path(
     r"D:\User Folders\Documents\Projects\vesper-music-video-builder\projects"
 )
+DEFAULT_STATE_ROOT = Path(
+    r"D:\User Folders\Documents\Projects\vesper-music-video-builder\state"
+)
+INVALID_PROJECT_STATE_FILENAME = "ignored_invalid_projects.json"
+INVALID_PROJECT_STATE_VERSION = 1
 REQUIRED_PROJECT_DIRECTORIES = (
     "source",
     "references",
@@ -35,6 +42,7 @@ REQUIRED_PROJECT_DIRECTORIES = (
 )
 SUPPORTED_AUDIO_EXTENSIONS = frozenset({".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus"})
 LEGACY_PROJECT_FIELDS = ("schema_version", "project_id", "name", "created_at", "updated_at")
+V2_PROJECT_FIELDS = LEGACY_PROJECT_FIELDS + ("source", "scenes")
 PROJECT_FIELDS = (
     "schema_version",
     "project_id",
@@ -43,11 +51,19 @@ PROJECT_FIELDS = (
     "updated_at",
     "source",
     "scenes",
+    "characters",
+    "locations",
 )
 SOURCE_FIELDS = ("master_audio", "lyrics_srt")
 MASTER_AUDIO_FIELDS = ("stored_name", "original_name", "duration_ms")
 LYRICS_SRT_FIELDS = ("stored_name", "original_name", "cue_count")
+REFERENCE_FIELDS = ("reference_id", "stored_name", "original_name")
+CHARACTER_FIELDS = ("character_id", "name", "role", "appearance", "outfit", "references")
+LOCATION_FIELDS = ("location_id", "name", "description", "references")
+CHARACTER_ROLES = frozenset({"performer", "band_member", "extra"})
 _MASTER_AUDIO_NAME_PATTERN = re.compile(r"^master_audio\.[a-z0-9]+$")
+_REFERENCE_EXTENSIONS = frozenset({".png", ".jpg", ".webp"})
+_INVALID_PROJECT_SIGNATURE_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ProjectError(Exception):
@@ -81,6 +97,49 @@ def validate_project_id(project_id: object) -> str:
     return canonical
 
 
+def validate_invalid_project_folder_name(folder_name: object) -> str:
+    if not isinstance(folder_name, str) or not folder_name:
+        raise ProjectValidationError("Invalid project folder identifier is required.")
+    if folder_name in {".", ".."} or "/" in folder_name or "\\" in folder_name:
+        raise ProjectValidationError("Invalid project folder identifier is unsafe.")
+    if any(ord(character) < 32 or ord(character) == 127 for character in folder_name):
+        raise ProjectValidationError("Invalid project folder identifier is unsafe.")
+    return folder_name
+
+
+def validate_invalid_project_signature(signature: object) -> str:
+    if not isinstance(signature, str) or not _INVALID_PROJECT_SIGNATURE_PATTERN.fullmatch(signature):
+        raise ProjectValidationError("Invalid project signature is malformed.")
+    return signature
+
+
+def invalid_project_signature(folder_name: object, error: object) -> str:
+    validated_folder_name = validate_invalid_project_folder_name(folder_name)
+    if not isinstance(error, str) or not error:
+        raise ProjectValidationError("Invalid project error is required.")
+    canonical = json.dumps(
+        [validated_folder_name, error],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def validate_entity_id(entity_id: object, label: str = "Entity ID") -> str:
+    if not isinstance(entity_id, str):
+        raise ProjectValidationError(f"{label} must be a UUID string.")
+
+    try:
+        parsed = uuid.UUID(entity_id)
+    except (ValueError, AttributeError) as error:
+        raise ProjectValidationError(f"{label} must be a valid UUID.") from error
+
+    canonical = str(parsed)
+    if entity_id != canonical:
+        raise ProjectValidationError(f"{label} must use canonical UUID form.")
+    return canonical
+
+
 def validate_project_name(name: object) -> str:
     if not isinstance(name, str):
         raise ProjectValidationError("Project name must be a string.")
@@ -94,6 +153,29 @@ def validate_project_name(name: object) -> str:
     if len(trimmed) > 200:
         raise ProjectValidationError("Project name is too long.")
     return trimmed
+
+
+def validate_entity_name(name: object, label: str) -> str:
+    if not isinstance(name, str):
+        raise ProjectValidationError(f"{label} must be a string.")
+    if any(ord(character) < 32 or ord(character) == 127 for character in name):
+        raise ProjectValidationError(f"{label} contains unsupported control characters.")
+    trimmed = name.strip()
+    if not trimmed:
+        raise ProjectValidationError(f"{label} cannot be empty.")
+    if len(trimmed) > 200:
+        raise ProjectValidationError(f"{label} is too long.")
+    return trimmed
+
+
+def validate_entity_text(value: object, label: str, maximum_length: int = 5_000) -> str:
+    if not isinstance(value, str):
+        raise ProjectValidationError(f"{label} must be a string.")
+    if any(ord(character) < 32 and character not in "\n\r\t" or ord(character) == 127 for character in value):
+        raise ProjectValidationError(f"{label} contains unsupported control characters.")
+    if len(value) > maximum_length:
+        raise ProjectValidationError(f"{label} is too long.")
+    return value
 
 
 def validate_original_name(name: object) -> str:
@@ -158,6 +240,35 @@ def _validate_legacy_project(document: dict[str, object]) -> dict[str, object]:
         **base,
         "source": {"master_audio": None, "lyrics_srt": None},
         "scenes": [],
+        "characters": [],
+        "locations": [],
+    }
+
+
+def _validate_v2_project(document: dict[str, object]) -> dict[str, object]:
+    schema_version = document.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != LEGACY_SCHEMA_VERSION_2:
+        raise ProjectValidationError("Unsupported project schema version.")
+
+    base = _validate_base_project(document, V2_PROJECT_FIELDS)
+    source = _validate_source(document.get("source"))
+    scenes = document.get("scenes")
+    if not isinstance(scenes, list):
+        raise ProjectValidationError("Project scenes must be an array.")
+    if scenes:
+        if source["master_audio"] is None or source["lyrics_srt"] is None:
+            raise ProjectValidationError("Built scenes require master audio and lyrics SRT metadata.")
+        try:
+            validate_scene_list(scenes, source["master_audio"]["duration_ms"])
+        except SceneValidationError as error:
+            raise ProjectValidationError(str(error)) from error
+    return {
+        "schema_version": SCHEMA_VERSION,
+        **base,
+        "source": source,
+        "scenes": scenes,
+        "characters": [],
+        "locations": [],
     }
 
 
@@ -217,6 +328,104 @@ def _validate_source(source: object) -> dict[str, object]:
     }
 
 
+def _validate_reference_metadata(metadata: object) -> dict[str, object]:
+    if not isinstance(metadata, dict) or set(metadata) != set(REFERENCE_FIELDS):
+        raise ProjectValidationError("Reference metadata is invalid.")
+
+    reference_id = validate_entity_id(metadata.get("reference_id"), "Reference ID")
+    stored_name = metadata.get("stored_name")
+    if not isinstance(stored_name, str) or "/" in stored_name or "\\" in stored_name:
+        raise ProjectValidationError("Reference stored filename must be a local filename.")
+    extension = Path(stored_name).suffix.lower()
+    if extension not in _REFERENCE_EXTENSIONS or stored_name != f"{reference_id}{extension}":
+        raise ProjectValidationError("Reference stored filename is invalid.")
+
+    original_name = validate_original_name(metadata.get("original_name"))
+    if original_name in {".", ".."}:
+        raise ProjectValidationError("Reference original filename is invalid.")
+    return {
+        "reference_id": reference_id,
+        "stored_name": stored_name,
+        "original_name": original_name,
+    }
+
+
+def _validate_references(references: object) -> list[dict[str, object]]:
+    if not isinstance(references, list):
+        raise ProjectValidationError("Entity references must be an array.")
+
+    validated: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    for reference in references:
+        normalized = _validate_reference_metadata(reference)
+        reference_id = normalized["reference_id"]
+        if reference_id in seen_ids:
+            raise ProjectValidationError("Entity reference IDs must be unique.")
+        seen_ids.add(reference_id)
+        validated.append(normalized)
+    return validated
+
+
+def _validate_character(document: object) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != set(CHARACTER_FIELDS):
+        raise ProjectValidationError("Character data has unsupported or missing fields.")
+
+    role = document.get("role")
+    if role not in CHARACTER_ROLES:
+        raise ProjectValidationError("Character role is invalid.")
+    return {
+        "character_id": validate_entity_id(document.get("character_id"), "Character ID"),
+        "name": validate_entity_name(document.get("name"), "Character name"),
+        "role": role,
+        "appearance": validate_entity_text(document.get("appearance"), "Character appearance"),
+        "outfit": validate_entity_text(document.get("outfit"), "Character outfit"),
+        "references": _validate_references(document.get("references")),
+    }
+
+
+def _validate_locations(document: object) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != set(LOCATION_FIELDS):
+        raise ProjectValidationError("Location data has unsupported or missing fields.")
+    return {
+        "location_id": validate_entity_id(document.get("location_id"), "Location ID"),
+        "name": validate_entity_name(document.get("name"), "Location name"),
+        "description": validate_entity_text(document.get("description"), "Location description"),
+        "references": _validate_references(document.get("references")),
+    }
+
+
+def _validate_entity_lists(
+    characters: object,
+    locations: object,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    if not isinstance(characters, list):
+        raise ProjectValidationError("Project characters must be an array.")
+    if not isinstance(locations, list):
+        raise ProjectValidationError("Project locations must be an array.")
+
+    validated_characters: list[dict[str, object]] = []
+    character_ids: set[str] = set()
+    for character in characters:
+        normalized = _validate_character(character)
+        character_id = normalized["character_id"]
+        if character_id in character_ids:
+            raise ProjectValidationError("Character IDs must be unique.")
+        character_ids.add(character_id)
+        validated_characters.append(normalized)
+
+    validated_locations: list[dict[str, object]] = []
+    location_ids: set[str] = set()
+    for location in locations:
+        normalized = _validate_locations(location)
+        location_id = normalized["location_id"]
+        if location_id in location_ids:
+            raise ProjectValidationError("Location IDs must be unique.")
+        location_ids.add(location_id)
+        validated_locations.append(normalized)
+
+    return validated_characters, validated_locations
+
+
 def validate_project_document(
     document: object,
     expected_project_id: str | None = None,
@@ -227,6 +436,8 @@ def validate_project_document(
     schema_version = document.get("schema_version")
     if schema_version == LEGACY_SCHEMA_VERSION:
         normalized = _validate_legacy_project(document)
+    elif schema_version == LEGACY_SCHEMA_VERSION_2:
+        normalized = _validate_v2_project(document)
     elif schema_version == SCHEMA_VERSION:
         base = _validate_base_project(document, PROJECT_FIELDS)
         source = _validate_source(document.get("source"))
@@ -240,11 +451,17 @@ def validate_project_document(
                 validate_scene_list(scenes, source["master_audio"]["duration_ms"])
             except SceneValidationError as error:
                 raise ProjectValidationError(str(error)) from error
+        characters, locations = _validate_entity_lists(
+            document.get("characters"),
+            document.get("locations"),
+        )
         normalized = {
             "schema_version": SCHEMA_VERSION,
             **base,
             "source": source,
             "scenes": scenes,
+            "characters": characters,
+            "locations": locations,
         }
     else:
         raise ProjectValidationError("Unsupported project schema version.")
@@ -292,8 +509,18 @@ def atomic_write_json(destination: Path, document: dict[str, object]) -> None:
 class ProjectStorage:
     """Persistence operations rooted at one fixed project directory."""
 
-    def __init__(self, projects_root: str | Path = DEFAULT_PROJECTS_ROOT):
+    def __init__(
+        self,
+        projects_root: str | Path = DEFAULT_PROJECTS_ROOT,
+        state_root: str | Path | None = None,
+    ):
         self.projects_root = Path(projects_root)
+        if state_root is not None:
+            self.state_root = Path(state_root)
+        elif self.projects_root == DEFAULT_PROJECTS_ROOT:
+            self.state_root = DEFAULT_STATE_ROOT
+        else:
+            self.state_root = self.projects_root.parent / "state"
 
     def create_project(self, name: object) -> dict[str, object]:
         validated_name = validate_project_name(name)
@@ -307,6 +534,8 @@ class ProjectStorage:
             "updated_at": created_at,
             "source": {"master_audio": None, "lyrics_srt": None},
             "scenes": [],
+            "characters": [],
+            "locations": [],
         }
         project_directory = self.projects_root / project_id
         project_file = project_directory / PROJECT_FILENAME
@@ -335,38 +564,65 @@ class ProjectStorage:
         return project_directory
 
     def list_projects(self) -> dict[str, list[dict[str, object]]]:
-        projects: list[dict[str, object]] = []
-        invalid_projects: list[dict[str, str]] = []
+        projects, invalid_projects = self._scan_projects()
+        ignored_signatures = self._load_ignored_invalid_signatures()
+        visible_invalid_projects = [
+            invalid_project
+            for invalid_project in invalid_projects
+            if invalid_project["signature"] not in ignored_signatures
+        ]
+        return {"projects": projects, "invalid_projects": visible_invalid_projects}
 
-        if not self.projects_root.exists():
-            return {"projects": projects, "invalid_projects": invalid_projects}
+    def delete_project(self, project_id: object) -> dict[str, object]:
+        canonical_id = validate_project_id(project_id)
+        candidate_directory = self.projects_root / canonical_id
+        if self.projects_root.is_symlink() or candidate_directory.is_symlink():
+            raise ProjectValidationError("Project deletion target is unsafe.")
+        project_directory = self.project_directory(canonical_id)
+
+        # Confirm the target is a valid project before allowing recursive removal.
+        self._read_project(project_directory, canonical_id)
 
         try:
-            candidates = sorted(self.projects_root.iterdir(), key=lambda path: path.name.casefold())
+            projects_root = self.projects_root.resolve(strict=True)
+            target_directory = project_directory.resolve(strict=True)
         except OSError as error:
-            raise ProjectPersistenceError("Could not list projects.") from error
+            raise ProjectPersistenceError("Project deletion target could not be verified.") from error
 
-        for candidate in candidates:
-            if not candidate.is_dir() or candidate.is_symlink():
-                continue
+        if target_directory == projects_root or projects_root not in target_directory.parents:
+            raise ProjectValidationError("Project deletion target is unsafe.")
 
-            try:
-                project_id = validate_project_id(candidate.name)
-                project = self._read_project(candidate, project_id)
-            except ProjectError as error:
-                invalid_projects.append({"folder_name": candidate.name, "error": str(error)})
-                continue
+        try:
+            shutil.rmtree(project_directory)
+        except OSError as error:
+            raise ProjectPersistenceError("Project could not be deleted.") from error
+        return {"project_id": canonical_id, "deleted": True}
 
-            projects.append(
-                {
-                    "project_id": project["project_id"],
-                    "name": project["name"],
-                    "created_at": project["created_at"],
-                    "updated_at": project["updated_at"],
-                }
-            )
+    def ignore_invalid_project(self, folder_name: object, signature: object) -> dict[str, object]:
+        validated_folder_name = validate_invalid_project_folder_name(folder_name)
+        validated_signature = validate_invalid_project_signature(signature)
+        _projects, invalid_projects = self._scan_projects()
+        current_entry = next(
+            (
+                invalid_project
+                for invalid_project in invalid_projects
+                if invalid_project["folder_name"] == validated_folder_name
+            ),
+            None,
+        )
+        if current_entry is None:
+            raise ProjectNotFoundError("Invalid project entry was not found.")
+        if current_entry["signature"] != validated_signature:
+            raise ProjectValidationError("Invalid project entry changed; refresh and retry.")
 
-        return {"projects": projects, "invalid_projects": invalid_projects}
+        ignored_signatures = self._load_ignored_invalid_signatures()
+        ignored_signatures.add(validated_signature)
+        self._save_ignored_invalid_signatures(ignored_signatures)
+        return {
+            "ignored": True,
+            "folder_name": validated_folder_name,
+            "signature": validated_signature,
+        }
 
     def load_project(self, project_id: object) -> dict[str, object]:
         canonical_id = validate_project_id(project_id)
@@ -377,12 +633,19 @@ class ProjectStorage:
         canonical_id = validate_project_id(project_id)
         project_directory = self.project_directory(canonical_id)
         current = self._read_project(project_directory, canonical_id)
-        if (
-            isinstance(document, dict)
-            and document.get("schema_version") == LEGACY_SCHEMA_VERSION
-            and (current["source"]["master_audio"] is not None or current["source"]["lyrics_srt"] is not None or current["scenes"])
-        ):
-            raise ProjectValidationError("Legacy project data cannot overwrite Phase 2 project state.")
+        if isinstance(document, dict) and document.get("schema_version") in {
+            LEGACY_SCHEMA_VERSION,
+            LEGACY_SCHEMA_VERSION_2,
+        }:
+            current_has_state = (
+                current["source"]["master_audio"] is not None
+                or current["source"]["lyrics_srt"] is not None
+                or current["scenes"]
+                or current["characters"]
+                or current["locations"]
+            )
+            if current_has_state:
+                raise ProjectValidationError("Legacy project data cannot overwrite current project state.")
 
         candidate = validate_project_document(document, expected_project_id=canonical_id)
         candidate["created_at"] = current["created_at"]
@@ -407,6 +670,97 @@ class ProjectStorage:
         except json.JSONDecodeError as error:
             raise ProjectValidationError("Project JSON is malformed.") from error
         return validate_project_document(document, expected_project_id=expected_project_id)
+
+    def _scan_projects(
+        self,
+    ) -> tuple[list[dict[str, object]], list[dict[str, str]]]:
+        projects: list[dict[str, object]] = []
+        invalid_projects: list[dict[str, str]] = []
+
+        if not self.projects_root.exists():
+            return projects, invalid_projects
+
+        try:
+            candidates = sorted(self.projects_root.iterdir(), key=lambda path: path.name.casefold())
+        except OSError as error:
+            raise ProjectPersistenceError("Could not list projects.") from error
+
+        for candidate in candidates:
+            if not candidate.is_dir() or candidate.is_symlink():
+                continue
+
+            try:
+                project_id = validate_project_id(candidate.name)
+                project = self._read_project(candidate, project_id)
+            except ProjectError as error:
+                safe_error = str(error)
+                invalid_projects.append(
+                    {
+                        "folder_name": candidate.name,
+                        "error": safe_error,
+                        "signature": invalid_project_signature(candidate.name, safe_error),
+                    }
+                )
+                continue
+
+            projects.append(
+                {
+                    "project_id": project["project_id"],
+                    "name": project["name"],
+                    "created_at": project["created_at"],
+                    "updated_at": project["updated_at"],
+                }
+            )
+
+        return projects, invalid_projects
+
+    def _load_ignored_invalid_signatures(self) -> set[str]:
+        state_file = self.state_root / INVALID_PROJECT_STATE_FILENAME
+        try:
+            raw = state_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return set()
+        except (OSError, UnicodeError) as error:
+            LOGGER.warning("Could not read ignored invalid-project state: %s", error)
+            return set()
+
+        try:
+            document = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            LOGGER.warning("Ignored invalid-project state is malformed: %s", error)
+            return set()
+
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"schema_version", "ignored_signatures"}
+            or document.get("schema_version") != INVALID_PROJECT_STATE_VERSION
+            or not isinstance(document.get("ignored_signatures"), list)
+        ):
+            LOGGER.warning("Ignored invalid-project state has an unsupported shape.")
+            return set()
+
+        signatures = document["ignored_signatures"]
+        if any(
+            not isinstance(signature, str)
+            or _INVALID_PROJECT_SIGNATURE_PATTERN.fullmatch(signature) is None
+            for signature in signatures
+        ):
+            LOGGER.warning("Ignored invalid-project state contains malformed signatures.")
+            return set()
+        return set(signatures)
+
+    def _save_ignored_invalid_signatures(self, signatures: set[str]) -> None:
+        document = {
+            "schema_version": INVALID_PROJECT_STATE_VERSION,
+            "ignored_signatures": sorted(signatures),
+        }
+        try:
+            self.state_root.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(self.state_root / INVALID_PROJECT_STATE_FILENAME, document)
+        except ProjectPersistenceError:
+            raise
+        except OSError as error:
+            raise ProjectPersistenceError("Could not save ignored invalid-project state.") from error
 
     @staticmethod
     def _clean_incomplete_directory(

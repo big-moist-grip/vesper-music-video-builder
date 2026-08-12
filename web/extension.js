@@ -81,7 +81,7 @@ function hasProjectDocument(payload) {
     const source = payload?.source;
     return payload !== null
         && typeof payload === "object"
-        && payload.schema_version === 2
+        && payload.schema_version === 3
         && typeof payload.project_id === "string"
         && typeof payload.name === "string"
         && typeof payload.created_at === "string"
@@ -91,7 +91,9 @@ function hasProjectDocument(payload) {
         && Object.keys(source).length === 2
         && Object.prototype.hasOwnProperty.call(source, "master_audio")
         && Object.prototype.hasOwnProperty.call(source, "lyrics_srt")
-        && Array.isArray(payload.scenes);
+        && Array.isArray(payload.scenes)
+        && Array.isArray(payload.characters)
+        && Array.isArray(payload.locations);
 }
 
 async function fetchJson(path, options = {}) {
@@ -177,6 +179,8 @@ function setCurrentProject(root, project) {
     builderState.saveMessage = "";
     builderState.setupState = project ? "ready" : "empty";
     builderState.setupMessage = "";
+    builderState.storyboardMessage = "";
+    builderState.deleteConfirm = null;
 }
 
 function cancelAutosave(root) {
@@ -307,6 +311,442 @@ function renderSetupState(root) {
     renderSceneReview(root);
 }
 
+function roleLabel(role) {
+    return {
+        performer: "Performer / Singer",
+        band_member: "Band Member",
+        extra: "Extra",
+    }[role] || role;
+}
+
+function referenceUrl(projectId, kind, entityId, referenceId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/${kind}/${encodeURIComponent(entityId)}/references/${encodeURIComponent(referenceId)}`;
+}
+
+function appendDefinitionField(parent, label, value) {
+    const labelElement = document.createElement("dt");
+    labelElement.textContent = label;
+    const valueElement = document.createElement("dd");
+    valueElement.textContent = value || "—";
+    parent.append(labelElement, valueElement);
+}
+
+function appendReferenceList(root, parent, kind, entity) {
+    const projectId = builderState.currentProject.project_id;
+    const references = document.createElement("div");
+    references.className = "mvb-reference-list";
+    if (!entity.references.length) {
+        const empty = document.createElement("p");
+        empty.className = "mvb-reference-empty";
+        empty.textContent = "No reference images.";
+        references.append(empty);
+    }
+
+    for (const reference of entity.references) {
+        const item = document.createElement("figure");
+        item.className = "mvb-reference-item";
+
+        const image = document.createElement("img");
+        image.src = referenceUrl(projectId, kind, entity[`${kind === "characters" ? "character" : "location"}_id`], reference.reference_id);
+        image.alt = `${entity.name} reference`;
+        image.title = reference.original_name;
+        image.loading = "lazy";
+
+        const caption = document.createElement("figcaption");
+        caption.textContent = reference.original_name;
+
+        const removeButton = document.createElement("button");
+        removeButton.className = "mvb-button mvb-button-small mvb-button-danger";
+        removeButton.type = "button";
+        removeButton.textContent = "Remove";
+        removeButton.disabled = Boolean(builderState.operation);
+        removeButton.addEventListener("click", () => void removeReference(root, kind, entity, reference));
+
+        item.append(image, caption, removeButton);
+        references.append(item);
+    }
+    parent.append(references);
+}
+
+function appendReferenceUpload(root, parent, kind, entity) {
+    const entityId = entity[kind === "characters" ? "character_id" : "location_id"];
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp";
+    input.hidden = true;
+    input.addEventListener("change", () => {
+        const file = input.files?.[0];
+        if (!file) {
+            return;
+        }
+        void uploadReference(root, kind, entityId, file).finally(() => {
+            input.value = "";
+        });
+    });
+
+    const button = document.createElement("button");
+    button.className = "mvb-button mvb-button-secondary mvb-button-small";
+    button.type = "button";
+    button.textContent = "Add Reference";
+    button.disabled = Boolean(builderState.operation);
+    button.addEventListener("click", () => input.click());
+    parent.append(button, input);
+}
+
+function appendDeleteControls(root, parent, kind, entity) {
+    const entityId = entity[kind === "characters" ? "character_id" : "location_id"];
+    const isPending = builderState.deleteConfirm?.kind === kind
+        && builderState.deleteConfirm?.id === entityId;
+    if (!isPending) {
+        const deleteButton = document.createElement("button");
+        deleteButton.className = "mvb-button mvb-button-danger mvb-button-small";
+        deleteButton.type = "button";
+        deleteButton.textContent = "Delete";
+        deleteButton.disabled = Boolean(builderState.operation);
+        deleteButton.addEventListener("click", () => {
+            builderState.deleteConfirm = { kind, id: entityId };
+            renderProjectState(root);
+        });
+        parent.append(deleteButton);
+        return;
+    }
+
+    const confirmation = document.createElement("span");
+    confirmation.className = "mvb-delete-confirmation";
+    confirmation.textContent = `Delete ${entity.name}?`;
+    const confirmButton = document.createElement("button");
+    confirmButton.className = "mvb-button mvb-button-danger mvb-button-small";
+    confirmButton.type = "button";
+    confirmButton.textContent = "Confirm";
+    confirmButton.addEventListener("click", () => void deleteEntity(root, kind, entityId));
+    const cancelButton = document.createElement("button");
+    cancelButton.className = "mvb-button mvb-button-secondary mvb-button-small";
+    cancelButton.type = "button";
+    cancelButton.textContent = "Cancel";
+    cancelButton.addEventListener("click", () => {
+        builderState.deleteConfirm = null;
+        renderProjectState(root);
+    });
+    parent.append(confirmation, confirmButton, cancelButton);
+}
+
+function appendCharacterCard(root, character) {
+    const card = document.createElement("article");
+    card.className = "mvb-entity-card";
+
+    const heading = document.createElement("div");
+    heading.className = "mvb-entity-card-heading";
+    const title = document.createElement("h3");
+    title.textContent = character.name;
+    const role = document.createElement("span");
+    role.className = "mvb-entity-role";
+    role.textContent = roleLabel(character.role);
+    heading.append(title, role);
+
+    const fields = document.createElement("dl");
+    fields.className = "mvb-entity-fields";
+    appendDefinitionField(fields, "Appearance", character.appearance);
+    appendDefinitionField(fields, "Outfit", character.outfit);
+
+    const referencesHeading = document.createElement("p");
+    referencesHeading.className = "mvb-entity-section-label";
+    referencesHeading.textContent = `References · ${character.references.length}`;
+    appendReferenceList(root, card, "characters", character);
+
+    const actions = document.createElement("div");
+    actions.className = "mvb-entity-actions";
+    const editButton = document.createElement("button");
+    editButton.className = "mvb-button mvb-button-secondary mvb-button-small";
+    editButton.type = "button";
+    editButton.textContent = "Edit";
+    editButton.disabled = Boolean(builderState.operation);
+    editButton.addEventListener("click", () => openCharacterDialog(root, character));
+    actions.append(editButton);
+    appendReferenceUpload(root, actions, "characters", character);
+    appendDeleteControls(root, actions, "characters", character);
+
+    const references = card.querySelector(".mvb-reference-list");
+    card.insertBefore(heading, card.firstChild);
+    card.insertBefore(fields, references);
+    card.insertBefore(referencesHeading, references);
+    card.append(actions);
+    return card;
+}
+
+function appendLocationCard(root, location) {
+    const card = document.createElement("article");
+    card.className = "mvb-entity-card";
+
+    const heading = document.createElement("div");
+    heading.className = "mvb-entity-card-heading";
+    const title = document.createElement("h3");
+    title.textContent = location.name;
+    heading.append(title);
+
+    const fields = document.createElement("dl");
+    fields.className = "mvb-entity-fields";
+    appendDefinitionField(fields, "Description", location.description);
+
+    const referencesHeading = document.createElement("p");
+    referencesHeading.className = "mvb-entity-section-label";
+    referencesHeading.textContent = `References · ${location.references.length}`;
+    appendReferenceList(root, card, "locations", location);
+
+    const actions = document.createElement("div");
+    actions.className = "mvb-entity-actions";
+    const editButton = document.createElement("button");
+    editButton.className = "mvb-button mvb-button-secondary mvb-button-small";
+    editButton.type = "button";
+    editButton.textContent = "Edit";
+    editButton.disabled = Boolean(builderState.operation);
+    editButton.addEventListener("click", () => openLocationDialog(root, location));
+    actions.append(editButton);
+    appendReferenceUpload(root, actions, "locations", location);
+    appendDeleteControls(root, actions, "locations", location);
+
+    const references = card.querySelector(".mvb-reference-list");
+    card.insertBefore(heading, card.firstChild);
+    card.insertBefore(fields, references);
+    card.insertBefore(referencesHeading, references);
+    card.append(actions);
+    return card;
+}
+
+function renderStoryboardState(root) {
+    if (!isActive(root)) {
+        return;
+    }
+
+    const project = builderState.currentProject;
+    const characterList = root.querySelector("[data-mvb-character-list]");
+    const locationList = root.querySelector("[data-mvb-location-list]");
+    const characterEmpty = root.querySelector("[data-mvb-character-empty]");
+    const locationEmpty = root.querySelector("[data-mvb-location-empty]");
+    const status = root.querySelector("[data-mvb-storyboard-status]");
+    const addCharacter = root.querySelector("[data-mvb-add-character]");
+    const addLocation = root.querySelector("[data-mvb-add-location]");
+    characterList.replaceChildren();
+    locationList.replaceChildren();
+
+    if (!project) {
+        characterEmpty.hidden = true;
+        locationEmpty.hidden = true;
+        status.textContent = "";
+        return;
+    }
+
+    for (const character of project.characters) {
+        characterList.append(appendCharacterCard(root, character));
+    }
+    for (const location of project.locations) {
+        locationList.append(appendLocationCard(root, location));
+    }
+    characterEmpty.hidden = project.characters.length > 0;
+    locationEmpty.hidden = project.locations.length > 0;
+    addCharacter.disabled = Boolean(builderState.operation) || builderState.transitioning || builderState.closing;
+    addLocation.disabled = Boolean(builderState.operation) || builderState.transitioning || builderState.closing;
+    const operationLabel = builderState.operation === "character"
+        ? "Saving character…"
+        : builderState.operation === "location"
+            ? "Saving location…"
+            : builderState.operation === "reference"
+                ? "Saving reference…"
+                : "";
+    status.textContent = operationLabel || builderState.storyboardMessage || "";
+    status.dataset.state = builderState.storyboardMessage ? "error" : builderState.operation ? "working" : "ready";
+}
+
+function closeResourceDialogs(root) {
+    root.querySelector("[data-mvb-character-dialog]").hidden = true;
+    root.querySelector("[data-mvb-location-dialog]").hidden = true;
+}
+
+function openCharacterDialog(root, character = null) {
+    if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
+        return;
+    }
+    closeResourceDialogs(root);
+    const dialog = root.querySelector("[data-mvb-character-dialog]");
+    const form = root.querySelector("[data-mvb-character-form]");
+    form.dataset.entityId = character?.character_id || "";
+    root.querySelector("[data-mvb-character-dialog-title]").textContent = character ? "Edit Character" : "Add Character";
+    root.querySelector("[data-mvb-character-submit]").textContent = character ? "Save Character" : "Add Character";
+    root.querySelector("[data-mvb-character-name]").value = character?.name || "";
+    root.querySelector("[data-mvb-character-role]").value = character?.role || "performer";
+    root.querySelector("[data-mvb-character-appearance]").value = character?.appearance || "";
+    root.querySelector("[data-mvb-character-outfit]").value = character?.outfit || "";
+    root.querySelector("[data-mvb-character-error]").hidden = true;
+    dialog.hidden = false;
+    window.requestAnimationFrame(() => root.querySelector("[data-mvb-character-name]").focus());
+}
+
+function openLocationDialog(root, location = null) {
+    if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
+        return;
+    }
+    closeResourceDialogs(root);
+    const dialog = root.querySelector("[data-mvb-location-dialog]");
+    const form = root.querySelector("[data-mvb-location-form]");
+    form.dataset.entityId = location?.location_id || "";
+    root.querySelector("[data-mvb-location-dialog-title]").textContent = location ? "Edit Location" : "Add Location";
+    root.querySelector("[data-mvb-location-submit]").textContent = location ? "Save Location" : "Add Location";
+    root.querySelector("[data-mvb-location-name]").value = location?.name || "";
+    root.querySelector("[data-mvb-location-description]").value = location?.description || "";
+    root.querySelector("[data-mvb-location-error]").hidden = true;
+    dialog.hidden = false;
+    window.requestAnimationFrame(() => root.querySelector("[data-mvb-location-name]").focus());
+}
+
+async function runResourceMutation(root, operation, task, failureMessage) {
+    if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
+        return false;
+    }
+    builderState.operation = operation;
+    builderState.storyboardMessage = "";
+    renderProjectState(root);
+    let succeeded = false;
+    const activeView = builderState.activeView;
+    try {
+        if (!await flushCurrentProject(root)) {
+            builderState.storyboardMessage = "Save the current project before continuing.";
+            return false;
+        }
+        const project = await task();
+        if (!hasProjectDocument(project)) {
+            throw new Error("Resource mutation response was invalid.");
+        }
+        setCurrentProject(root, project);
+        builderState.activeView = activeView;
+        builderState.deleteConfirm = null;
+        void loadProjectList(root);
+        succeeded = true;
+        return true;
+    } catch (error) {
+        if (!isActive(root)) {
+            return false;
+        }
+        console.error(`[Music Video Builder] ${operation} operation failed.`, error);
+        builderState.storyboardMessage = failureMessage;
+        return false;
+    } finally {
+        if (isActive(root)) {
+            builderState.operation = null;
+            if (succeeded) {
+                builderState.storyboardMessage = "";
+            }
+            renderProjectState(root);
+        }
+    }
+}
+
+async function saveCharacter(root) {
+    const form = root.querySelector("[data-mvb-character-form]");
+    const errorElement = root.querySelector("[data-mvb-character-error]");
+    const characterId = form.dataset.entityId;
+    const projectId = builderState.currentProject.project_id;
+    errorElement.textContent = "";
+    errorElement.hidden = true;
+    const payload = {
+        name: root.querySelector("[data-mvb-character-name]").value,
+        role: root.querySelector("[data-mvb-character-role]").value,
+        appearance: root.querySelector("[data-mvb-character-appearance]").value,
+        outfit: root.querySelector("[data-mvb-character-outfit]").value,
+    };
+    const path = `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/characters${characterId ? `/${encodeURIComponent(characterId)}` : ""}`;
+    const saved = await runResourceMutation(
+        root,
+        "character",
+        () => fetchJson(path, { method: characterId ? "PUT" : "POST", body: JSON.stringify(payload) }),
+        "Character could not be saved.",
+    );
+    if (!saved && isActive(root)) {
+        errorElement.textContent = builderState.storyboardMessage || "Character could not be saved.";
+        errorElement.hidden = false;
+    }
+    if (saved && isActive(root)) {
+        closeResourceDialogs(root);
+    }
+}
+
+async function saveLocation(root) {
+    const form = root.querySelector("[data-mvb-location-form]");
+    const errorElement = root.querySelector("[data-mvb-location-error]");
+    const locationId = form.dataset.entityId;
+    const projectId = builderState.currentProject.project_id;
+    errorElement.textContent = "";
+    errorElement.hidden = true;
+    const payload = {
+        name: root.querySelector("[data-mvb-location-name]").value,
+        description: root.querySelector("[data-mvb-location-description]").value,
+    };
+    const path = `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/locations${locationId ? `/${encodeURIComponent(locationId)}` : ""}`;
+    const saved = await runResourceMutation(
+        root,
+        "location",
+        () => fetchJson(path, { method: locationId ? "PUT" : "POST", body: JSON.stringify(payload) }),
+        "Location could not be saved.",
+    );
+    if (!saved && isActive(root)) {
+        errorElement.textContent = builderState.storyboardMessage || "Location could not be saved.";
+        errorElement.hidden = false;
+    }
+    if (saved && isActive(root)) {
+        closeResourceDialogs(root);
+    }
+}
+
+async function uploadReference(root, kind, entityId, file) {
+    const projectId = builderState.currentProject.project_id;
+    await runResourceMutation(
+        root,
+        "reference",
+        () => fetchJson(
+            `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/${kind}/${encodeURIComponent(entityId)}/references`,
+            { method: "POST", body: uploadFormData(file) },
+        ),
+        "Reference image is invalid or could not be saved.",
+    );
+}
+
+async function removeReference(root, kind, entity, reference) {
+    const entityId = entity[kind === "characters" ? "character_id" : "location_id"];
+    const projectId = builderState.currentProject.project_id;
+    await runResourceMutation(
+        root,
+        "reference",
+        () => fetchJson(
+            `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/${kind}/${encodeURIComponent(entityId)}/references/${encodeURIComponent(reference.reference_id)}`,
+            { method: "DELETE" },
+        ),
+        "Reference could not be removed.",
+    );
+}
+
+async function deleteEntity(root, kind, entityId) {
+    const projectId = builderState.currentProject.project_id;
+    await runResourceMutation(
+        root,
+        kind === "characters" ? "character" : "location",
+        () => fetchJson(
+            `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/${kind}/${encodeURIComponent(entityId)}`,
+            { method: "DELETE" },
+        ),
+        kind === "characters" ? "Character could not be deleted." : "Location could not be deleted.",
+    );
+}
+
+function switchView(root, view) {
+    if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
+        return;
+    }
+    if (view !== "setup" && view !== "storyboard") {
+        return;
+    }
+    builderState.activeView = view;
+    builderState.deleteConfirm = null;
+    renderProjectState(root);
+}
+
 function renderProjectState(root) {
     if (!isActive(root)) {
         return;
@@ -318,20 +758,28 @@ function renderProjectState(root) {
     const landingHeader = root.querySelector("[data-mvb-landing-header]");
     const projectToolbar = root.querySelector("[data-mvb-project-toolbar]");
     const landing = root.querySelector("[data-mvb-landing]");
+    const viewNav = root.querySelector("[data-mvb-view-nav]");
+    const setupView = root.querySelector("[data-mvb-setup-view]");
     const setup = root.querySelector("[data-mvb-setup]");
     const sceneReview = root.querySelector("[data-mvb-scene-review]");
+    const storyboard = root.querySelector("[data-mvb-storyboard]");
     const nameInput = root.querySelector("[data-mvb-project-name]");
     const saveButton = root.querySelector("[data-mvb-save]");
     const projectsButton = root.querySelector("[data-mvb-projects]");
     const newButtons = root.querySelectorAll("[data-mvb-new]");
     const openButtons = root.querySelectorAll("[data-mvb-open]");
     const saveState = root.querySelector("[data-mvb-save-state]");
+    const characterSubmit = root.querySelector("[data-mvb-character-submit]");
+    const locationSubmit = root.querySelector("[data-mvb-location-submit]");
 
     if (!currentProject) {
         root.classList.remove("mvb-project-open");
         landingHeader.hidden = false;
         projectToolbar.hidden = true;
         landing.hidden = false;
+        viewNav.hidden = true;
+        setupView.hidden = true;
+        storyboard.hidden = true;
         setup.hidden = true;
         sceneReview.hidden = true;
         nameInput.value = "";
@@ -343,6 +791,9 @@ function renderProjectState(root) {
         landingHeader.hidden = true;
         projectToolbar.hidden = false;
         landing.hidden = true;
+        viewNav.hidden = false;
+        setupView.hidden = state.activeView !== "setup";
+        storyboard.hidden = state.activeView !== "storyboard";
         setup.hidden = false;
         sceneReview.hidden = false;
         if (nameInput.value !== currentProject.name) {
@@ -363,11 +814,20 @@ function renderProjectState(root) {
     saveState.textContent = saveLabel;
     saveState.hidden = !saveLabel;
     saveState.dataset.state = state.saveState;
+    characterSubmit.disabled = Boolean(state.operation) || state.closing || state.transitioning;
+    locationSubmit.disabled = Boolean(state.operation) || state.closing || state.transitioning;
+    for (const button of root.querySelectorAll("[data-mvb-view]")) {
+        const selected = currentProject && button.dataset.mvbView === state.activeView;
+        button.classList.toggle("mvb-view-active", Boolean(selected));
+        button.setAttribute("aria-selected", String(Boolean(selected)));
+    }
     renderRecentProjectList(root);
     if (currentProject) {
         renderSetupState(root);
+        renderStoryboardState(root);
     } else {
         renderSceneReview(root);
+        renderStoryboardState(root);
     }
 }
 
@@ -393,7 +853,7 @@ function updateProjectListSummary(root) {
     }
 
     const count = state.projects.length;
-    const invalidCount = state.invalidProjectsDismissed ? 0 : state.invalidProjects.length;
+    const invalidCount = state.invalidProjects.length;
     const projectLabel = count === 1 ? "project" : "projects";
     const invalidSuffix = invalidCount > 0
         ? " · " + invalidCount + " invalid " + (invalidCount === 1 ? "entry" : "entries")
@@ -439,19 +899,8 @@ function recentProjects(projects) {
         .slice(0, 5);
 }
 
-function invalidProjectsSignature(projects) {
-    return JSON.stringify(
-        projects
-            .map((project) => [
-                typeof project?.folder_name === "string" ? project.folder_name : "",
-                typeof project?.error === "string" ? project.error : "",
-            ])
-            .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
-    );
-}
-
 function appendInvalidProjectNotice(root, list, location) {
-    if (!isActive(root) || builderState.invalidProjects.length === 0 || builderState.invalidProjectsDismissed) {
+    if (!isActive(root) || builderState.invalidProjects.length === 0) {
         return;
     }
 
@@ -465,6 +914,14 @@ function appendInvalidProjectNotice(root, list, location) {
     message.className = "mvb-invalid-projects-message";
     message.textContent = String(count) + " project " + (count === 1 ? "entry" : "entries") + " could not be read.";
 
+    if (builderState.invalidIgnoreMessage) {
+        const errorMessage = document.createElement("p");
+        errorMessage.className = "mvb-invalid-projects-error";
+        errorMessage.setAttribute("role", "alert");
+        errorMessage.textContent = builderState.invalidIgnoreMessage;
+        item.append(message, errorMessage);
+    }
+
     const actions = document.createElement("div");
     actions.className = "mvb-invalid-projects-actions";
 
@@ -476,10 +933,19 @@ function appendInvalidProjectNotice(root, list, location) {
     detailsButton.setAttribute("aria-controls", detailsId);
     detailsButton.setAttribute("aria-expanded", "false");
 
-    const dismissButton = document.createElement("button");
-    dismissButton.className = "mvb-button mvb-button-secondary";
-    dismissButton.type = "button";
-    dismissButton.textContent = "Dismiss";
+    const addIgnoreButton = (invalidProject, parent) => {
+        const ignoreButton = document.createElement("button");
+        ignoreButton.className = "mvb-button mvb-button-secondary";
+        ignoreButton.type = "button";
+        ignoreButton.textContent = "Ignore";
+        ignoreButton.disabled = builderState.invalidIgnoreBusy;
+        ignoreButton.addEventListener("click", () => void ignoreInvalidProject(root, invalidProject));
+        parent.append(ignoreButton);
+    };
+
+    if (count === 1) {
+        addIgnoreButton(builderState.invalidProjects[0], actions);
+    }
 
     const details = document.createElement("div");
     details.className = "mvb-invalid-project-details";
@@ -511,6 +977,9 @@ function appendInvalidProjectNotice(root, list, location) {
             : "Project entry could not be read.";
 
         entry.append(folderLabel, folderValue, problemLabel, problemValue);
+        if (count > 1) {
+            addIgnoreButton(invalidProject, entry);
+        }
         details.append(entry);
     }
 
@@ -520,18 +989,57 @@ function appendInvalidProjectNotice(root, list, location) {
         detailsButton.textContent = expanded ? "Hide Details" : "Details";
         detailsButton.setAttribute("aria-expanded", String(expanded));
     });
-    dismissButton.addEventListener("click", () => {
+    actions.prepend(detailsButton);
+    if (!builderState.invalidIgnoreMessage) {
+        item.append(message);
+    }
+    item.append(actions, details);
+    list.append(item);
+}
+
+async function ignoreInvalidProject(root, invalidProject) {
+    if (!isActive(root) || builderState.invalidIgnoreBusy || !invalidProject) {
+        return;
+    }
+
+    const folderName = invalidProject.folder_name;
+    const signature = invalidProject.signature;
+    if (typeof folderName !== "string" || typeof signature !== "string") {
+        builderState.invalidIgnoreMessage = "Invalid project entry could not be ignored.";
+        renderRecentProjectList(root);
+        renderOpenProjectList(root);
+        return;
+    }
+
+    builderState.invalidIgnoreBusy = true;
+    builderState.invalidIgnoreMessage = "";
+    renderRecentProjectList(root);
+    renderOpenProjectList(root);
+    try {
+        await fetchJson(`${PROJECTS_PATH}/invalid/ignore`, {
+            method: "POST",
+            body: JSON.stringify({ folder_name: folderName, signature }),
+        });
         if (!isActive(root)) {
             return;
         }
-        builderState.invalidProjectsDismissed = true;
-        renderProjectState(root);
-        renderOpenProjectList(root);
-    });
-
-    actions.append(detailsButton, dismissButton);
-    item.append(message, actions, details);
-    list.append(item);
+        await loadProjectList(root);
+    } catch (error) {
+        if (!isActive(root)) {
+            return;
+        }
+        console.error("[Music Video Builder] Invalid project Ignore failed.", error);
+        builderState.invalidIgnoreMessage = error instanceof Error
+            ? error.message
+            : "Invalid project entry could not be ignored.";
+    } finally {
+        if (isActive(root)) {
+            builderState.invalidIgnoreBusy = false;
+            updateProjectListSummary(root);
+            renderRecentProjectList(root);
+            renderOpenProjectList(root);
+        }
+    }
 }
 
 function renderRecentProjectList(root) {
@@ -584,7 +1092,21 @@ function renderRecentProjectList(root) {
 
         button.append(name, updated);
         button.addEventListener("click", () => void openProject(root, project.project_id));
-        item.append(button);
+        const deleteButton = document.createElement("button");
+        deleteButton.type = "button";
+        deleteButton.className = "mvb-button mvb-button-danger mvb-button-small mvb-project-delete";
+        deleteButton.textContent = "Delete";
+        deleteButton.title = `Delete ${project.name}`;
+        deleteButton.disabled = state.openingProject || state.transitioning || state.closing || state.projectDeleteBusy;
+        deleteButton.addEventListener("click", (event) => {
+            event.stopPropagation();
+            openProjectDeleteDialog(root, project);
+        });
+
+        const row = document.createElement("div");
+        row.className = "mvb-project-row";
+        row.append(button, deleteButton);
+        item.append(row);
         list.append(item);
     }
 
@@ -657,6 +1179,7 @@ async function loadProjectList(root) {
 
     builderState.projectListState = "loading";
     builderState.projectListMessage = "";
+    builderState.invalidIgnoreMessage = "";
     updateProjectListSummary(root);
     renderRecentProjectList(root);
     renderOpenProjectList(root);
@@ -668,11 +1191,6 @@ async function loadProjectList(root) {
         }
         if (!payload || !Array.isArray(payload.projects) || !Array.isArray(payload.invalid_projects)) {
             throw new Error("Project list response was invalid.");
-        }
-        const invalidSignature = invalidProjectsSignature(payload.invalid_projects);
-        if (invalidSignature !== builderState.invalidProjectsSignature) {
-            builderState.invalidProjectsDismissed = false;
-            builderState.invalidProjectsSignature = invalidSignature;
         }
         builderState.projects = payload.projects;
         builderState.invalidProjects = payload.invalid_projects;
@@ -695,6 +1213,90 @@ async function loadProjectList(root) {
 function closeProjectDialogs(root) {
     root.querySelector("[data-mvb-new-dialog]").hidden = true;
     root.querySelector("[data-mvb-open-dialog]").hidden = true;
+    closeProjectDeleteDialog(root);
+}
+
+function closeProjectDeleteDialog(root) {
+    const dialog = root.querySelector("[data-mvb-delete-dialog]");
+    if (dialog) {
+        dialog.hidden = true;
+    }
+    if (builderState) {
+        builderState.projectDeleteTarget = null;
+    }
+}
+
+function openProjectDeleteDialog(root, project) {
+    if (
+        !isActive(root)
+        || builderState.currentProject
+        || builderState.transitioning
+        || builderState.closing
+        || builderState.operation
+        || builderState.projectDeleteBusy
+        || !project
+    ) {
+        return;
+    }
+
+    closeProjectDialogs(root);
+    closeResourceDialogs(root);
+    builderState.projectDeleteTarget = project;
+    const dialog = root.querySelector("[data-mvb-delete-dialog]");
+    const projectName = root.querySelector("[data-mvb-delete-name]");
+    const error = root.querySelector("[data-mvb-delete-error]");
+    projectName.textContent = project.name;
+    error.textContent = "";
+    error.hidden = true;
+    dialog.hidden = false;
+    window.requestAnimationFrame(() => root.querySelector("[data-mvb-cancel-delete]")?.focus());
+}
+
+async function deleteProject(root) {
+    if (!isActive(root) || builderState.projectDeleteBusy || !builderState.projectDeleteTarget) {
+        return;
+    }
+
+    const target = builderState.projectDeleteTarget;
+    const error = root.querySelector("[data-mvb-delete-error]");
+    const submit = root.querySelector("[data-mvb-confirm-delete]");
+    const cancel = root.querySelector("[data-mvb-cancel-delete]");
+    builderState.projectDeleteBusy = true;
+    error.textContent = "";
+    error.hidden = true;
+    submit.disabled = true;
+    cancel.disabled = true;
+    renderRecentProjectList(root);
+
+    try {
+        const result = await fetchJson(`${PROJECTS_PATH}/${encodeURIComponent(target.project_id)}`, {
+            method: "DELETE",
+        });
+        if (!result || result.deleted !== true || result.project_id !== target.project_id) {
+            throw new Error("Project could not be deleted.");
+        }
+        if (!isActive(root)) {
+            return;
+        }
+        closeProjectDeleteDialog(root);
+        await loadProjectList(root);
+    } catch (requestError) {
+        if (!isActive(root)) {
+            return;
+        }
+        console.error("[Music Video Builder] Project deletion failed.", requestError);
+        error.textContent = requestError instanceof Error
+            ? requestError.message
+            : "Project could not be deleted.";
+        error.hidden = false;
+    } finally {
+        if (isActive(root)) {
+            builderState.projectDeleteBusy = false;
+            submit.disabled = false;
+            cancel.disabled = false;
+            renderRecentProjectList(root);
+        }
+    }
 }
 
 function showNewProjectError(root, message) {
@@ -718,6 +1320,7 @@ async function openNewProjectDialog(root) {
         }
 
         closeProjectDialogs(root);
+        closeResourceDialogs(root);
         const dialog = root.querySelector("[data-mvb-new-dialog]");
         const input = root.querySelector("[data-mvb-new-name]");
         const error = root.querySelector("[data-mvb-new-error]");
@@ -769,6 +1372,7 @@ async function createProject(root) {
         if (!hasProjectDocument(project)) {
             throw new Error("Create project response was invalid.");
         }
+        builderState.activeView = "setup";
         setCurrentProject(root, project);
         closeProjectDialogs(root);
         renderProjectState(root);
@@ -805,6 +1409,7 @@ async function openProjectDialog(root) {
         }
 
         closeProjectDialogs(root);
+        closeResourceDialogs(root);
         root.querySelector("[data-mvb-open-dialog]").hidden = false;
         renderOpenProjectList(root);
         void loadProjectList(root);
@@ -843,6 +1448,7 @@ async function openProject(root, projectId) {
         if (!hasProjectDocument(project)) {
             throw new Error("Open project response was invalid.");
         }
+        builderState.activeView = "setup";
         setCurrentProject(root, project);
         closeProjectDialogs(root);
         renderProjectState(root);
@@ -1185,7 +1791,7 @@ function openBuilder() {
                     <div class="mvb-brand" data-mvb-landing-header>
                         <span class="mvb-brand-rule" aria-hidden="true"></span>
                         <div>
-                            <p class="mvb-phase">Phase 2 · Audio, lyrics, and scenes</p>
+                            <p class="mvb-phase">Phase 3 · Characters, locations, and references</p>
                             <h1 id="mvb-title">Vesper Music Video Builder</h1>
                             <p class="mvb-subtitle">A local project space for organised music-video work.</p>
                         </div>
@@ -1211,6 +1817,11 @@ function openBuilder() {
             <main class="mvb-content">
                 <div class="mvb-health-banner" data-mvb-health-banner data-mvb-status data-state="checking" role="status" aria-live="polite" hidden></div>
 
+                <nav class="mvb-view-nav" data-mvb-view-nav role="tablist" aria-label="Project views" hidden>
+                    <button class="mvb-view-button" data-mvb-view="setup" type="button" role="tab" aria-selected="true">Setup</button>
+                    <button class="mvb-view-button" data-mvb-view="storyboard" type="button" role="tab" aria-selected="false">Storyboard</button>
+                </nav>
+
                 <section class="mvb-landing" data-mvb-landing aria-labelledby="mvb-landing-heading" hidden>
                     <div class="mvb-landing-heading">
                         <div>
@@ -1227,7 +1838,8 @@ function openBuilder() {
                     <ul class="mvb-project-list mvb-recent-project-list" data-mvb-recent-project-list></ul>
                 </section>
 
-                <section class="mvb-setup" data-mvb-setup aria-labelledby="mvb-setup-heading">
+                <div class="mvb-setup-view" data-mvb-setup-view hidden>
+                    <section class="mvb-setup" data-mvb-setup aria-labelledby="mvb-setup-heading">
                     <div class="mvb-setup-heading">
                         <div>
                             <p class="mvb-eyebrow">Setup</p>
@@ -1277,9 +1889,9 @@ function openBuilder() {
                         </div>
                         <button class="mvb-button mvb-button-primary" data-mvb-build-scenes type="button" disabled>Build Scenes</button>
                     </div>
-                </section>
+                    </section>
 
-                <section class="mvb-scene-review" data-mvb-scene-review aria-labelledby="mvb-scene-review-heading" hidden>
+                    <section class="mvb-scene-review" data-mvb-scene-review aria-labelledby="mvb-scene-review-heading" hidden>
                     <div class="mvb-scene-review-heading">
                         <div>
                             <p class="mvb-eyebrow">Timing Review</p>
@@ -1306,6 +1918,35 @@ function openBuilder() {
                             </thead>
                             <tbody data-mvb-scene-rows></tbody>
                         </table>
+                    </div>
+                    </section>
+                </div>
+
+                <section class="mvb-storyboard" data-mvb-storyboard aria-labelledby="mvb-storyboard-heading" hidden>
+                    <div class="mvb-storyboard-heading">
+                        <div>
+                            <p class="mvb-eyebrow">Storyboard resources</p>
+                            <h2 id="mvb-storyboard-heading">Characters &amp; Locations</h2>
+                        </div>
+                        <span class="mvb-storyboard-status" data-mvb-storyboard-status aria-live="polite"></span>
+                    </div>
+                    <div class="mvb-storyboard-grid">
+                        <section class="mvb-resource-panel" aria-labelledby="mvb-characters-heading">
+                            <div class="mvb-resource-panel-heading">
+                                <h3 id="mvb-characters-heading">Characters</h3>
+                                <button class="mvb-button mvb-button-primary mvb-button-small" data-mvb-add-character type="button">Add Character</button>
+                            </div>
+                            <p class="mvb-resource-empty" data-mvb-character-empty>No characters yet.</p>
+                            <div class="mvb-resource-list" data-mvb-character-list></div>
+                        </section>
+                        <section class="mvb-resource-panel" aria-labelledby="mvb-locations-heading">
+                            <div class="mvb-resource-panel-heading">
+                                <h3 id="mvb-locations-heading">Locations</h3>
+                                <button class="mvb-button mvb-button-primary mvb-button-small" data-mvb-add-location type="button">Add Location</button>
+                            </div>
+                            <p class="mvb-resource-empty" data-mvb-location-empty>No locations yet.</p>
+                            <div class="mvb-resource-list" data-mvb-location-list></div>
+                        </section>
                     </div>
                 </section>
             </main>
@@ -1349,6 +1990,91 @@ function openBuilder() {
                     </div>
                 </section>
             </div>
+
+            <div class="mvb-modal-backdrop" data-mvb-delete-dialog hidden>
+                <section class="mvb-dialog" role="dialog" aria-modal="true" aria-labelledby="mvb-delete-heading">
+                    <div class="mvb-dialog-heading">
+                        <div>
+                            <p class="mvb-eyebrow">Delete project</p>
+                            <h2 id="mvb-delete-heading">Delete project?</h2>
+                        </div>
+                        <button class="mvb-dialog-close" data-mvb-cancel-delete type="button">Cancel</button>
+                    </div>
+                    <p>Delete <strong data-mvb-delete-name></strong>?</p>
+                    <p class="mvb-dialog-note">This removes the project-local files and cannot be undone.</p>
+                    <p class="mvb-dialog-error" data-mvb-delete-error role="alert" hidden></p>
+                    <div class="mvb-dialog-actions">
+                        <button class="mvb-button mvb-button-secondary" data-mvb-cancel-delete type="button">Cancel</button>
+                        <button class="mvb-button mvb-button-danger" data-mvb-confirm-delete type="button">Delete Project</button>
+                    </div>
+                </section>
+            </div>
+
+            <div class="mvb-modal-backdrop" data-mvb-character-dialog hidden>
+                <section class="mvb-dialog" role="dialog" aria-modal="true" aria-labelledby="mvb-character-dialog-heading">
+                    <div class="mvb-dialog-heading">
+                        <div>
+                            <p class="mvb-eyebrow">Storyboard resource</p>
+                            <h2 id="mvb-character-dialog-heading" data-mvb-character-dialog-title>Add Character</h2>
+                        </div>
+                        <button class="mvb-dialog-close" data-mvb-cancel-character type="button">Cancel</button>
+                    </div>
+                    <form data-mvb-character-form>
+                        <label class="mvb-field">
+                            <span>Name</span>
+                            <input data-mvb-character-name type="text" maxlength="200" autocomplete="off" required>
+                        </label>
+                        <label class="mvb-field">
+                            <span>Role</span>
+                            <select data-mvb-character-role>
+                                <option value="performer">Performer / Singer</option>
+                                <option value="band_member">Band Member</option>
+                                <option value="extra">Extra</option>
+                            </select>
+                        </label>
+                        <label class="mvb-field">
+                            <span>Appearance</span>
+                            <textarea data-mvb-character-appearance rows="3" maxlength="5000"></textarea>
+                        </label>
+                        <label class="mvb-field">
+                            <span>Outfit</span>
+                            <textarea data-mvb-character-outfit rows="3" maxlength="5000"></textarea>
+                        </label>
+                        <p class="mvb-dialog-error" data-mvb-character-error role="alert" hidden></p>
+                        <div class="mvb-dialog-actions">
+                            <button class="mvb-button mvb-button-secondary" data-mvb-cancel-character type="button">Cancel</button>
+                            <button class="mvb-button mvb-button-primary" data-mvb-character-submit type="submit">Add Character</button>
+                        </div>
+                    </form>
+                </section>
+            </div>
+
+            <div class="mvb-modal-backdrop" data-mvb-location-dialog hidden>
+                <section class="mvb-dialog" role="dialog" aria-modal="true" aria-labelledby="mvb-location-dialog-heading">
+                    <div class="mvb-dialog-heading">
+                        <div>
+                            <p class="mvb-eyebrow">Storyboard resource</p>
+                            <h2 id="mvb-location-dialog-heading" data-mvb-location-dialog-title>Add Location</h2>
+                        </div>
+                        <button class="mvb-dialog-close" data-mvb-cancel-location type="button">Cancel</button>
+                    </div>
+                    <form data-mvb-location-form>
+                        <label class="mvb-field">
+                            <span>Name</span>
+                            <input data-mvb-location-name type="text" maxlength="200" autocomplete="off" required>
+                        </label>
+                        <label class="mvb-field">
+                            <span>Description</span>
+                            <textarea data-mvb-location-description rows="5" maxlength="5000"></textarea>
+                        </label>
+                        <p class="mvb-dialog-error" data-mvb-location-error role="alert" hidden></p>
+                        <div class="mvb-dialog-actions">
+                            <button class="mvb-button mvb-button-secondary" data-mvb-cancel-location type="button">Cancel</button>
+                            <button class="mvb-button mvb-button-primary" data-mvb-location-submit type="submit">Add Location</button>
+                        </div>
+                    </form>
+                </section>
+            </div>
         </section>
     `;
 
@@ -1370,11 +2096,16 @@ function openBuilder() {
         operation: null,
         setupState: "empty",
         setupMessage: "",
+        storyboardMessage: "",
+        activeView: "setup",
+        deleteConfirm: null,
         newProjectBusy: false,
         openingProject: false,
         maximized: false,
-        invalidProjectsDismissed: false,
-        invalidProjectsSignature: "",
+        invalidIgnoreBusy: false,
+        invalidIgnoreMessage: "",
+        projectDeleteTarget: null,
+        projectDeleteBusy: false,
     };
 
     const closeButton = root.querySelector(".mvb-close");
@@ -1392,6 +2123,15 @@ function openBuilder() {
     const newForm = root.querySelector("[data-mvb-new-form]");
     const cancelNewButtons = root.querySelectorAll("[data-mvb-cancel-new]");
     const closeOpenButton = root.querySelector("[data-mvb-close-open]");
+    const cancelDeleteButtons = root.querySelectorAll("[data-mvb-cancel-delete]");
+    const confirmDeleteButton = root.querySelector("[data-mvb-confirm-delete]");
+    const viewButtons = root.querySelectorAll("[data-mvb-view]");
+    const addCharacterButton = root.querySelector("[data-mvb-add-character]");
+    const addLocationButton = root.querySelector("[data-mvb-add-location]");
+    const characterForm = root.querySelector("[data-mvb-character-form]");
+    const locationForm = root.querySelector("[data-mvb-location-form]");
+    const cancelCharacterButtons = root.querySelectorAll("[data-mvb-cancel-character]");
+    const cancelLocationButtons = root.querySelectorAll("[data-mvb-cancel-location]");
 
     closeButton.addEventListener("click", () => void closeBuilder(root));
     maximizeButton.addEventListener("click", () => toggleMaximize(root));
@@ -1441,6 +2181,29 @@ function openBuilder() {
     }
     closeOpenButton.addEventListener("click", () => closeProjectDialogs(root));
     root.querySelector("[data-mvb-dialog-new]").addEventListener("click", () => void openNewProjectDialog(root));
+    for (const button of cancelDeleteButtons) {
+        button.addEventListener("click", () => closeProjectDeleteDialog(root));
+    }
+    confirmDeleteButton.addEventListener("click", () => void deleteProject(root));
+    for (const button of viewButtons) {
+        button.addEventListener("click", () => switchView(root, button.dataset.mvbView));
+    }
+    addCharacterButton.addEventListener("click", () => openCharacterDialog(root));
+    addLocationButton.addEventListener("click", () => openLocationDialog(root));
+    characterForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        void saveCharacter(root);
+    });
+    locationForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        void saveLocation(root);
+    });
+    for (const button of cancelCharacterButtons) {
+        button.addEventListener("click", () => closeResourceDialogs(root));
+    }
+    for (const button of cancelLocationButtons) {
+        button.addEventListener("click", () => closeResourceDialogs(root));
+    }
 
     overlay = root;
     builderState = state;
