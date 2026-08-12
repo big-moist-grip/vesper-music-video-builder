@@ -26,6 +26,7 @@ from backend.storyboard import (
     validate_storyboard_response,
 )
 from backend.source import AudioProbeError, import_master_audio
+from backend.visuals import default_visuals_for_scenes
 
 
 class FakeUpload:
@@ -71,7 +72,9 @@ class Phase4TestCase(unittest.TestCase):
                     },
                 },
                 "scenes": scenes,
+                "visuals": default_visuals_for_scenes(scenes),
             },
+            allow_visuals_change=True,
         )
 
     def _reference(self, reference_id=None, extension=".png", original_name="ref.png"):
@@ -151,7 +154,7 @@ class Phase4TestCase(unittest.TestCase):
 
     def test_new_project_and_legacy_documents_normalize_to_v4(self):
         project = self.storage.create_project("Schema v4")
-        self.assertEqual(project["schema_version"], 4)
+        self.assertEqual(project["schema_version"], 5)
         self.assertEqual(project["story_direction"], empty_story_direction())
         self.assertEqual(project["storyboard"], empty_storyboard())
 
@@ -171,23 +174,37 @@ class Phase4TestCase(unittest.TestCase):
         v3 = {**project, "schema_version": 3}
         v3.pop("story_direction")
         v3.pop("storyboard")
+        v3.pop("visuals")
 
         for legacy in (v1, v2, v3):
             normalized = validate_project_document(legacy)
-            self.assertEqual(normalized["schema_version"], 4)
+            self.assertEqual(normalized["schema_version"], 5)
             self.assertEqual(normalized["story_direction"], empty_story_direction())
             self.assertEqual(normalized["storyboard"], empty_storyboard())
 
     def test_provisional_v4_story_direction_normalizes_without_load_mutation(self):
         project = self.storage.create_project("Provisional v4")
+        project = self.storage.save_project(
+            project["project_id"],
+            {
+                **project,
+                "story_direction": {
+                    "storyboard_mode": "loose",
+                    "story_brief": "A provisional brief.",
+                    "visual_notes": "A provisional visual language.",
+                },
+            },
+        )
         project_file = self.projects_root / project["project_id"] / "project.json"
         provisional = {
             **project,
+            "schema_version": 4,
             "story_direction": {
                 "story_brief": "A provisional brief.",
                 "visual_notes": "A provisional visual language.",
             },
         }
+        provisional.pop("visuals")
         provisional_bytes = (json.dumps(provisional, indent=2) + "\n").encode("utf-8")
         project_file.write_bytes(provisional_bytes)
 
@@ -396,18 +413,21 @@ class Phase4TestCase(unittest.TestCase):
 
     def test_multi_scene_response_requires_complete_current_scene_order(self):
         project = self._project_with_scene()
+        new_scenes = build_scenes(
+            [
+                {"cue_number": 1, "start_ms": 0, "end_ms": 2_000, "text": "First"},
+                {"cue_number": 2, "start_ms": 2_000, "end_ms": 4_000, "text": "Second"},
+            ],
+            4_000,
+        )
         project = self.storage.save_project(
             project["project_id"],
             {
                 **project,
-                "scenes": build_scenes(
-                    [
-                        {"cue_number": 1, "start_ms": 0, "end_ms": 2_000, "text": "First"},
-                        {"cue_number": 2, "start_ms": 2_000, "end_ms": 4_000, "text": "Second"},
-                    ],
-                    4_000,
-                ),
+                "scenes": new_scenes,
+                "visuals": default_visuals_for_scenes(new_scenes),
             },
+            allow_visuals_change=True,
         )
         response = self._response(project)
         preview = validate_storyboard_response(project, response)
@@ -673,15 +693,18 @@ class Phase4TestCase(unittest.TestCase):
             )
         )
         self.assertEqual(replaced["storyboard"], empty_storyboard())
+        replacement_scenes = build_scenes(
+            [{"cue_number": 1, "start_ms": 0, "end_ms": 4_000, "text": "A lyric"}],
+            4_000,
+        )
         replaced = self.storage.save_project(
             replaced["project_id"],
             {
                 **replaced,
-                "scenes": build_scenes(
-                    [{"cue_number": 1, "start_ms": 0, "end_ms": 4_000, "text": "A lyric"}],
-                    4_000,
-                ),
+                "scenes": replacement_scenes,
+                "visuals": default_visuals_for_scenes(replacement_scenes),
             },
+            allow_visuals_change=True,
         )
         replaced = self._apply(replaced, self._response(replaced))
         prior_reapplied_storyboard = replaced["storyboard"]
@@ -698,7 +721,7 @@ class Phase4TestCase(unittest.TestCase):
         self.assertEqual(self.storage.load_project(project["project_id"])["storyboard"], prior_reapplied_storyboard)
         self.assertNotEqual(prior_storyboard, prior_reapplied_storyboard)
 
-    def test_frontend_and_routes_expose_only_phase4_relay_contract(self):
+    def test_frontend_and_routes_preserve_phase4_relay_contract(self):
         extension = Path("web/extension.js").read_text(encoding="utf-8")
         routes = Path("backend/routes.py").read_text(encoding="utf-8")
         for marker in (
@@ -721,11 +744,10 @@ class Phase4TestCase(unittest.TestCase):
             "/storyboard",
         ):
             self.assertIn(route, routes)
-        self.assertNotIn("generation_method", extension)
-        self.assertNotIn("generation_method", routes)
+        self.assertIn("generation_method", extension)
+        self.assertIn("generation-method", routes)
         self.assertNotIn("localStorage", extension)
         self.assertNotIn("sessionStorage", extension)
-        self.assertNotIn("Visuals", extension)
         self.assertNotIn("Prompts", extension)
         self.assertNotIn("Render", extension)
 

@@ -1170,6 +1170,8 @@ Implement:
 - Alternate `reference2video`.
 - Non-destructive method switching.
 
+The per-scene Generation Method remains authoritative. Visuals also provides a convenience `Apply to All Scenes` action for setting one allowed generation method across the current scene list in one mutation. Bulk method changes are non-destructive: inactive keyframe and Reference-to-Video branch data remains stored.
+
 For `keyframe_i2v`:
 
 - Reference instructions.
@@ -1184,8 +1186,10 @@ For `reference2video`:
 - Select one or more existing project-local Character/Location still references.
 - Preserve ordered owning-entity/reference IDs.
 - Preview selected references.
-- Deterministic planned `<Picture N>` / `<Subject N>` mapping.
+- Deterministic planned mapping: `<Picture N>` follows selected-reference order; `<Subject N>` follows first occurrence of each distinct owning Character or Location, and multiple references from one owner share its Subject tag.
 - Reference-to-Video readiness without requiring a keyframe.
+
+Exact production mapping remains subject to Phase 6 qualification.
 
 No H3 rendering yet.
 

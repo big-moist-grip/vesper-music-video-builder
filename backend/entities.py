@@ -134,9 +134,12 @@ def delete_character(storage: ProjectStorage, project_id: object, character_id: 
     project = storage.load_project(project_id)
     canonical_id = validate_entity_id(character_id, "Character ID")
     from .storyboard import storyboard_uses_character
+    from .visuals import visuals_uses_entity
 
     if storyboard_uses_character(project["storyboard"], canonical_id):
         raise ProjectValidationError("Character is used by the applied storyboard.")
+    if visuals_uses_entity(project["visuals"], "character", canonical_id):
+        raise ProjectValidationError("Character is used by a Visuals reference selection.")
     characters = [
         character for character in project["characters"] if character["character_id"] != canonical_id
     ]
@@ -185,9 +188,12 @@ def delete_location(storage: ProjectStorage, project_id: object, location_id: ob
     project = storage.load_project(project_id)
     canonical_id = validate_entity_id(location_id, "Location ID")
     from .storyboard import storyboard_uses_location
+    from .visuals import visuals_uses_entity
 
     if storyboard_uses_location(project["storyboard"], canonical_id):
         raise ProjectValidationError("Location is used by the applied storyboard.")
+    if visuals_uses_entity(project["visuals"], "location", canonical_id):
+        raise ProjectValidationError("Location is used by a Visuals reference selection.")
     locations = [
         location for location in project["locations"] if location["location_id"] != canonical_id
     ]
@@ -364,6 +370,7 @@ def remove_reference(
     entity = _find_entity(project, kind, canonical_entity_id)
     metadata = _reference_metadata(entity, canonical_reference_id)
     from .storyboard import storyboard_uses_reference
+    from .visuals import visuals_uses_reference
 
     entity_type = "character" if kind == "characters" else "location"
     if storyboard_uses_reference(
@@ -373,6 +380,13 @@ def remove_reference(
         canonical_reference_id,
     ):
         raise ProjectValidationError("Reference is required by the applied storyboard.")
+    if visuals_uses_reference(
+        project["visuals"],
+        entity_type,
+        canonical_entity_id,
+        canonical_reference_id,
+    ):
+        raise ProjectValidationError("Reference is selected by the Visuals workflow.")
     updated_entity = {
         **entity,
         "references": [

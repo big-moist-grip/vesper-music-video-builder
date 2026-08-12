@@ -38,6 +38,18 @@ from .storyboard import (
     empty_storyboard,
     validate_storyboard_response,
 )
+from .visuals import (
+    KeyframeNotFoundError,
+    VisualSceneNotFoundError,
+    assign_keyframe,
+    generate_and_save_keyframe_prompt,
+    get_keyframe_path,
+    remove_keyframe,
+    save_keyframe_details,
+    save_reference_selection,
+    set_all_generation_method,
+    set_generation_method,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -267,6 +279,185 @@ def register_routes():
             LOGGER.exception("Could not clear the Music Video Builder storyboard.")
             return api_error("Storyboard could not be cleared.", 500)
         return web.json_response(saved_project)
+
+    def validate_visual_route_ids(request):
+        project_id = request.match_info["project_id"]
+        scene_id = request.match_info["scene_id"]
+        validate_project_id(project_id)
+        validate_entity_id(scene_id, "Scene ID")
+        return project_id, scene_id
+
+    def validate_visual_project_id(request):
+        project_id = request.match_info["project_id"]
+        validate_project_id(project_id)
+        return project_id
+
+    async def run_visual_json_mutation(request, operation, fields):
+        try:
+            project_id, scene_id = validate_visual_route_ids(request)
+        except ProjectValidationError:
+            return api_error("The project or scene ID is invalid.", 400)
+        payload = await read_json(request)
+        if not isinstance(payload, dict) or set(payload) != set(fields):
+            return api_error("Request body has unsupported or missing Visuals fields.", 400)
+        try:
+            project = operation(PROJECT_STORAGE, project_id, scene_id, payload)
+        except ProjectNotFoundError:
+            return api_error("Project or scene was not found.", 404)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist Music Video Builder Visuals mutation.")
+            return api_error("Visuals state could not be saved.", 500)
+        return web.json_response(project)
+
+    @PromptServer.instance.routes.put("/music-video-builder/projects/{project_id}/visuals/scenes/{scene_id}/generation-method")
+    async def music_video_builder_set_generation_method(request):
+        try:
+            project_id, scene_id = validate_visual_route_ids(request)
+        except ProjectValidationError:
+            return api_error("The project or scene ID is invalid.", 400)
+        payload = await read_json(request)
+        if not isinstance(payload, dict) or set(payload) != {"generation_method"}:
+            return api_error("Request body must contain only generation_method.", 400)
+        try:
+            project = set_generation_method(
+                PROJECT_STORAGE,
+                project_id,
+                scene_id,
+                payload["generation_method"],
+            )
+        except ProjectNotFoundError:
+            return api_error("Project or scene was not found.", 404)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist Music Video Builder generation method.")
+            return api_error("Generation method could not be saved.", 500)
+        return web.json_response(project)
+
+    @PromptServer.instance.routes.put("/music-video-builder/projects/{project_id}/visuals/generation-method")
+    async def music_video_builder_set_all_generation_method(request):
+        try:
+            project_id = validate_visual_project_id(request)
+        except ProjectValidationError:
+            return api_error("The project ID is invalid.", 400)
+        payload = await read_json(request)
+        if not isinstance(payload, dict) or set(payload) != {"generation_method"}:
+            return api_error("Request body must contain only generation_method.", 400)
+        try:
+            project = set_all_generation_method(
+                PROJECT_STORAGE,
+                project_id,
+                payload["generation_method"],
+            )
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist Music Video Builder bulk generation method.")
+            return api_error("Generation method could not be saved.", 500)
+        return web.json_response(project)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/visuals/scenes/{scene_id}/keyframe-prompt")
+    async def music_video_builder_generate_keyframe_prompt(request):
+        try:
+            project_id, scene_id = validate_visual_route_ids(request)
+        except ProjectValidationError:
+            return api_error("The project or scene ID is invalid.", 400)
+        try:
+            project = generate_and_save_keyframe_prompt(PROJECT_STORAGE, project_id, scene_id)
+        except ProjectNotFoundError:
+            return api_error("Project or scene was not found.", 404)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist Music Video Builder keyframe prompt.")
+            return api_error("Keyframe prompt could not be saved.", 500)
+        return web.json_response(project)
+
+    @PromptServer.instance.routes.put("/music-video-builder/projects/{project_id}/visuals/scenes/{scene_id}/keyframe-details")
+    async def music_video_builder_save_keyframe_details(request):
+        return await run_visual_json_mutation(
+            request,
+            save_keyframe_details,
+            ("keyframe_generation_prompt", "intended_keyframe_description", "actual_keyframe_description"),
+        )
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/visuals/scenes/{scene_id}/keyframe")
+    async def music_video_builder_assign_keyframe(request):
+        try:
+            project_id, scene_id = validate_visual_route_ids(request)
+        except ProjectValidationError:
+            return api_error("The project or scene ID is invalid.", 400)
+        part = await read_file_part(request)
+        if part is None:
+            return api_error("Multipart request must contain a file field.", 400)
+        try:
+            project = await assign_keyframe(
+                PROJECT_STORAGE,
+                project_id,
+                scene_id,
+                part.filename,
+                part,
+            )
+        except ProjectNotFoundError:
+            return api_error("Project or scene was not found.", 404)
+        except ProjectValidationError as error:
+            LOGGER.warning("Accepted keyframe upload was rejected: %s", error)
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist Music Video Builder keyframe.")
+            return api_error("Keyframe could not be saved.", 500)
+        return web.json_response(project)
+
+    @PromptServer.instance.routes.delete("/music-video-builder/projects/{project_id}/visuals/scenes/{scene_id}/keyframe")
+    async def music_video_builder_remove_keyframe(request):
+        try:
+            project_id, scene_id = validate_visual_route_ids(request)
+        except ProjectValidationError:
+            return api_error("The project or scene ID is invalid.", 400)
+        try:
+            project = remove_keyframe(PROJECT_STORAGE, project_id, scene_id)
+        except (KeyframeNotFoundError, VisualSceneNotFoundError):
+            return api_error("Accepted keyframe was not found.", 404)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist Music Video Builder keyframe removal.")
+            return api_error("Keyframe could not be removed.", 500)
+        return web.json_response(project)
+
+    @PromptServer.instance.routes.get("/music-video-builder/projects/{project_id}/visuals/scenes/{scene_id}/keyframe/image")
+    async def music_video_builder_get_keyframe_image(request):
+        try:
+            project_id, scene_id = validate_visual_route_ids(request)
+        except ProjectValidationError:
+            return api_error("The project or scene ID is invalid.", 400)
+        try:
+            path = get_keyframe_path(PROJECT_STORAGE, project_id, scene_id)
+        except KeyframeNotFoundError:
+            return api_error("Accepted keyframe was not found.", 404)
+        except VisualSceneNotFoundError:
+            return api_error("Project or scene was not found.", 404)
+        except ProjectNotFoundError:
+            return api_error("Project or scene was not found.", 404)
+        except ProjectValidationError:
+            LOGGER.warning("Unsafe keyframe path rejected.")
+            return api_error("Project data is invalid.", 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not load Music Video Builder keyframe.")
+            return api_error("Keyframe could not be loaded.", 500)
+        return web.FileResponse(path, headers={"Cache-Control": "no-store"})
+
+    @PromptServer.instance.routes.put("/music-video-builder/projects/{project_id}/visuals/scenes/{scene_id}/reference2video")
+    async def music_video_builder_save_reference_selection(request):
+        return await run_visual_json_mutation(
+            request,
+            save_reference_selection,
+            ("selected_references",),
+        )
 
     @PromptServer.instance.routes.delete("/music-video-builder/projects/{project_id}")
     async def music_video_builder_delete_project(request):

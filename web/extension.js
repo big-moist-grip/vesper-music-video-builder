@@ -86,9 +86,10 @@ function hasProjectDocument(payload) {
     const source = payload?.source;
     const storyDirection = payload?.story_direction;
     const storyboard = payload?.storyboard;
+    const visuals = payload?.visuals;
     return payload !== null
         && typeof payload === "object"
-        && payload.schema_version === 4
+        && payload.schema_version === 5
         && typeof payload.project_id === "string"
         && typeof payload.name === "string"
         && typeof payload.created_at === "string"
@@ -112,7 +113,16 @@ function hasProjectDocument(payload) {
         && typeof storyboard === "object"
         && Object.keys(storyboard).length === 2
         && (storyboard.request_fingerprint === null || typeof storyboard.request_fingerprint === "string")
-        && Array.isArray(storyboard.scenes);
+        && Array.isArray(storyboard.scenes)
+        && visuals !== null
+        && typeof visuals === "object"
+        && Object.keys(visuals).length === 1
+        && Array.isArray(visuals.scenes)
+        && visuals.scenes.length === payload.scenes.length
+        && visuals.scenes.every((visualScene, index) => visualScene !== null
+            && typeof visualScene === "object"
+            && visualScene.scene_id === payload.scenes[index]?.scene_id
+            && (visualScene.generation_method === "keyframe_i2v" || visualScene.generation_method === "reference2video"));
 }
 
 async function fetchJson(path, options = {}) {
@@ -186,13 +196,56 @@ function saveStateLabel(state) {
     }
 }
 
-function setCurrentProject(root, project) {
+function reconcileVisualDrafts(previousProject, nextProject, drafts, reconciledSceneId = null) {
+    if (!previousProject || !nextProject || previousProject.project_id !== nextProject.project_id) {
+        return {};
+    }
+
+    const nextSceneIds = new Set((nextProject.scenes || []).map((scene) => scene.scene_id));
+    const preserved = {};
+    for (const [sceneId, draft] of Object.entries(drafts || {})) {
+        const visualScene = visualSceneFor(nextProject, sceneId);
+        if (nextSceneIds.has(sceneId) && visualScene && sceneId !== reconciledSceneId && visualDraftIsDirty(visualScene, draft)) {
+            preserved[sceneId] = draft;
+        }
+    }
+    return preserved;
+}
+
+function reconcileVisualExpansion(previousProject, nextProject, expandedScenes) {
+    if (!previousProject || !nextProject || previousProject.project_id !== nextProject.project_id) {
+        return {};
+    }
+
+    const nextSceneIds = new Set((nextProject.scenes || []).map((scene) => scene.scene_id));
+    return Object.fromEntries(
+        Object.entries(expandedScenes || {}).filter(([sceneId]) => nextSceneIds.has(sceneId)),
+    );
+}
+
+function setCurrentProject(root, project, options = {}) {
     if (!isActive(root)) {
         return;
     }
 
+    const previousProject = builderState.currentProject;
+    const sameProject = previousProject?.project_id === project?.project_id;
+    const preservedVisualDrafts = reconcileVisualDrafts(
+        previousProject,
+        project,
+        builderState.visualDrafts,
+        options.reconciledVisualSceneId || null,
+    );
+    const preservedVisualExpansion = reconcileVisualExpansion(
+        previousProject,
+        project,
+        builderState.visualExpandedScenes,
+    );
     cancelAutosave(root);
     builderState.currentProject = project;
+    if (!sameProject || !["keyframe_i2v", "reference2video"].includes(builderState.visualBulkMethod)) {
+        builderState.visualBulkMethod = project?.visuals?.scenes?.[0]?.generation_method || "keyframe_i2v";
+    }
     builderState.editRevision = 0;
     builderState.saveState = project ? "saved" : "empty";
     builderState.saveMessage = "";
@@ -206,6 +259,11 @@ function setCurrentProject(root, project) {
     builderState.storyboardRelayMessage = "";
     builderState.storyboardRelayState = "ready";
     builderState.deleteConfirm = null;
+    builderState.visualDrafts = preservedVisualDrafts;
+    builderState.visualExpandedScenes = preservedVisualExpansion;
+    builderState.visualRemoveTarget = null;
+    builderState.visualMessage = "";
+    builderState.visualMessageState = "ready";
 }
 
 function cancelAutosave(root) {
@@ -800,6 +858,857 @@ function renderStoryboardState(root) {
     renderStoryboardRelay(root);
 }
 
+const VISUAL_METHOD_LABELS = {
+    keyframe_i2v: "Keyframe / Image-to-Video",
+    reference2video: "Reference-to-Video",
+};
+
+function visualSceneFor(project, sceneId) {
+    return project?.visuals?.scenes?.find((visualScene) => visualScene.scene_id === sceneId) || null;
+}
+
+function storyboardSceneFor(project, sceneId) {
+    return project?.storyboard?.scenes?.find((storyboardScene) => storyboardScene.scene_id === sceneId) || null;
+}
+
+function visualSelectorKey(selector) {
+    return `${selector.entity_type}:${selector.entity_id}:${selector.reference_id}`;
+}
+
+function visualReferenceFor(project, selector) {
+    const entity = selector.entity_type === "character"
+        ? findCharacter(project, selector.entity_id)
+        : findLocation(project, selector.entity_id);
+    const reference = entity?.references.find((item) => item.reference_id === selector.reference_id);
+    return entity && reference ? { entity, reference } : null;
+}
+
+function visualAssignedReferences(project, storyboardScene) {
+    if (!storyboardScene) {
+        return [];
+    }
+    const assigned = [];
+    for (const characterId of storyboardScene.character_ids) {
+        const character = findCharacter(project, characterId);
+        for (const reference of character?.references || []) {
+            assigned.push({
+                entity_type: "character",
+                entity_id: character.character_id,
+                reference_id: reference.reference_id,
+            });
+        }
+    }
+    if (storyboardScene.location_id) {
+        const location = findLocation(project, storyboardScene.location_id);
+        for (const reference of location?.references || []) {
+            assigned.push({
+                entity_type: "location",
+                entity_id: location.location_id,
+                reference_id: reference.reference_id,
+            });
+        }
+    }
+    return assigned;
+}
+
+function visualDraftFor(sceneId, visualScene) {
+    const existing = builderState.visualDrafts[sceneId];
+    if (existing) {
+        return existing;
+    }
+    const source = visualScene.keyframe_i2v;
+    const draft = {
+        keyframe_generation_prompt: source.keyframe_generation_prompt,
+        intended_keyframe_description: source.intended_keyframe_description,
+        actual_keyframe_description: source.actual_keyframe_description,
+    };
+    builderState.visualDrafts[sceneId] = draft;
+    return draft;
+}
+
+function visualDraftIsDirty(visualScene, draft) {
+    return Boolean(draft)
+        && (draft.keyframe_generation_prompt !== visualScene.keyframe_i2v.keyframe_generation_prompt
+            || draft.intended_keyframe_description !== visualScene.keyframe_i2v.intended_keyframe_description
+            || draft.actual_keyframe_description !== visualScene.keyframe_i2v.actual_keyframe_description);
+}
+
+function deriveVisualReadinessClient(project, visualScene) {
+    const missing = [];
+    const storyboardScenes = project?.storyboard?.scenes || [];
+    const storyboardScene = storyboardSceneFor(project, visualScene.scene_id);
+    if (!storyboardScenes.length) {
+        missing.push("Apply a storyboard before continuing.");
+    } else if (builderState.storyboardRequestStale) {
+        missing.push("Storyboard is out of date.");
+    } else if (!storyboardScene) {
+        missing.push("Current storyboard scene allocation is missing.");
+    }
+
+    if (visualScene.generation_method === "keyframe_i2v") {
+        const keyframe = visualScene.keyframe_i2v;
+        if (!keyframe.keyframe_generation_prompt) {
+            missing.push("Missing keyframe generation prompt");
+        }
+        if (!keyframe.intended_keyframe_description) {
+            missing.push("Missing intended keyframe description");
+        }
+        if (!keyframe.accepted_keyframe) {
+            missing.push("Missing accepted keyframe");
+        }
+        if (!keyframe.actual_keyframe_description) {
+            missing.push("Missing actual image description");
+        }
+    } else {
+        const selected = visualScene.reference2video.selected_references;
+        const assigned = new Set(visualAssignedReferences(project, storyboardScene).map(visualSelectorKey));
+        const selectedKeys = new Set(selected.map(visualSelectorKey));
+        if (!selected.length) {
+            missing.push("Select at least one still reference");
+        }
+        if (selected.some((selector) => !assigned.has(visualSelectorKey(selector)))) {
+            missing.push("A selected reference is not assigned to this scene");
+        }
+        for (const required of storyboardScene?.required_references || []) {
+            if (!selectedKeys.has(visualSelectorKey(required))) {
+                missing.push("A required storyboard reference is not selected");
+            }
+        }
+    }
+    return {
+        ready: missing.length === 0,
+        missing: [...new Set(missing)],
+    };
+}
+
+function appendVisualContextField(parent, label, value) {
+    const field = document.createElement("div");
+    field.className = "mvb-visual-context-field";
+    const labelElement = document.createElement("span");
+    labelElement.className = "mvb-visual-context-label";
+    labelElement.textContent = label;
+    const valueElement = document.createElement("span");
+    valueElement.className = "mvb-visual-context-value";
+    valueElement.textContent = value || "—";
+    field.append(labelElement, valueElement);
+    parent.append(field);
+}
+
+function makeVisualButton(label, className, handler, disabled = false) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `mvb-button mvb-button-small ${className}`;
+    button.textContent = label;
+    button.disabled = disabled;
+    button.addEventListener("click", handler);
+    return button;
+}
+
+function visualPath(projectId, sceneId, suffix = "") {
+    const tail = suffix ? `/${suffix}` : "";
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/visuals/scenes/${encodeURIComponent(sceneId)}${tail}`;
+}
+
+function visualProjectPath(projectId, suffix = "") {
+    const tail = suffix ? `/${suffix}` : "";
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/visuals${tail}`;
+}
+
+function captureVisualViewport(root) {
+    if (!isActive(root) || builderState.activeView !== "visuals") {
+        return null;
+    }
+    const visuals = root.querySelector("[data-mvb-visuals]");
+    const content = root.querySelector(".mvb-content");
+    return {
+        visuals: visuals ? { top: visuals.scrollTop, left: visuals.scrollLeft } : null,
+        content: content ? { top: content.scrollTop, left: content.scrollLeft } : null,
+    };
+}
+
+function restoreVisualViewport(root, viewport) {
+    if (!viewport || !isActive(root) || builderState.activeView !== "visuals") {
+        return;
+    }
+    const apply = () => {
+        if (!isActive(root) || builderState.activeView !== "visuals") {
+            return;
+        }
+        const visuals = root.querySelector("[data-mvb-visuals]");
+        const content = root.querySelector(".mvb-content");
+        if (visuals && viewport.visuals) {
+            visuals.scrollTop = viewport.visuals.top;
+            visuals.scrollLeft = viewport.visuals.left;
+        }
+        if (content && viewport.content) {
+            content.scrollTop = viewport.content.top;
+            content.scrollLeft = viewport.content.left;
+        }
+    };
+    apply();
+    window.requestAnimationFrame(apply);
+}
+
+function appendVisualTextarea(parent, label, value, rows, onInput, disabled = false) {
+    const field = document.createElement("label");
+    field.className = "mvb-field mvb-visual-field";
+    const labelElement = document.createElement("span");
+    labelElement.textContent = label;
+    const textarea = document.createElement("textarea");
+    textarea.rows = rows;
+    textarea.maxLength = 8000;
+    textarea.value = value;
+    textarea.disabled = disabled;
+    textarea.addEventListener("input", () => onInput(textarea.value));
+    field.append(labelElement, textarea);
+    parent.append(field);
+    return textarea;
+}
+
+function plannedVisualReferenceMapping(project, selectedReferences) {
+    const subjectNumbers = new Map();
+    const mapping = [];
+    for (const [index, selector] of selectedReferences.entries()) {
+        const info = visualReferenceFor(project, selector);
+        if (!info) {
+            continue;
+        }
+        const ownerKey = `${selector.entity_type}:${selector.entity_id}`;
+        if (!subjectNumbers.has(ownerKey)) {
+            subjectNumbers.set(ownerKey, subjectNumbers.size + 1);
+        }
+        const subjectTag = `<Subject ${subjectNumbers.get(ownerKey)}>`;
+        mapping.push({
+            pictureTag: `<Picture ${index + 1}>`,
+            subjectTag,
+            entityName: info.entity.name,
+            originalName: info.reference.original_name,
+        });
+    }
+    return mapping;
+}
+
+function renderVisualKeyframeBranch(root, body, scene, visualScene, disabled) {
+    const draft = visualDraftFor(visualScene.scene_id, visualScene);
+    const branch = document.createElement("div");
+    branch.className = "mvb-visual-branch";
+
+    appendVisualTextarea(
+        branch,
+        "Keyframe generation prompt",
+        draft.keyframe_generation_prompt,
+        5,
+        (value) => {
+            draft.keyframe_generation_prompt = value;
+            builderState.visualMessage = "";
+        },
+        disabled,
+    );
+    appendVisualTextarea(
+        branch,
+        "Intended keyframe description",
+        draft.intended_keyframe_description,
+        3,
+        (value) => {
+            draft.intended_keyframe_description = value;
+            builderState.visualMessage = "";
+        },
+        disabled,
+    );
+    appendVisualTextarea(
+        branch,
+        "Actual keyframe description",
+        draft.actual_keyframe_description,
+        3,
+        (value) => {
+            draft.actual_keyframe_description = value;
+            builderState.visualMessage = "";
+        },
+        disabled,
+    );
+
+    const accepted = visualScene.keyframe_i2v.accepted_keyframe;
+    if (accepted) {
+        const preview = document.createElement("figure");
+        preview.className = "mvb-visual-keyframe-preview";
+        const image = document.createElement("img");
+        const imagePath = visualPath(builderState.currentProject.project_id, visualScene.scene_id, "keyframe/image");
+        image.src = `${imagePath}?v=${encodeURIComponent(accepted.asset_id)}`;
+        image.alt = `Accepted keyframe for scene ${scene.scene_id}`;
+        image.loading = "lazy";
+        const caption = document.createElement("figcaption");
+        caption.textContent = accepted.original_name;
+        preview.append(image, caption);
+        branch.append(preview);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "mvb-visual-actions";
+    actions.append(
+        makeVisualButton(
+            "Save Details",
+            "mvb-button-primary",
+            () => void saveVisualDetails(root, visualScene.scene_id),
+            disabled,
+        ),
+        makeVisualButton(
+            "Generate Prompt",
+            "mvb-button-secondary",
+            () => void generateKeyframePrompt(root, visualScene.scene_id),
+            disabled,
+        ),
+        makeVisualButton(
+            "Copy Prompt",
+            "mvb-button-secondary",
+            () => void copyKeyframePrompt(root, visualScene.scene_id),
+            disabled || !draft.keyframe_generation_prompt,
+        ),
+    );
+
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = "image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp";
+    fileInput.hidden = true;
+    fileInput.addEventListener("change", () => {
+        const file = fileInput.files?.[0];
+        if (!file) {
+            return;
+        }
+        void assignKeyframe(root, visualScene.scene_id, file).finally(() => {
+            fileInput.value = "";
+        });
+    });
+    actions.append(
+        makeVisualButton(
+            accepted ? "Replace Keyframe" : "Assign Keyframe",
+            "mvb-button-secondary",
+            () => fileInput.click(),
+            disabled,
+        ),
+        fileInput,
+    );
+
+    if (accepted && builderState.visualRemoveTarget === visualScene.scene_id) {
+        const confirmation = document.createElement("span");
+        confirmation.className = "mvb-visual-remove-confirmation";
+        confirmation.textContent = "Remove this accepted image?";
+        actions.append(
+            confirmation,
+            makeVisualButton(
+                "Confirm Remove",
+                "mvb-button-danger",
+                () => void removeKeyframe(root, visualScene.scene_id),
+                disabled,
+            ),
+            makeVisualButton(
+                "Keep",
+                "mvb-button-secondary",
+                () => {
+                    builderState.visualRemoveTarget = null;
+                    renderVisualsState(root);
+                },
+                disabled,
+            ),
+        );
+    } else if (accepted) {
+        actions.append(makeVisualButton(
+            "Remove Keyframe",
+            "mvb-button-danger",
+            () => {
+                builderState.visualRemoveTarget = visualScene.scene_id;
+                renderVisualsState(root);
+            },
+            disabled,
+        ));
+    }
+    branch.append(actions, document.createElement("div"));
+    body.append(branch);
+}
+
+function renderVisualReferenceBranch(root, body, scene, visualScene, disabled) {
+    const project = builderState.currentProject;
+    const storyboardScene = storyboardSceneFor(project, scene.scene_id);
+    const assigned = visualAssignedReferences(project, storyboardScene);
+    const selected = visualScene.reference2video.selected_references;
+    const selectedKeys = new Set(selected.map(visualSelectorKey));
+    const branch = document.createElement("div");
+    branch.className = "mvb-visual-branch";
+
+    const chooser = document.createElement("div");
+    chooser.className = "mvb-visual-reference-chooser";
+    const select = document.createElement("select");
+    select.className = "mvb-visual-reference-select";
+    select.setAttribute("aria-label", "Assigned reference to add");
+    for (const selector of assigned) {
+        if (selectedKeys.has(visualSelectorKey(selector))) {
+            continue;
+        }
+        const info = visualReferenceFor(project, selector);
+        if (!info) {
+            continue;
+        }
+        const option = document.createElement("option");
+        option.value = visualSelectorKey(selector);
+        option.textContent = `${info.entity.name} · ${info.reference.original_name}`;
+        select.append(option);
+    }
+    const addButton = makeVisualButton(
+        "Add Reference",
+        "mvb-button-secondary",
+        () => {
+            const selector = assigned.find((item) => visualSelectorKey(item) === select.value);
+            if (selector) {
+                void saveReferenceSelection(root, scene.scene_id, [...selected, selector]);
+            }
+        },
+        disabled || !select.options.length,
+    );
+    chooser.append(select, addButton);
+    branch.append(chooser);
+
+    const selectedList = document.createElement("div");
+    selectedList.className = "mvb-visual-selected-references";
+    if (!selected.length) {
+        const empty = document.createElement("p");
+        empty.className = "mvb-visual-empty";
+        empty.textContent = "No still references selected.";
+        selectedList.append(empty);
+    }
+    for (const [index, selector] of selected.entries()) {
+        const info = visualReferenceFor(project, selector);
+        const row = document.createElement("div");
+        row.className = "mvb-visual-selected-reference";
+        if (!info) {
+            row.textContent = "Reference is no longer available.";
+            selectedList.append(row);
+            continue;
+        }
+        const image = document.createElement("img");
+        image.src = referenceUrl(project.project_id, selector.entity_type === "character" ? "characters" : "locations", selector.entity_id, selector.reference_id);
+        image.alt = `${info.entity.name} reference`;
+        image.loading = "lazy";
+        const text = document.createElement("span");
+        text.textContent = `${index + 1}. ${info.entity.name} · ${info.reference.original_name}`;
+        const rowActions = document.createElement("span");
+        rowActions.className = "mvb-visual-row-actions";
+        rowActions.append(
+            makeVisualButton(
+                "Up",
+                "mvb-button-secondary",
+                () => {
+                    if (index === 0) return;
+                    const reordered = [...selected];
+                    [reordered[index - 1], reordered[index]] = [reordered[index], reordered[index - 1]];
+                    void saveReferenceSelection(root, scene.scene_id, reordered);
+                },
+                disabled || index === 0,
+            ),
+            makeVisualButton(
+                "Down",
+                "mvb-button-secondary",
+                () => {
+                    if (index === selected.length - 1) return;
+                    const reordered = [...selected];
+                    [reordered[index], reordered[index + 1]] = [reordered[index + 1], reordered[index]];
+                    void saveReferenceSelection(root, scene.scene_id, reordered);
+                },
+                disabled || index === selected.length - 1,
+            ),
+            makeVisualButton(
+                "Remove",
+                "mvb-button-danger",
+                () => void saveReferenceSelection(root, scene.scene_id, selected.filter((_, itemIndex) => itemIndex !== index)),
+                disabled,
+            ),
+        );
+        row.append(image, text, rowActions);
+        selectedList.append(row);
+    }
+    branch.append(selectedList);
+
+    const mapping = document.createElement("div");
+    mapping.className = "mvb-visual-mapping";
+    const mappingHeading = document.createElement("p");
+    mappingHeading.className = "mvb-visual-subheading";
+    mappingHeading.textContent = "Planned reference mapping";
+    mapping.append(mappingHeading);
+    const mappingList = document.createElement("ul");
+    const planned = plannedVisualReferenceMapping(project, selected);
+    if (!planned.length) {
+        const empty = document.createElement("li");
+        empty.textContent = "Select assigned references to preview deterministic Picture order.";
+        mappingList.append(empty);
+    }
+    for (const item of planned) {
+        const entry = document.createElement("li");
+        entry.textContent = `${item.pictureTag} · ${item.entityName} · ${item.originalName}${item.subjectTag ? ` · ${item.subjectTag}` : ""}`;
+        mappingList.append(entry);
+    }
+    mapping.append(mappingList);
+    branch.append(mapping);
+    body.append(branch);
+}
+
+function renderVisualSceneCard(root, scene, visualScene, index) {
+    const readiness = deriveVisualReadinessClient(builderState.currentProject, visualScene);
+    const card = document.createElement("details");
+    card.className = "mvb-visual-card";
+    const hasExpansionState = Object.prototype.hasOwnProperty.call(builderState.visualExpandedScenes, scene.scene_id);
+    card.open = hasExpansionState ? Boolean(builderState.visualExpandedScenes[scene.scene_id]) : index === 0;
+    card.addEventListener("toggle", () => {
+        if (isActive(root)) {
+            builderState.visualExpandedScenes[scene.scene_id] = card.open;
+        }
+    });
+
+    const summary = document.createElement("summary");
+    summary.className = "mvb-visual-summary";
+    const title = document.createElement("span");
+    title.className = "mvb-visual-summary-title";
+    title.textContent = `Scene ${String(index + 1).padStart(2, "0")}`;
+    const timing = document.createElement("span");
+    timing.className = "mvb-visual-summary-timing";
+    timing.textContent = `${formatTimelineMs(scene.timeline_start_ms)} → ${formatTimelineMs(scene.timeline_end_ms)} · ${formatDurationMs(scene.exact_duration_ms)}`;
+    const method = document.createElement("span");
+    method.className = "mvb-visual-summary-method";
+    method.textContent = VISUAL_METHOD_LABELS[visualScene.generation_method];
+    const readinessElement = document.createElement("span");
+    readinessElement.className = "mvb-visual-readiness";
+    readinessElement.dataset.state = readiness.ready ? "ready" : "blocked";
+    readinessElement.textContent = readiness.ready ? "Ready" : "Needs input";
+    summary.append(title, timing, method, readinessElement);
+    card.append(summary);
+
+    const body = document.createElement("div");
+    body.className = "mvb-visual-card-body";
+    const storyboardScene = storyboardSceneFor(builderState.currentProject, scene.scene_id);
+    const context = document.createElement("div");
+    context.className = "mvb-visual-context";
+    appendVisualContextField(context, "Type", storyboardScene?.scene_type || "No storyboard allocation");
+    appendVisualContextField(context, "Source", scene.source_kind === "lyric" ? scene.lyric : "Instrumental");
+    appendVisualContextField(
+        context,
+        "Characters",
+        storyboardScene?.character_ids.map((id) => findCharacter(builderState.currentProject, id)?.name || "Unknown character").join(", "),
+    );
+    appendVisualContextField(
+        context,
+        "Location",
+        storyboardScene?.location_id ? findLocation(builderState.currentProject, storyboardScene.location_id)?.name : "—",
+    );
+    appendVisualContextField(context, "Action", storyboardScene?.action);
+    appendVisualContextField(context, "Visual", storyboardScene?.visual_instructions);
+    appendVisualContextField(context, "Camera", storyboardScene?.camera_direction);
+    appendVisualContextField(context, "Motion", storyboardScene?.motion_direction);
+    appendVisualContextField(context, "Continuity", storyboardScene?.continuity_notes);
+    appendVisualContextField(
+        context,
+        "Required references",
+        storyboardScene?.required_references.map((selector) => {
+            const info = visualReferenceFor(builderState.currentProject, selector);
+            return info ? `${info.entity.name} · ${info.reference.original_name}` : "Unknown reference";
+        }).join(", "),
+    );
+    body.append(context);
+
+    const controls = document.createElement("div");
+    controls.className = "mvb-visual-method-row";
+    const methodField = document.createElement("label");
+    methodField.className = "mvb-field";
+    const methodLabel = document.createElement("span");
+    methodLabel.textContent = "Generation method";
+    const methodSelect = document.createElement("select");
+    methodSelect.setAttribute("aria-label", `Generation method for scene ${index + 1}`);
+    for (const value of ["keyframe_i2v", "reference2video"]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = VISUAL_METHOD_LABELS[value];
+        option.selected = visualScene.generation_method === value;
+        methodSelect.append(option);
+    }
+    methodSelect.disabled = Boolean(builderState.operation) || builderState.transitioning || builderState.closing;
+    methodSelect.addEventListener("change", () => void changeVisualMethod(root, scene.scene_id, methodSelect.value));
+    methodField.append(methodLabel, methodSelect);
+    controls.append(methodField);
+    body.append(controls);
+
+    const disabled = Boolean(builderState.operation) || builderState.transitioning || builderState.closing;
+    if (visualScene.generation_method === "keyframe_i2v") {
+        renderVisualKeyframeBranch(root, body, scene, visualScene, disabled);
+    } else {
+        renderVisualReferenceBranch(root, body, scene, visualScene, disabled);
+    }
+    if (readiness.missing.length) {
+        const missing = document.createElement("p");
+        missing.className = "mvb-visual-missing";
+        missing.textContent = readiness.missing.join(" · ");
+        body.append(missing);
+    }
+    card.append(body);
+    return card;
+}
+
+function renderVisualsState(root, viewport = null) {
+    if (!isActive(root)) {
+        return;
+    }
+    const list = root.querySelector("[data-mvb-visual-scenes]");
+    const empty = root.querySelector("[data-mvb-visual-empty]");
+    const status = root.querySelector("[data-mvb-visual-status]");
+    const bulkControls = root.querySelector("[data-mvb-visual-bulk]");
+    const bulkMethod = root.querySelector("[data-mvb-visual-bulk-method]");
+    const bulkButton = root.querySelector("[data-mvb-visual-bulk-apply]");
+    if (!list || !empty || !status || !bulkControls || !bulkMethod || !bulkButton) {
+        return;
+    }
+    const capturedViewport = viewport || captureVisualViewport(root);
+    list.replaceChildren();
+    const project = builderState.currentProject;
+    if (!project) {
+        bulkControls.hidden = true;
+        empty.hidden = true;
+        status.textContent = "";
+        restoreVisualViewport(root, capturedViewport);
+        return;
+    }
+    const scenes = project.scenes || [];
+    bulkControls.hidden = false;
+    bulkMethod.value = builderState.visualBulkMethod;
+    const controlsDisabled = Boolean(builderState.operation) || builderState.transitioning || builderState.closing || !scenes.length;
+    bulkMethod.disabled = controlsDisabled;
+    bulkButton.disabled = controlsDisabled;
+    const sceneIds = new Set(scenes.map((scene) => scene.scene_id));
+    for (const sceneId of Object.keys(builderState.visualExpandedScenes)) {
+        if (!sceneIds.has(sceneId)) {
+            delete builderState.visualExpandedScenes[sceneId];
+        }
+    }
+    empty.hidden = scenes.length > 0;
+    if (!scenes.length) {
+        status.textContent = "Build scenes before preparing Visuals.";
+        status.dataset.state = "empty";
+        restoreVisualViewport(root, capturedViewport);
+        return;
+    }
+    const operationLabel = builderState.operation?.startsWith("visual") ? "Saving Visuals…" : "";
+    status.textContent = builderState.visualMessage || operationLabel;
+    status.dataset.state = builderState.visualMessage
+        ? builderState.visualMessageState
+        : operationLabel
+            ? "working"
+            : "ready";
+    for (const [index, scene] of scenes.entries()) {
+        const visualScene = visualSceneFor(project, scene.scene_id);
+        if (visualScene) {
+            list.append(renderVisualSceneCard(root, scene, visualScene, index));
+        }
+    }
+    restoreVisualViewport(root, capturedViewport);
+}
+
+async function runVisualMutation(root, operation, sceneId, task, failureMessage, options = {}) {
+    if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
+        return false;
+    }
+    const projectId = builderState.currentProject.project_id;
+    const activeView = builderState.activeView;
+    const visualViewport = captureVisualViewport(root);
+    builderState.operation = operation;
+    builderState.visualMessage = "";
+    builderState.visualMessageState = "ready";
+    renderProjectState(root, { visualViewport });
+    let succeeded = false;
+    try {
+        if (!await flushCurrentProject(root)) {
+            builderState.visualMessage = "Save the current project before continuing.";
+            builderState.visualMessageState = "error";
+            return false;
+        }
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        const project = await task(projectId, sceneId);
+        if (!hasProjectDocument(project)) {
+            throw new Error("Visuals response was invalid.");
+        }
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        setCurrentProject(root, project, options);
+        builderState.activeView = activeView;
+        builderState.visualMessage = "";
+        builderState.visualMessageState = "ready";
+        if (project.storyboard?.scenes?.length) {
+            void loadStoryboardRequest(root, true);
+        }
+        void loadProjectList(root);
+        succeeded = true;
+        return true;
+    } catch (error) {
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        console.error(`[Music Video Builder] ${operation} operation failed.`, error);
+        builderState.visualMessage = error instanceof Error && error.message ? error.message : failureMessage;
+        builderState.visualMessageState = "error";
+        return false;
+    } finally {
+        if (isActive(root)) {
+            builderState.operation = null;
+            if (succeeded) {
+                builderState.visualMessage = "";
+            }
+            renderProjectState(root, { visualViewport });
+        }
+    }
+}
+
+async function saveVisualDetails(root, sceneId) {
+    const project = builderState.currentProject;
+    const visualScene = visualSceneFor(project, sceneId);
+    if (!visualScene) {
+        return false;
+    }
+    const draft = visualDraftFor(sceneId, visualScene);
+    return runVisualMutation(
+        root,
+        "visual-details",
+        sceneId,
+        (projectId, currentSceneId) => fetchJson(visualPath(projectId, currentSceneId, "keyframe-details"), {
+            method: "PUT",
+            body: JSON.stringify({
+                keyframe_generation_prompt: draft.keyframe_generation_prompt,
+                intended_keyframe_description: draft.intended_keyframe_description,
+                actual_keyframe_description: draft.actual_keyframe_description,
+            }),
+        }),
+        "Keyframe details could not be saved.",
+        { reconciledVisualSceneId: sceneId },
+    );
+}
+
+async function persistVisualDetailsIfDirty(root, sceneId) {
+    const visualScene = visualSceneFor(builderState.currentProject, sceneId);
+    const draft = visualScene ? builderState.visualDrafts[sceneId] : null;
+    if (!visualScene || !visualDraftIsDirty(visualScene, draft)) {
+        return true;
+    }
+    return saveVisualDetails(root, sceneId);
+}
+
+async function changeVisualMethod(root, sceneId, generationMethod) {
+    const visualScene = visualSceneFor(builderState.currentProject, sceneId);
+    if (!visualScene || visualScene.generation_method === generationMethod) {
+        return;
+    }
+    if (!(await persistVisualDetailsIfDirty(root, sceneId))) {
+        return;
+    }
+    await runVisualMutation(
+        root,
+        "visual-method",
+        sceneId,
+        (projectId, currentSceneId) => fetchJson(visualPath(projectId, currentSceneId, "generation-method"), {
+            method: "PUT",
+            body: JSON.stringify({ generation_method: generationMethod }),
+        }),
+        "Generation method could not be saved.",
+        { reconciledVisualSceneId: sceneId },
+    );
+}
+
+async function generateKeyframePrompt(root, sceneId) {
+    if (!(await persistVisualDetailsIfDirty(root, sceneId))) {
+        return;
+    }
+    await runVisualMutation(
+        root,
+        "visual-prompt",
+        sceneId,
+        (projectId, currentSceneId) => fetchJson(visualPath(projectId, currentSceneId, "keyframe-prompt"), { method: "POST" }),
+        "Keyframe prompt could not be generated.",
+        { reconciledVisualSceneId: sceneId },
+    );
+}
+
+async function copyKeyframePrompt(root, sceneId) {
+    const visualScene = visualSceneFor(builderState.currentProject, sceneId);
+    const prompt = builderState.visualDrafts[sceneId]?.keyframe_generation_prompt
+        || visualScene?.keyframe_i2v.keyframe_generation_prompt;
+    if (!prompt) {
+        return;
+    }
+    try {
+        if (!navigator.clipboard?.writeText) {
+            throw new Error("Clipboard access is unavailable; select the visible prompt to copy it.");
+        }
+        await navigator.clipboard.writeText(prompt);
+        builderState.visualMessage = "Keyframe prompt copied.";
+        builderState.visualMessageState = "success";
+    } catch (error) {
+        console.error("[Music Video Builder] Keyframe prompt copy failed.", error);
+        builderState.visualMessage = error instanceof Error ? error.message : "Keyframe prompt could not be copied.";
+        builderState.visualMessageState = "error";
+    }
+    renderVisualsState(root);
+}
+
+async function assignKeyframe(root, sceneId, file) {
+    if (!(await persistVisualDetailsIfDirty(root, sceneId))) {
+        return;
+    }
+    await runVisualMutation(
+        root,
+        "visual-keyframe",
+        sceneId,
+        (projectId, currentSceneId) => fetchJson(visualPath(projectId, currentSceneId, "keyframe"), {
+            method: "POST",
+            body: uploadFormData(file),
+        }),
+        "Keyframe could not be saved.",
+        { reconciledVisualSceneId: sceneId },
+    );
+}
+
+async function removeKeyframe(root, sceneId) {
+    await runVisualMutation(
+        root,
+        "visual-remove-keyframe",
+        sceneId,
+        (projectId, currentSceneId) => fetchJson(visualPath(projectId, currentSceneId, "keyframe"), { method: "DELETE" }),
+        "Keyframe could not be removed.",
+    );
+}
+
+async function saveReferenceSelection(root, sceneId, selectedReferences) {
+    await runVisualMutation(
+        root,
+        "visual-references",
+        sceneId,
+        (projectId, currentSceneId) => fetchJson(visualPath(projectId, currentSceneId, "reference2video"), {
+            method: "PUT",
+            body: JSON.stringify({ selected_references: selectedReferences }),
+        }),
+        "Reference selection could not be saved.",
+    );
+}
+
+async function applyVisualMethodToAllScenes(root) {
+    if (!isActive(root) || !builderState.currentProject?.scenes?.length) {
+        return;
+    }
+    await runVisualMutation(
+        root,
+        "visual-bulk-method",
+        null,
+        (projectId) => fetchJson(visualProjectPath(projectId, "generation-method"), {
+            method: "PUT",
+            body: JSON.stringify({ generation_method: builderState.visualBulkMethod }),
+        }),
+        "Generation method could not be applied to all scenes.",
+    );
+}
+
 function closeResourceDialogs(root) {
     root.querySelector("[data-mvb-character-dialog]").hidden = true;
     root.querySelector("[data-mvb-location-dialog]").hidden = true;
@@ -986,7 +1895,7 @@ function switchView(root, view) {
     if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
         return;
     }
-    if (view !== "setup" && view !== "storyboard") {
+    if (view !== "setup" && view !== "storyboard" && view !== "visuals") {
         return;
     }
     builderState.activeView = view;
@@ -994,7 +1903,7 @@ function switchView(root, view) {
     renderProjectState(root);
 }
 
-function renderProjectState(root) {
+function renderProjectState(root, options = {}) {
     if (!isActive(root)) {
         return;
     }
@@ -1010,6 +1919,7 @@ function renderProjectState(root) {
     const setup = root.querySelector("[data-mvb-setup]");
     const sceneReview = root.querySelector("[data-mvb-scene-review]");
     const storyboard = root.querySelector("[data-mvb-storyboard]");
+    const visuals = root.querySelector("[data-mvb-visuals]");
     const nameInput = root.querySelector("[data-mvb-project-name]");
     const saveButton = root.querySelector("[data-mvb-save]");
     const projectsButton = root.querySelector("[data-mvb-projects]");
@@ -1027,6 +1937,7 @@ function renderProjectState(root) {
         viewNav.hidden = true;
         setupView.hidden = true;
         storyboard.hidden = true;
+        visuals.hidden = true;
         setup.hidden = true;
         sceneReview.hidden = true;
         nameInput.value = "";
@@ -1041,6 +1952,7 @@ function renderProjectState(root) {
         viewNav.hidden = false;
         setupView.hidden = state.activeView !== "setup";
         storyboard.hidden = state.activeView !== "storyboard";
+        visuals.hidden = state.activeView !== "visuals";
         setup.hidden = false;
         sceneReview.hidden = false;
         if (nameInput.value !== currentProject.name) {
@@ -1072,9 +1984,11 @@ function renderProjectState(root) {
     if (currentProject) {
         renderSetupState(root);
         renderStoryboardState(root);
+        renderVisualsState(root, options.visualViewport || null);
     } else {
         renderSceneReview(root);
         renderStoryboardState(root);
+        renderVisualsState(root, options.visualViewport || null);
     }
 }
 
@@ -2324,6 +3238,7 @@ function openBuilder() {
                 <nav class="mvb-view-nav" data-mvb-view-nav role="tablist" aria-label="Project views" hidden>
                     <button class="mvb-view-button" data-mvb-view="setup" type="button" role="tab" aria-selected="true">Setup</button>
                     <button class="mvb-view-button" data-mvb-view="storyboard" type="button" role="tab" aria-selected="false">Storyboard</button>
+                    <button class="mvb-view-button" data-mvb-view="visuals" type="button" role="tab" aria-selected="false">Visuals</button>
                 </nav>
 
                 <section class="mvb-landing" data-mvb-landing aria-labelledby="mvb-landing-heading" hidden>
@@ -2425,6 +3340,29 @@ function openBuilder() {
                     </div>
                     </section>
                 </div>
+
+                <section class="mvb-visuals" data-mvb-visuals aria-labelledby="mvb-visuals-heading" hidden>
+                    <div class="mvb-visuals-heading">
+                        <div>
+                            <p class="mvb-eyebrow">Visuals</p>
+                            <h2 id="mvb-visuals-heading">Scene visual workflow</h2>
+                        </div>
+                        <span class="mvb-visual-status" data-mvb-visual-status aria-live="polite"></span>
+                    </div>
+                    <p class="mvb-visual-intro">Prepare one generation method and its scene-local inputs for each applied storyboard scene.</p>
+                    <div class="mvb-visual-bulk" data-mvb-visual-bulk>
+                        <label class="mvb-field mvb-visual-bulk-field">
+                            <span>Generation Method for All Scenes</span>
+                            <select data-mvb-visual-bulk-method aria-label="Generation Method for All Scenes">
+                                <option value="keyframe_i2v">Keyframe / Image-to-Video</option>
+                                <option value="reference2video">Reference-to-Video</option>
+                            </select>
+                        </label>
+                        <button class="mvb-button mvb-button-secondary" data-mvb-visual-bulk-apply type="button">Apply to All Scenes</button>
+                    </div>
+                    <p class="mvb-visual-empty" data-mvb-visual-empty hidden>Build scenes before preparing Visuals.</p>
+                    <div class="mvb-visual-scenes" data-mvb-visual-scenes></div>
+                </section>
 
                 <section class="mvb-storyboard" data-mvb-storyboard aria-labelledby="mvb-storyboard-heading" hidden>
                     <div class="mvb-storyboard-heading">
@@ -2694,6 +3632,12 @@ function openBuilder() {
         storyboardPreview: null,
         storyboardRelayMessage: "",
         storyboardRelayState: "ready",
+        visualDrafts: {},
+        visualExpandedScenes: {},
+        visualBulkMethod: "keyframe_i2v",
+        visualRemoveTarget: null,
+        visualMessage: "",
+        visualMessageState: "ready",
         activeView: "setup",
         deleteConfirm: null,
         newProjectBusy: false,
@@ -2741,6 +3685,8 @@ function openBuilder() {
     const clearStoryboardButton = root.querySelector("[data-mvb-clear-storyboard]");
     const cancelClearStoryboardButton = root.querySelector("[data-mvb-cancel-clear-storyboard]");
     const confirmClearStoryboardButton = root.querySelector("[data-mvb-confirm-clear-storyboard]");
+    const visualBulkMethod = root.querySelector("[data-mvb-visual-bulk-method]");
+    const visualBulkApply = root.querySelector("[data-mvb-visual-bulk-apply]");
 
     closeButton.addEventListener("click", () => void closeBuilder(root));
     maximizeButton.addEventListener("click", () => toggleMaximize(root));
@@ -2849,6 +3795,13 @@ function openBuilder() {
     });
     applyStoryboardButton.addEventListener("click", () => void applyStoryboard(root));
     clearStoryboardButton.addEventListener("click", () => openStoryboardClearDialog(root));
+    visualBulkMethod.addEventListener("change", () => {
+        if (!isActive(root)) {
+            return;
+        }
+        builderState.visualBulkMethod = visualBulkMethod.value;
+    });
+    visualBulkApply.addEventListener("click", () => void applyVisualMethodToAllScenes(root));
     cancelClearStoryboardButton.addEventListener("click", () => closeStoryboardClearDialog(root));
     confirmClearStoryboardButton.addEventListener("click", () => void clearAppliedStoryboard(root));
     newForm.addEventListener("submit", (event) => {

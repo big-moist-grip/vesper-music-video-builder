@@ -23,6 +23,7 @@ from backend.source import (
     import_master_audio,
     SrtValidationError,
 )
+from backend.visuals import default_visuals_for_scenes
 
 
 class FakeUpload:
@@ -52,6 +53,7 @@ class Phase2TestCase(unittest.TestCase):
         self.storage = ProjectStorage(self.projects_root)
 
     def _source_document(self, project, duration_ms=20_001, cue_count=0, scenes=None):
+        resolved_scenes = [] if scenes is None else scenes
         return {
             **project,
             "source": {
@@ -66,7 +68,8 @@ class Phase2TestCase(unittest.TestCase):
                     "cue_count": cue_count,
                 },
             },
-            "scenes": [] if scenes is None else scenes,
+            "scenes": resolved_scenes,
+            "visuals": default_visuals_for_scenes(resolved_scenes),
         }
 
 
@@ -85,7 +88,7 @@ class ProjectSchemaV2Tests(Phase2TestCase):
 
         loaded = self.storage.load_project(project["project_id"])
 
-        self.assertEqual(loaded["schema_version"], 4)
+        self.assertEqual(loaded["schema_version"], 5)
         self.assertEqual(loaded["project_id"], legacy["project_id"])
         self.assertEqual(loaded["created_at"], legacy["created_at"])
         self.assertEqual(loaded["updated_at"], legacy["updated_at"])
@@ -109,14 +112,15 @@ class ProjectSchemaV2Tests(Phase2TestCase):
 
         saved = self.storage.save_project(project["project_id"], {**legacy, "name": "Upgraded"})
 
-        self.assertEqual(saved["schema_version"], 4)
+        self.assertEqual(saved["schema_version"], 5)
         self.assertEqual(saved["name"], "Upgraded")
-        self.assertEqual(json.loads(project_file.read_text(encoding="utf-8"))["schema_version"], 4)
+        self.assertEqual(json.loads(project_file.read_text(encoding="utf-8"))["schema_version"], 5)
 
     def test_invalid_current_source_and_scene_data_is_rejected(self):
         project = self.storage.create_project("Invalid v2")
         valid = self._source_document(project, duration_ms=10_001)
         valid["scenes"] = build_scenes([], 10_001)
+        valid["visuals"] = default_visuals_for_scenes(valid["scenes"])
         self.assertEqual(validate_project_document(valid), valid)
 
         invalid_source = self._source_document(project, duration_ms=0)
@@ -723,7 +727,11 @@ class SceneConstructionTests(unittest.TestCase):
             [{"cue_number": 1, "start_ms": 0, "end_ms": 1_000, "text": "Valid"}],
             5_000,
         )
-        project = storage.save_project(project["project_id"], {**project, "scenes": prior_scenes})
+        project = storage.save_project(
+            project["project_id"],
+            {**project, "scenes": prior_scenes, "visuals": default_visuals_for_scenes(prior_scenes)},
+            allow_visuals_change=True,
+        )
         lyrics_path = storage.project_directory(project["project_id"]) / "source" / "lyrics.srt"
         lyrics_path.write_text(
             "1\n00:00:00,000 --> 00:00:01,000\nValid\n\n2\n00:00:00,500 --> 00:00:02,000\nOverlap",
@@ -810,7 +818,11 @@ class SourceImportTests(Phase2TestCase):
             [{"cue_number": 1, "start_ms": 0, "end_ms": 1_000, "text": "First"}],
             5_000,
         )
-        project = self.storage.save_project(project["project_id"], {**project, "scenes": scenes})
+        project = self.storage.save_project(
+            project["project_id"],
+            {**project, "scenes": scenes, "visuals": default_visuals_for_scenes(scenes)},
+            allow_visuals_change=True,
+        )
         old_audio_bytes = (self.projects_root / project["project_id"] / "source" / "master_audio.wav").read_bytes()
         old_srt_bytes = (self.projects_root / project["project_id"] / "source" / "lyrics.srt").read_bytes()
 
@@ -827,15 +839,18 @@ class SourceImportTests(Phase2TestCase):
         self.assertEqual(replaced_audio["scenes"], [])
         self.assertFalse((self.projects_root / project["project_id"] / "source" / "master_audio.wav").exists())
 
+        replacement_scenes = build_scenes(
+            [{"cue_number": 1, "start_ms": 0, "end_ms": 1_000, "text": "First"}],
+            6_000,
+        )
         self.storage.save_project(
             project["project_id"],
             {
                 **replaced_audio,
-                "scenes": build_scenes(
-                    [{"cue_number": 1, "start_ms": 0, "end_ms": 1_000, "text": "First"}],
-                    6_000,
-                ),
+                "scenes": replacement_scenes,
+                "visuals": default_visuals_for_scenes(replacement_scenes),
             },
+            allow_visuals_change=True,
         )
         replaced_srt = run_async(
             import_lyrics_srt(
