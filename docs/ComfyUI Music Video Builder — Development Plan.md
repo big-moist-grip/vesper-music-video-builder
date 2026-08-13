@@ -89,6 +89,27 @@ Target machine:
 
 No external inference API is required.
 
+### Development host and target qualification host
+
+The current development host is intentionally:
+
+- AMD Radeon RX 7900 XT.
+
+The target production and final qualification host remains:
+
+- NVIDIA RTX 4080 SUPER 16 GB.
+- 32 GB system RAM.
+
+The AMD workstation is used to complete Builder development and deterministic
+validation. Resource failures observed on that host do not invalidate the
+selected H3 models, do not justify lowering production quality, and do not
+predict failure on the target NVIDIA host.
+
+Do not alter Windows paging, download lower-quality substitutes, promote the
+W4A8 REF2VA candidate to Final, or rerun an expensive H3 generation on the AMD
+host solely to make a development-host qualification pass. Such a diagnostic
+run requires explicit reviewer authorization.
+
 ---
 
 # 2. User workflow
@@ -270,6 +291,12 @@ Do not expose generic T2V.
 
 Do not expose H3 video-reference or motion-transfer inputs in MVP merely because REF2VA can technically accept them.
 
+The installed `MiniMaxH3ReferenceToVideo` contract currently exposes nine
+finite still-image inputs, `ref_image_0` through `ref_image_8`. The provisional
+production contract therefore limits a scene to nine ordered still references.
+Phase 5 enforces this limit without truncating stored data, and scenes that
+retain an over-capacity legacy selection remain not-ready until corrected.
+
 ---
 
 ## Stage G — H3 prompt generation
@@ -409,7 +436,7 @@ The exact implementation must be validated against the installed H3 nodes during
 
 # 4. Community workflow donor policy
 
-Four supplied workflows are reference donors.
+The supplied and reviewed workflows below are reference donors.
 
 They are not production workflows.
 
@@ -417,7 +444,40 @@ Do not embed them intact.
 
 Do not reproduce their UI groups, notes, toggles or convenience infrastructure.
 
-## Donor A — primary generation core
+## Donor A — latest primary generation research donor
+
+`minimaxH3T2VI2VREF2VAdvanced_v18`
+
+Advanced v18 is the latest primary H3 research donor. Use it to refresh
+qualification evidence for FL2VA/I2V, REF2VA, source-audio latent replacement,
+sampling, resolution/frame calculations, and optional NVIDIA optimisation.
+
+The current stripped Base production topology was derived from Advanced v16
+and installed-node contracts. Advanced v16 remains historical Base-contract
+derivation evidence. Newer optional nodes in v18 do not rewrite the hardened
+Base manifests or templates.
+
+Deferred target-NVIDIA candidates observed in v18 are:
+
+- `minimax_h3_video_vae_int8_convrot.safetensors`, compared with the current
+  provisional FP16 video VAE for visible quality, decode behaviour, VRAM,
+  stability, and speed.
+- `MiniMaxH3SigmaShift`, with observed video shift 12 and audio shift 6; no
+  shift value is frozen until target qualification resolves differing donor
+  evidence.
+- `minimax_h3_fl2v_lightx2v_turbo_4step_v0.1_comfy_resized_avg_rank_21_bf16.safetensors`
+  at observed strength 0.7 as the current preferred I2V Draft Turbo candidate.
+- Additional REF2VA audio-reference inputs as research evidence only; MVP
+  continues to expose one authoritative scene-audio source from the master
+  song.
+
+Do not adopt `LoadImageCrop` or `ModelPreviewOverrideKJ` into the Base graph.
+Do not add Sigma Shift, the INT8 ConvRot video VAE, or the newer Turbo model as
+current production requirements.
+
+---
+
+## Donor A historical evidence — Base-contract derivation
 
 `minimaxH3T2VI2VREF2VAdvanced_v16`
 
@@ -458,6 +518,10 @@ Reference for:
 - Additional H3 speed optimisations.
 - H3 frame calculation.
 - Optional acceleration techniques.
+- `MiniMaxChunkFeedForward` as a deferred memory-management candidate. The
+  observed donor values are 2 and 4096; compare Base with Base plus this node
+  on the target NVIDIA host for completion, time, memory, and visible output
+  equivalence. Do not add it to the Base template without qualification.
 
 Do not adopt:
 
@@ -467,9 +531,11 @@ Do not adopt:
 - RIFE by default.
 - Its entire dependency set without evidence.
 
+W8A8/INT4 diffusion remains fallback/research evidence only and is not Final.
+
 ---
 
-## Donor C — quality upscale and local prompt helper
+## Donor C — quality upscale and memory research
 
 `minimaxH3WithSEEDVR2Upscaler_v4`
 
@@ -478,12 +544,15 @@ Reference for:
 - SeedVR2 video upscaling.
 - Model unloading between H3 and upscale stages.
 - 16 GB-class VRAM handling.
-- Local Ollama prompt-helper behaviour.
 - H3 sigma-shift relationships if applicable.
 
 Do not execute Ollama as part of the render graph.
 
 Do not retain seamless-loop or interpolation functionality unless explicitly added by Sol later.
+
+`minimaxH3WithSEEDVR2Upscaler_v4` remains the SeedVR2 v4 upscale/memory
+research donor. SeedVR2 is not part of the Base H3 generation templates and
+remains conditional on target qualification.
 
 ---
 
@@ -506,6 +575,13 @@ It is deliberately too broad to be the production graph.
 Do not use it as the builder workflow.
 
 MVP Reference-to-Video adopts only the qualified still-image REF2VA subset plus the authoritative scene-audio path. Video-reference/motion-transfer UI remains excluded.
+
+`minimaxh3Auto_v5` is a prompt-grammar/research donor only. Do not inherit its
+ComfyUI LLM graph, Qwen3.6 GGUF or Qwen3.5 9B requirements, three-image helper
+limitation, TextGenerate render nodes, rgthree switching, Pixaroma,
+video-reference support, additional audio-reference UI, concept-expansion UI,
+or EasyUse dependencies. Its useful contribution is structured H3 prompt
+grammar and conventions, not a production workflow.
 
 ---
 
@@ -1199,19 +1275,28 @@ Do not expose T2V or video-reference/motion-transfer UI.
 
 ## PHASE 6 — H3 donor qualification
 
-This phase uses the four supplied workflow JSONs.
+This phase uses the reviewed donor set and installed-node contracts. The raw
+v18, EZ v35, and Auto-Prompter v5 JSON files may not be present in every
+development checkout; when unavailable, reviewer-audited findings are recorded
+as research evidence and are not treated as a replacement for direct graph
+inspection.
 
 Luna must inspect actual graphs, not their Civitai descriptions.
 
-Primary donor:
+Latest primary research donor:
+
+`Advanced v18`
+
+Historical Base-contract derivation evidence:
 
 `Advanced v16`
 
-Secondary donors:
+Qualification and research donors:
 
 - `EZ v3.5`
 - `SeedVR2 v4`
 - `All Inputs beta`
+- `Auto-Prompter v5` — prompt grammar only; not a production H3 workflow donor.
 
 ### 6A — Extract minimum H3 cores
 
@@ -1271,6 +1356,59 @@ Do not benchmark every theoretical permutation.
 
 Sol selects final production settings after reviewing results.
 
+#### Deferred target-NVIDIA acceptance gate
+
+Real H3 generation and quality acceptance may be deferred while the target
+NVIDIA host is unavailable. Development may continue on the AMD workstation
+using:
+
+- Structural workflow validation.
+- Mocked or unit-tested queue behaviour where appropriate.
+- Deterministic manifest patching tests.
+- Backend and frontend tests.
+- Non-generative ComfyUI API validation where safe.
+
+Do not mark deferred runtime tests as passed. The following remain required
+before Final Project Approval and must run on the target RTX 4080 SUPER:
+
+- Real `keyframe_i2v` H3 generation.
+- Real `reference2video` H3 generation.
+- Final quality and acceleration selection.
+- RTX VSR qualification if retained.
+- Real single-scene render validation.
+- Real mixed-generation-method batch validation.
+
+The quality-first production candidates remain provisional until those target
+NVIDIA gates are complete. Keep production graph settings manifest/config
+driven. Graph structure and deterministic node mappings may be implemented
+before the gate when donor evidence and installed-node contracts support them,
+but AMD resource behaviour must not be used to downgrade the selected INT8
+models or promote a lower-memory fallback.
+
+#### Focused target-NVIDIA qualification shortlist
+
+Do not benchmark every cross-product permutation. Sol selects final settings
+after user quality review.
+
+Final-quality and memory order:
+
+1. Current Base INT8 with FP16 video VAE.
+2. Compare FP16 video VAE with the v18 INT8 ConvRot video VAE candidate.
+3. Compare Base with Base plus `MiniMaxChunkFeedForward`.
+4. Compare Base with Base plus `MiniMaxH3SigmaShift`.
+5. Combine only individually successful and valuable optimisations if warranted.
+
+Draft order:
+
+6. Qualify the newer v18 resized-average Rank-21 LightX2V I2V Turbo candidate.
+7. Qualify the appropriate REF2VA Turbo candidate.
+8. Qualify Sage only if it remains credible and compatible at test time.
+
+Upscale order:
+
+9. RTX VSR.
+10. SeedVR2 only if it becomes available and remains worthwhile.
+
 ### 6C — Upscale qualification
 
 Test:
@@ -1295,9 +1433,24 @@ Create the manifest registry and one approved manifest entry per supported metho
 
 Freeze node mappings after approval.
 
+The Phase 6D Base contract may establish the stripped I2V and REF2VA topology,
+deterministic node mappings, ordered REF2VA picture capacity, source-audio
+replacement, decode, and output mechanics before target-NVIDIA qualification.
+This establishes the structural Base contract; it does not freeze target-NVIDIA
+quality or acceleration topology. Final Base settings, Turbo Draft, Sage/Sol or
+other acceleration, any alternative acceleration template, final resolution,
+and RTX VSR remain deferred and manifest/config driven. If target qualification
+requires acceleration, add a separately approved workflow/template rather than
+altering the stripped Base contract.
+
+The 6D.3 donor refresh does not change the Base production topology, manifest
+registry, or workflow templates. Advanced v18, EZ v3.5, SeedVR2 v4, All Inputs
+beta, and Auto-Prompter v5 contribute deferred qualification or research
+evidence only.
+
 ---
 
-## PHASE 7 — Requirement checker + H3 prompt service
+## PHASE 7 — Requirement checker + deterministic H3 prompt compiler
 
 Implement:
 
@@ -1307,12 +1460,68 @@ Implement:
 - Optional RTX VSR scan.
 - Optional SeedVR2 scan.
 - Optional Ollama scan.
-- Local Ollama H3 prompt helper.
-- Deterministic fallback prompt builder for `keyframe_i2v`.
-- Deterministic fallback prompt builder for `reference2video`, including stable picture/subject tags.
-- Editable final prompt.
+- A deterministic method-specific H3 prompt compiler as the authoritative
+  machine-fact layer.
+- Optional local LLM enhancement after deterministic compilation.
+- A user-editable final authoritative prompt.
 
 Do not report dependencies inherited from unused donor branches.
+
+The Phase 7 prompt pipeline is:
+
+`deterministic method-specific H3 prompt compiler`
+`-> optional local LLM enhancement`
+`-> user-editable final authoritative prompt`
+
+The deterministic compiler must supply for both generation methods:
+
+- Exact scene duration.
+- Generation method.
+- Storyboard action.
+- Camera direction and motion direction.
+- Continuity context.
+- The authoritative source-audio relationship.
+- Reference ownership and numbering where applicable.
+- Timestamps only where the storyboard establishes a structurally warranted
+  timed change.
+
+For `reference2video`, the compiler must additionally supply ordered
+`<Picture N>` and `<Subject N>` relationships, Character/Location ownership,
+stable Subject reuse for multiple Pictures from one owner, and the
+`<Audio 1>` relationship. An LLM may improve wording and detail but must not
+invent, renumber, or reassign these structural facts.
+
+The REF2VA prompt structure should be evaluated around these deterministic
+fields, informed by Auto-Prompter v5 without copying its prose or examples:
+
+- `subject_definitions` — machine-generated Picture/Subject/Audio relationships.
+- `summary` — concise generation intent.
+- `retention_analysis` — explicit preservation relationships for supplied
+  reference assets.
+- `detailed_description` — actual scene/action/camera/motion description,
+  normally one continuous shot, with timestamps only for genuine timed state
+  or action changes.
+- `overall_soundscape` — only relevant diegetic/environmental sound
+  requirements.
+- `non_diegetic_music` — the supplied authoritative scene-audio relationship.
+
+For `keyframe_i2v`, the accepted keyframe remains the authoritative opening
+state at 0.00 seconds. The compiler conveys its actual description, scene
+action, camera, motion, continuity, exact duration, and relevant audio or
+performance relationship. It does not add REF2VA Picture/Subject labels or
+`<Audio N>` tags merely because that syntax exists for REF2VA.
+
+The master song remains authoritative. The prompt system must not invent
+lyrics, dialogue, vocal words, soundtrack, music genre, or an extra score
+unless those facts are present in authoritative project data. For ordinary
+Vesper music-video scenes, `non_diegetic_music` references the supplied scene
+audio rather than hallucinating replacement music; final audio replacement or
+remux remains Phase 8.
+
+One Builder scene is one continuous H3 shot by default. Do not invent multiple
+shots to fill a prompt template. A cut, transition, or timed state change may
+justify timestamps only when storyboard data explicitly establishes it; small
+camera-position changes remain camera movement.
 
 ---
 

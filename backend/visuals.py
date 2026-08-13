@@ -47,6 +47,7 @@ REFERENCE2VIDEO_FIELDS = ("selected_references",)
 ACCEPTED_KEYFRAME_FIELDS = ("asset_id", "stored_name", "original_name")
 REFERENCE_SELECTOR_FIELDS = ("entity_type", "entity_id", "reference_id")
 GENERATION_METHODS = ("keyframe_i2v", "reference2video")
+MAX_REF2VA_STILL_REFERENCES = 9
 VISUAL_TEXT_MAX_LENGTH = 8_000
 KEYFRAME_FORMATS = {
     "PNG": ".png",
@@ -134,9 +135,15 @@ def _validate_selected_references(
     value: object,
     characters: list[dict[str, object]],
     locations: list[dict[str, object]],
+    *,
+    allow_over_capacity: bool = False,
 ) -> list[dict[str, str]]:
     if not isinstance(value, list):
         raise ProjectValidationError("Visuals selected_references must be an array.")
+    if len(value) > MAX_REF2VA_STILL_REFERENCES and not allow_over_capacity:
+        raise ProjectValidationError(
+            f"Visuals selected_references cannot exceed {MAX_REF2VA_STILL_REFERENCES} still references."
+        )
 
     characters_by_id = {character["character_id"]: character for character in characters}
     locations_by_id = {location["location_id"]: location for location in locations}
@@ -174,6 +181,9 @@ def validate_visuals(
     scenes: list[dict[str, object]],
     characters: list[dict[str, object]],
     locations: list[dict[str, object]],
+    *,
+    allow_over_capacity: bool = False,
+    allow_over_capacity_scene_ids: set[str] | None = None,
 ) -> dict[str, object]:
     document = _require_exact_fields(value, VISUALS_FIELDS, "Visuals")
     visual_scenes = document.get("scenes")
@@ -224,6 +234,10 @@ def validate_visuals(
                 reference_document.get("selected_references"),
                 characters,
                 locations,
+                allow_over_capacity=(
+                    allow_over_capacity
+                    or (allow_over_capacity_scene_ids is not None and scene_id in allow_over_capacity_scene_ids)
+                ),
             )
         }
         normalized_scenes.append(
@@ -312,6 +326,10 @@ def derive_visual_readiness(
             missing.append("Missing actual image description")
     else:
         selected = visual_scene["reference2video"]["selected_references"]
+        if len(selected) > MAX_REF2VA_STILL_REFERENCES:
+            missing.append(
+                f"Reference-to-Video supports at most {MAX_REF2VA_STILL_REFERENCES} still references"
+            )
         if not selected:
             missing.append("Select at least one still reference")
         if storyboard_scene is not None:

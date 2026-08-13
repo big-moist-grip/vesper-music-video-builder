@@ -1,0 +1,157 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "type": "minimax",
+      "device": "default"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    }
+  },
+  "4": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    }
+  },
+  "5": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "__PHASE8_KEYFRAME_IMAGE__"
+    }
+  },
+  "6": {
+    "class_type": "LoadAudio",
+    "inputs": {
+      "audio": "__PHASE8_SCENE_AUDIO__"
+    }
+  },
+  "7": {
+    "class_type": "MiniMaxH3ImageToVideo",
+    "inputs": {
+      "clip": ["2", 0],
+      "vae": ["3", 0],
+      "prompt": "__PHASE8_COMPLETED_PROMPT__",
+      "width": 960,
+      "height": 544,
+      "length": 73,
+      "first_frame": ["5", 0]
+    }
+  },
+  "8": {
+    "class_type": "LTXVSeparateAVLatent",
+    "inputs": {
+      "av_latent": ["7", 1]
+    }
+  },
+  "9": {
+    "class_type": "VAEEncodeAudio",
+    "inputs": {
+      "audio": ["6", 0],
+      "vae": ["4", 0]
+    }
+  },
+  "10": {
+    "class_type": "SolidMask",
+    "inputs": {
+      "value": 0,
+      "width": 32,
+      "height": 32
+    }
+  },
+  "11": {
+    "class_type": "SetLatentNoiseMask",
+    "inputs": {
+      "samples": ["9", 0],
+      "mask": ["10", 0]
+    }
+  },
+  "12": {
+    "class_type": "LTXVConcatAVLatent",
+    "inputs": {
+      "video_latent": ["8", 0],
+      "audio_latent": ["11", 0]
+    }
+  },
+  "13": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": ["1", 0],
+      "conditioning": ["7", 0]
+    }
+  },
+  "14": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "res_multistep"
+    }
+  },
+  "15": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "model": ["1", 0],
+      "scheduler": "simple",
+      "steps": 20,
+      "denoise": 1
+    }
+  },
+  "16": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 446059383552270
+    }
+  },
+  "17": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": ["16", 0],
+      "guider": ["13", 0],
+      "sampler": ["14", 0],
+      "sigmas": ["15", 0],
+      "latent_image": ["12", 0]
+    }
+  },
+  "18": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["17", 0],
+      "vae": ["3", 0]
+    }
+  },
+  "19": {
+    "class_type": "VAEDecodeAudio",
+    "inputs": {
+      "samples": ["17", 0],
+      "vae": ["4", 0]
+    }
+  },
+  "20": {
+    "class_type": "VHS_VideoCombine",
+    "inputs": {
+      "images": ["18", 0],
+      "audio": ["19", 0],
+      "frame_rate": 24,
+      "loop_count": 0,
+      "filename_prefix": "music_video/scenes",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 16,
+      "save_metadata": false,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true
+    }
+  }
+}

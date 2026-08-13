@@ -5,6 +5,7 @@ const NODE_CLASS = "MusicVideoBuilder";
 const STYLESHEET_ID = "music-video-builder-styles";
 const PROJECTS_PATH = "/music-video-builder/projects";
 const AUTOSAVE_DELAY_MS = 700;
+const MAX_REF2VA_STILL_REFERENCES = 9;
 const STORYBOARD_MODE_HELP = {
     loose: "Interpret the song freely; lyrics guide emotion and structure rather than dictating each shot.",
     strict: "Keep the visuals closely aligned to the lyrical content and sequence.",
@@ -963,6 +964,9 @@ function deriveVisualReadinessClient(project, visualScene) {
         const selected = visualScene.reference2video.selected_references;
         const assigned = new Set(visualAssignedReferences(project, storyboardScene).map(visualSelectorKey));
         const selectedKeys = new Set(selected.map(visualSelectorKey));
+        if (selected.length > MAX_REF2VA_STILL_REFERENCES) {
+            missing.push(`Reference-to-Video supports at most ${MAX_REF2VA_STILL_REFERENCES} still references`);
+        }
         if (!selected.length) {
             missing.push("Select at least one still reference");
         }
@@ -1261,8 +1265,14 @@ function renderVisualReferenceBranch(root, body, scene, visualScene, disabled) {
                 void saveReferenceSelection(root, scene.scene_id, [...selected, selector]);
             }
         },
-        disabled || !select.options.length,
+        disabled || selected.length >= MAX_REF2VA_STILL_REFERENCES || !select.options.length,
     );
+    if (selected.length >= MAX_REF2VA_STILL_REFERENCES) {
+        const limit = document.createElement("p");
+        limit.className = "mvb-visual-missing";
+        limit.textContent = `Reference-to-Video supports up to ${MAX_REF2VA_STILL_REFERENCES} still references.`;
+        chooser.append(limit);
+    }
     chooser.append(select, addButton);
     branch.append(chooser);
 

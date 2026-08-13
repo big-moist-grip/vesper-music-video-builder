@@ -527,9 +527,62 @@ def _validate_entity_lists(
     return validated_characters, validated_locations
 
 
+def _visual_reference_selection_state(value: object) -> list[list[object]] | None:
+    if not isinstance(value, dict) or not isinstance(value.get("scenes"), list):
+        return None
+    selections: list[list[object]] = []
+    for scene in value["scenes"]:
+        if not isinstance(scene, dict):
+            return None
+        reference2video = scene.get("reference2video")
+        if not isinstance(reference2video, dict) or not isinstance(reference2video.get("selected_references"), list):
+            return None
+        selections.append(reference2video["selected_references"])
+    return selections
+
+
+def _preserved_visual_over_capacity_scene_ids(
+    current: dict[str, object],
+    document: object,
+) -> set[str]:
+    from .visuals import MAX_REF2VA_STILL_REFERENCES
+
+    current_selections = _visual_reference_selection_state(current.get("visuals"))
+    incoming_visuals = document.get("visuals") if isinstance(document, dict) else None
+    incoming_selections = _visual_reference_selection_state(incoming_visuals)
+    if current_selections is None or incoming_selections is None:
+        return set()
+    current_visual_scenes = current.get("visuals", {}).get("scenes") if isinstance(current.get("visuals"), dict) else None
+    incoming_visual_scenes = incoming_visuals.get("scenes") if isinstance(incoming_visuals, dict) else None
+    if not isinstance(current_visual_scenes, list) or not isinstance(incoming_visual_scenes, list):
+        return set()
+
+    preserved: set[str] = set()
+    for current_scene, incoming_scene, current_selection, incoming_selection in zip(
+        current_visual_scenes,
+        incoming_visual_scenes,
+        current_selections,
+        incoming_selections,
+    ):
+        if not isinstance(current_scene, dict) or not isinstance(incoming_scene, dict):
+            continue
+        scene_id = current_scene.get("scene_id")
+        if (
+            isinstance(scene_id, str)
+            and incoming_scene.get("scene_id") == scene_id
+            and len(current_selection) > MAX_REF2VA_STILL_REFERENCES
+            and current_selection == incoming_selection
+        ):
+            preserved.add(scene_id)
+    return preserved
+
+
 def validate_project_document(
     document: object,
     expected_project_id: str | None = None,
+    *,
+    allow_visual_over_capacity: bool = False,
+    allow_visual_over_capacity_scene_ids: set[str] | None = None,
 ) -> dict[str, object]:
     if not isinstance(document, dict):
         raise ProjectValidationError("Project document must be a JSON object.")
@@ -582,6 +635,8 @@ def validate_project_document(
             scenes,
             characters,
             locations,
+            allow_over_capacity=allow_visual_over_capacity,
+            allow_over_capacity_scene_ids=allow_visual_over_capacity_scene_ids,
         )
         normalized = {
             "schema_version": SCHEMA_VERSION,
@@ -801,7 +856,11 @@ class ProjectStorage:
             if current_has_state:
                 raise ProjectValidationError("Legacy project data cannot overwrite current project state.")
 
-        candidate = validate_project_document(document, expected_project_id=canonical_id)
+        candidate = validate_project_document(
+            document,
+            expected_project_id=canonical_id,
+            allow_visual_over_capacity_scene_ids=_preserved_visual_over_capacity_scene_ids(current, document),
+        )
         if not allow_storyboard_change:
             candidate["storyboard"] = current["storyboard"]
         if not allow_visuals_change:
@@ -827,7 +886,11 @@ class ProjectStorage:
             document = json.loads(raw)
         except json.JSONDecodeError as error:
             raise ProjectValidationError("Project JSON is malformed.") from error
-        return validate_project_document(document, expected_project_id=expected_project_id)
+        return validate_project_document(
+            document,
+            expected_project_id=expected_project_id,
+            allow_visual_over_capacity=True,
+        )
 
     def _scan_projects(
         self,
