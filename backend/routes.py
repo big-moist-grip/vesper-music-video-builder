@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 
@@ -38,6 +39,8 @@ from .storyboard import (
     empty_storyboard,
     validate_storyboard_response,
 )
+from .prompt_service import compile_scene_prompt
+from .requirements import build_requirements_report
 from .visuals import (
     KeyframeNotFoundError,
     VisualSceneNotFoundError,
@@ -76,6 +79,15 @@ def register_routes():
     @PromptServer.instance.routes.get("/music-video-builder/health")
     async def music_video_builder_health(_request):
         return web.json_response(health_payload())
+
+    @PromptServer.instance.routes.get("/music-video-builder/requirements")
+    async def music_video_builder_requirements(_request):
+        try:
+            report = await asyncio.to_thread(build_requirements_report)
+            return web.json_response(report)
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+            LOGGER.exception("Could not scan Music Video Builder requirements.")
+            return api_error("Requirements could not be scanned.", 500)
 
     def api_error(message, status):
         return web.json_response({"error": message}, status=status)
@@ -310,6 +322,27 @@ def register_routes():
             LOGGER.exception("Could not persist Music Video Builder Visuals mutation.")
             return api_error("Visuals state could not be saved.", 500)
         return web.json_response(project)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/scenes/{scene_id}/prompt/preview")
+    async def music_video_builder_prompt_preview(request):
+        try:
+            project_id, scene_id = validate_visual_route_ids(request)
+        except ProjectValidationError:
+            return api_error("The project or scene ID is invalid.", 400)
+        payload = await read_json(request)
+        if payload is not None and (not isinstance(payload, dict) or payload):
+            return api_error("Prompt preview does not accept request fields.", 400)
+        try:
+            project = PROJECT_STORAGE.load_project(project_id)
+            preview = compile_scene_prompt(project, scene_id)
+        except ProjectNotFoundError:
+            return api_error("Project or scene was not found.", 404)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not load the project for prompt preview.")
+            return api_error("Prompt preview could not be built.", 500)
+        return web.json_response(preview)
 
     @PromptServer.instance.routes.put("/music-video-builder/projects/{project_id}/visuals/scenes/{scene_id}/generation-method")
     async def music_video_builder_set_generation_method(request):
