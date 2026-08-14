@@ -6,19 +6,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backend.prompt_service import (
-    build_immutable_structural_facts,
     build_ref2va_mapping,
+    build_prompt_relay_request,
     compile_scene_prompt,
-    enhance_prompt_with_ollama,
-    validate_enhanced_prompt,
+    validate_prompt_relay_response,
+    validate_relay_description,
 )
-from backend.projects import ProjectStorage, ProjectValidationError
+from backend.projects import ProjectStorage, ProjectValidationError, default_prompts_for_scenes
 from backend.requirements import (
     STATUS_AVAILABLE,
     STATUS_MISSING,
     STATUS_UNKNOWN,
-    OLLAMA_MODEL,
-    probe_ollama,
     scan_requirements,
 )
 from backend.scenes import build_scenes
@@ -41,18 +39,6 @@ class _FakeFolderPaths:
     @staticmethod
     def get_full_path(category, filename):
         return f"C:/ComfyUI/models/{category}/{filename}"
-
-
-class _FakeResponse:
-    def __init__(self, document):
-        self.document = document
-        self.closed = False
-
-    def read(self):
-        return json.dumps(self.document).encode("utf-8")
-
-    def close(self):
-        self.closed = True
 
 
 class Phase7TestCase(unittest.TestCase):
@@ -116,6 +102,7 @@ class Phase7TestCase(unittest.TestCase):
                     }
                 ],
                 "visuals": default_visuals_for_scenes(scene),
+                "prompts": default_prompts_for_scenes(scene),
             },
             allow_visuals_change=True,
         )
@@ -156,13 +143,11 @@ class Phase7TestCase(unittest.TestCase):
             node_types=node_types,
             folder_paths_module=_FakeFolderPaths,
             binary_finder=lambda name: f"C:/tools/{name}.exe",
-            ollama_probe=lambda: {"status": STATUS_MISSING, "model": OLLAMA_MODEL},
         )
         report_two = scan_requirements(
             node_types=node_types,
             folder_paths_module=_FakeFolderPaths,
             binary_finder=lambda name: f"C:/tools/{name}.exe",
-            ollama_probe=lambda: {"status": STATUS_MISSING, "model": OLLAMA_MODEL},
         )
         self.assertEqual(report_one, report_two)
         self.assertEqual(report_one["source"], "backend.workflows.production_manifest_registry")
@@ -181,7 +166,6 @@ class Phase7TestCase(unittest.TestCase):
             node_types={"UNETLoader"},
             folder_paths_module=None,
             binary_finder=lambda _name: None,
-            ollama_probe=lambda: {"status": STATUS_MISSING, "model": OLLAMA_MODEL},
         )
         self.assertFalse(report["required_ready"])
         self.assertEqual(report["methods"]["keyframe_i2v"]["required_nodes"][0]["status"], STATUS_AVAILABLE)
@@ -204,8 +188,7 @@ class Phase7TestCase(unittest.TestCase):
             node_types={"UNETLoader", "CLIPLoader", "VAELoader"},
             folder_paths_module=MissingFolderPaths,
             binary_finder=lambda _name: None,
-            ollama_probe=lambda: {"status": STATUS_MISSING, "model": OLLAMA_MODEL},
-        )
+                )
         required_nodes = {item["node_type"] for item in report["shared"]["nodes"]}
         self.assertNotIn("MiniMaxH3TurboSampler", required_nodes)
         self.assertNotIn("RTXVideoSuperResolution", required_nodes)
@@ -217,25 +200,16 @@ class Phase7TestCase(unittest.TestCase):
             report = scan_requirements(
                 folder_paths_module=None,
                 binary_finder=lambda _name: None,
-                ollama_probe=lambda: {"status": STATUS_MISSING, "model": OLLAMA_MODEL},
             )
         self.assertEqual(report["methods"]["keyframe_i2v"]["required_nodes"][0]["status"], STATUS_UNKNOWN)
 
-    def test_ollama_probe_is_loopback_only_and_reports_model(self):
-        calls = []
-
-        def opener(request, timeout):
-            calls.append((request.full_url, timeout))
-            return _FakeResponse({"models": [{"name": OLLAMA_MODEL}]})
-
-        report = probe_ollama(opener=opener)
-        self.assertEqual(report["status"], STATUS_AVAILABLE)
-        self.assertEqual(report["model_status"], STATUS_AVAILABLE)
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0][0].endswith("/api/tags"))
-        blocked = probe_ollama("https://example.invalid", opener=opener)
-        self.assertEqual(blocked["status"], STATUS_UNKNOWN)
-        self.assertEqual(len(calls), 1)
+    def test_requirements_have_no_local_lm_optional_capability(self):
+        report = scan_requirements(
+            node_types={"UNETLoader"},
+            folder_paths_module=None,
+            binary_finder=lambda _name: None,
+        )
+        self.assertNotIn("ollama", report["optional"])
 
     def test_ref2va_mapping_numbers_all_entity_owners_in_selection_order(self):
         project, character_refs, location_refs = self._project()
@@ -315,18 +289,39 @@ class Phase7TestCase(unittest.TestCase):
         prompt = result["deterministic_prompt"]
         self.assertIn("Accepted image shows Vesper", prompt)
         self.assertNotIn("This must not become authoritative", prompt)
-        self.assertNotIn("<Picture", prompt)
+        self.assertIn("For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.", prompt)
         self.assertNotIn("<Subject", prompt)
         self.assertNotIn("<Audio", prompt)
+        self.assertIn("integrated_multimodal_description:", prompt)
+        self.assertIn("overall_soundscape:", prompt)
+        self.assertIn("non_diegetic_music:", prompt)
+        self.assertLess(prompt.index("<Picture 1> (from [Shot 1])"), prompt.index("integrated_multimodal_description:"))
+        opening = "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced."
+        self.assertTrue(prompt.startswith(opening + "\n\nintegrated_multimodal_description: [Shot 1]"))
+        self.assertIn("integrated_multimodal_description: [Shot 1]", prompt)
+        self.assertLess(prompt.index("integrated_multimodal_description:"), prompt.index("overall_soundscape:"))
+        self.assertLess(prompt.index("overall_soundscape:"), prompt.index("non_diegetic_music:"))
         self.assertNotIn(scene_id, prompt)
         self.assertNotIn(character_id, prompt)
         self.assertNotIn(location_id, prompt)
         self.assertNotIn(asset_id, prompt)
         self.assertNotIn("source_cue_numbers", prompt)
         self.assertNotIn("accepted.png", prompt)
-        self.assertIn("Opening state is defined exclusively by the accepted keyframe", prompt)
-        self.assertIn("Continuity context for identity and preservation", prompt)
-        self.assertIn("Forward-generation intent applies after the opening state", prompt)
+        self.assertIn(
+            "The accepted first frame establishes the opening: Accepted image shows Vesper in warm chapel light.",
+            prompt,
+        )
+        self.assertIn("Vesper remains consistent with the opening image", prompt)
+        self.assertIn("The Chapel environment remains consistent with the opening image", prompt)
+        for boilerplate in (
+            "Opening state is defined exclusively",
+            "The target duration is exactly",
+            "Actual accepted-keyframe description:",
+            "Continuity context for",
+            "Forward-generation intent",
+            "Treat the supplied lyric as",
+        ):
+            self.assertNotIn(boilerplate, prompt)
         self.assertEqual(result["reference_map"]["pictures"], [])
 
     def test_compiler_is_byte_deterministic_and_instrumental_does_not_invent_vocals(self):
@@ -369,6 +364,7 @@ class Phase7TestCase(unittest.TestCase):
         project = save_reference_selection(self.storage, project["project_id"], scene_id, {"selected_references": selected})
         result = compile_scene_prompt(project, scene_id)
         prompt = result["deterministic_prompt"]
+        self.assertTrue(prompt.startswith("subject_definitions:"))
         self.assertTrue(all(section + ":" in prompt for section in ("subject_definitions", "summary", "retention_analysis", "detailed_description", "overall_soundscape", "non_diegetic_music")))
         self.assertLess(prompt.index("subject_definitions:"), prompt.index("summary:"))
         self.assertLess(prompt.index("summary:"), prompt.index("retention_analysis:"))
@@ -376,8 +372,25 @@ class Phase7TestCase(unittest.TestCase):
         self.assertIn("<Subject 1>", prompt)
         self.assertIn("<Subject 2>", prompt)
         self.assertIn("<Audio 1>", prompt)
+        self.assertIn("<Audio 1>: fully_copy -", prompt)
+        self.assertEqual(prompt.count("fully_preserved"), 2)
         self.assertNotIn("<Location", prompt)
-        self.assertIn("The lyric remains verbatim.", prompt)
+        self.assertIn("Vesper (S1) sings: <d>[English] The lyric remains verbatim.</d>", prompt)
+        self.assertIn("<Subject 1> (appears in [Shot 1]): fully_preserved -", prompt)
+        self.assertIn("<Subject 2> (appears in [Shot 1]): fully_preserved -", prompt)
+        self.assertIn("<Audio 1>: fully_copy -", prompt)
+        section_order = [
+            prompt.index(f"{section}:")
+            for section in (
+                "subject_definitions",
+                "summary",
+                "retention_analysis",
+                "detailed_description",
+                "overall_soundscape",
+                "non_diegetic_music",
+            )
+        ]
+        self.assertEqual(section_order, sorted(section_order))
         self.assertNotIn(project["characters"][0]["character_id"], prompt)
         self.assertNotIn(project["locations"][0]["location_id"], prompt)
         self.assertNotIn(character_refs[0]["original_name"], prompt)
@@ -389,7 +402,7 @@ class Phase7TestCase(unittest.TestCase):
         project, _, _ = self._project()
         scene_id = project["scenes"][0]["scene_id"]
         performance_prompt = compile_scene_prompt(project, scene_id)["deterministic_prompt"]
-        self.assertIn("The lyric remains verbatim.", performance_prompt)
+        self.assertIn("Vesper (S1) sings: <d>[English] The lyric remains verbatim.</d>", performance_prompt)
         narrative_storyboard = {
             **project["storyboard"],
             "scenes": [{**project["storyboard"]["scenes"][0], "scene_type": "narrative"}],
@@ -411,76 +424,88 @@ class Phase7TestCase(unittest.TestCase):
         instrumental_prompt = compile_scene_prompt(instrumental, scene_id)["deterministic_prompt"]
         self.assertNotIn("Instrumental", instrumental_prompt)
         self.assertIn("do not invent vocal words", instrumental_prompt)
+        lyric_marker = {
+            **project,
+            "scenes": [{
+                **project["scenes"][0],
+                "source_kind": "lyric",
+                "lyric": "Instrumental",
+            }],
+        }
+        marker_prompt = compile_scene_prompt(lyric_marker, scene_id)["deterministic_prompt"]
+        self.assertNotIn("<d>[English] Instrumental</d>", marker_prompt)
+        self.assertIn("do not invent vocal words", marker_prompt)
 
-    def test_bounded_enhancement_keeps_guard_input_only_and_reassembles(self):
-        project, _, _ = self._project()
+    def test_custom_gpt_request_is_deterministic_and_method_specific(self):
+        project, character_refs, location_refs = self._project()
         scene_id = project["scenes"][0]["scene_id"]
-        result = compile_scene_prompt(project, scene_id)
-        guard = build_immutable_structural_facts(result)
-        self.assertIn('"exact_duration_ms":4000', guard)
-        self.assertNotIn(guard, result["deterministic_prompt"])
-        captured = {}
+        project = set_generation_method(self.storage, project["project_id"], scene_id, "reference2video")
+        selected = [
+            {"entity_type": "character", "entity_id": project["characters"][0]["character_id"], "reference_id": character_refs[0]["reference_id"]},
+            {"entity_type": "location", "entity_id": project["locations"][0]["location_id"], "reference_id": location_refs[0]["reference_id"]},
+        ]
+        project = save_reference_selection(self.storage, project["project_id"], scene_id, {"selected_references": selected})
+        first = build_prompt_relay_request(project, scene_id)
+        second = build_prompt_relay_request(project, scene_id)
+        self.assertEqual(first, second)
+        self.assertEqual(first["prompt_relay_request_version"], 1)
+        self.assertEqual(first["request_fingerprint"], compile_scene_prompt(project, scene_id)["source_fingerprint"])
+        self.assertEqual(first["generation_method"], "reference2video")
+        self.assertNotIn(project["project_id"], json.dumps(first))
+        self.assertNotIn(project["characters"][0]["character_id"], json.dumps(first))
+        self.assertNotIn("current_deterministic_prompt", first)
+        self.assertNotIn("creative_components", first)
+        self.assertNotIn("subject_definitions:", json.dumps(first))
+        self.assertNotIn("retention_analysis:", json.dumps(first))
+        self.assertNotIn("detailed_description:", json.dumps(first))
+        self.assertNotIn("overall_soundscape:", json.dumps(first))
+        self.assertNotIn("non_diegetic_music:", json.dumps(first))
+        self.assertNotIn("stored_name", json.dumps(first))
+        self.assertNotIn("original_name", json.dumps(first))
+        expected_mapping = [
+            {
+                "picture_number": picture["picture_number"],
+                "subject_tag": picture["subject_tag"],
+                "entity_name": picture["entity_name"],
+            }
+            for picture in build_ref2va_mapping(project, scene_id)["pictures"]
+        ]
+        self.assertEqual(first["reference_context"]["picture_mapping_summary"], expected_mapping)
+        self.assertEqual(first["subjects"][0]["subject_tag"], "<Subject 1>")
+        self.assertEqual(first["subjects"][1]["subject_tag"], "<Subject 2>")
+        self.assertTrue(first["reference_context"]["subject_ownership_is_machine_owned"])
+        self.assertTrue(first["constraints"]["may_use_supplied_subject_tags_for_reference2video"])
+        self.assertIn("350-500 English words", first["constraints"]["detail_guidance"])
 
-        def opener(request, _timeout):
-            captured["payload"] = json.loads(request.data.decode("utf-8"))
-            return _FakeResponse(
-                {
-                    "response": json.dumps(
-                        {"enhanced_description": "The performer turns toward the warm light."}
-                    )
-                }
-            )
-
-        enhanced = enhance_prompt_with_ollama(result, opener=opener)
-        self.assertFalse(enhanced["used_fallback"], enhanced)
-        self.assertEqual(enhanced["enhanced_description"], "The performer turns toward the warm light.")
-        self.assertIn(guard, captured["payload"]["prompt"])
-        self.assertEqual(captured["payload"]["format"], "json")
-        self.assertNotIn(guard, enhanced["prompt"])
-        self.assertIn("Duration: 4.000-second continuous shot.", enhanced["prompt"])
-        self.assertIn("The performer turns toward the warm light.", enhanced["prompt"])
-        self.assertNotIn("subject_definitions:", enhanced["prompt"])
-
-    def test_bounded_enhancement_rejects_tags_shots_dialogue_and_duration(self):
-        project, _, _ = self._project()
-        result = compile_scene_prompt(project, project["scenes"][0]["scene_id"])
-        for description in (
-            "<Picture 1>",
-            "<Subject 1>",
-            "<Audio 1>",
-            "<Location 1>",
-            "[Shot 2]",
-            "<d>spoken words</d>",
-            "Change the timing to 10 seconds.",
-        ):
-            with self.subTest(description=description):
-                with self.assertRaises(ProjectValidationError):
-                    validate_enhanced_prompt(result, {"enhanced_description": description})
-
-    def test_malformed_bounded_response_falls_back_without_repair(self):
-        project, _, _ = self._project()
-        result = compile_scene_prompt(project, project["scenes"][0]["scene_id"])
-
-        response = enhance_prompt_with_ollama(
-            result,
-            opener=lambda _request, _timeout: _FakeResponse({"response": "not JSON"}),
+        keyframe_request = build_prompt_relay_request(
+            project,
+            scene_id,
+            "keyframe_i2v",
         )
-        self.assertTrue(response["used_fallback"])
-        self.assertEqual(response["prompt"], result["deterministic_prompt"])
+        self.assertEqual(keyframe_request["generation_method"], "keyframe_i2v")
+        self.assertIn("actual_keyframe_description", keyframe_request["method_specific"])
+        self.assertNotIn("opening_reference", keyframe_request["method_specific"])
+        self.assertNotIn("<Picture 1>", json.dumps(keyframe_request))
+        self.assertNotIn("integrated_multimodal_description:", json.dumps(keyframe_request))
+        self.assertNotIn("<Subject", json.dumps(keyframe_request))
+        self.assertNotIn("<Audio", json.dumps(keyframe_request))
+        changed_project = {
+            **project,
+            "storyboard": {
+                **project["storyboard"],
+                "scenes": [{
+                    **project["storyboard"]["scenes"][0],
+                    "action": "Vesper turns toward the lens.",
+                }],
+            },
+        }
+        changed = build_prompt_relay_request(changed_project, scene_id)
+        self.assertNotEqual(first["request_fingerprint"], changed["request_fingerprint"])
+        self.assertNotEqual(first, changed)
+        renamed_project = {**project, "name": "Relay payload rename only"}
+        self.assertEqual(first, build_prompt_relay_request(renamed_project, scene_id))
 
-    def test_ollama_invalid_response_falls_back_without_repair(self):
-        project, _, _ = self._project()
-        scene_id = project["scenes"][0]["scene_id"]
-        result = compile_scene_prompt(project, scene_id)
-
-        def opener(_request, _timeout):
-            return _FakeResponse({"response": "corrupted output"})
-
-        enhanced = enhance_prompt_with_ollama(result, opener=opener)
-        self.assertTrue(enhanced["used_fallback"])
-        self.assertEqual(enhanced["prompt"], result["deterministic_prompt"])
-
-    def test_ref2va_enhancement_reassembles_machine_sections_and_rejects_unknown_tags(self):
+    def test_ref2va_relay_accepts_supplied_subject_tags_and_reassembles_shot_once(self):
         project, character_refs, location_refs = self._project()
         scene_id = project["scenes"][0]["scene_id"]
         project = set_generation_method(self.storage, project["project_id"], scene_id, "reference2video")
@@ -490,65 +515,137 @@ class Phase7TestCase(unittest.TestCase):
         ]
         project = save_reference_selection(self.storage, project["project_id"], scene_id, {"selected_references": selected})
         result = compile_scene_prompt(project, scene_id)
-        structural = result["deterministic_prompt"]
-        valid = enhance_prompt_with_ollama(
-            result,
-            opener=lambda _request, _timeout: _FakeResponse(
-                {
-                    "response": json.dumps(
-                        {
-                            "enhanced_description": (
-                                "The camera drifts through the warm chapel while the performer "
-                                "moves with measured intensity."
-                            )
-                        }
-                    )
-                }
-            ),
+        enhanced = (
+            "<Subject 1> holds a measured performance position within <Subject 2>, "
+            "with restrained movement, warm side light, and a slow lateral camera drift."
         )
-        self.assertFalse(valid["used_fallback"], valid)
-        self.assertNotIn(build_immutable_structural_facts(result), valid["prompt"])
-        self.assertEqual(valid["prompt"].count("subject_definitions:"), 1)
-        self.assertEqual(valid["prompt"].count("summary:"), 1)
-        self.assertLess(valid["prompt"].index("subject_definitions:"), valid["prompt"].index("summary:"))
-        self.assertLess(valid["prompt"].index("summary:"), valid["prompt"].index("retention_analysis:"))
-        self.assertIn("<Subject 1> is Vesper", valid["prompt"])
-        self.assertIn("<Subject 2> is Chapel", valid["prompt"])
-        self.assertIn("<Audio 1> — fully_copy", valid["prompt"])
-        self.assertIn("lasting exactly 4.000 seconds", valid["prompt"])
-        self.assertEqual(structural.split("detailed_description:", 1)[0], valid["prompt"].split("detailed_description:", 1)[0])
-
-        for description in ("<Picture 99>", "<Subject 99>", "<Audio 2>", "<Location 1>"):
-            invalid = enhance_prompt_with_ollama(
-                result,
-                opener=lambda _request, _timeout, description=description: _FakeResponse(
-                    {"response": json.dumps({"enhanced_description": description})}
-                ),
-            )
+        response = validate_prompt_relay_response(result, {
+            "prompt_relay_response_version": 1,
+            "scene_id": scene_id,
+            "request_fingerprint": result["source_fingerprint"],
+            "enhanced_description": enhanced,
+        })
+        prompt = response["enhanced_prompt"]
+        self.assertIn(f"\n\n[Shot 1] {enhanced}", prompt)
+        detailed = prompt.split("detailed_description:\n", 1)[1].split("\n\noverall_soundscape:", 1)[0]
+        self.assertEqual(detailed.count("[Shot 1]"), 1)
+        self.assertNotIn("[Shot 2]", prompt)
+        self.assertNotIn("Opening reference state:", prompt)
+        self.assertNotIn("Forward-generation intent follows", prompt)
+        self.assertEqual(
+            [prompt.index(f"{section}:") for section in (
+                "subject_definitions",
+                "summary",
+                "retention_analysis",
+                "detailed_description",
+                "overall_soundscape",
+                "non_diegetic_music",
+            )],
+            sorted(prompt.index(f"{section}:") for section in (
+                "subject_definitions",
+                "summary",
+                "retention_analysis",
+                "detailed_description",
+                "overall_soundscape",
+                "non_diegetic_music",
+            )),
+        )
+        for description in (
+            "<Subject 3> is not supplied.",
+            "<Picture 1> appears here.",
+            "<Audio 1> is heard.",
+            "<Video 1> appears here.",
+            "<Location 1> appears here.",
+            "[Shot 1] duplicate wrapper.",
+            "retention_analysis: fully_preserved",
+        ):
             with self.subTest(description=description):
-                self.assertTrue(invalid["used_fallback"])
+                with self.assertRaises(ProjectValidationError):
+                    validate_relay_description(result, description)
 
-    def test_custom_model_is_reported_by_fallback(self):
+    def test_i2v_relay_accepts_plain_prose_and_rejects_all_machine_wrapper_content(self):
         project, _, _ = self._project()
-        result = compile_scene_prompt(project, project["scenes"][0]["scene_id"])
-        response = enhance_prompt_with_ollama(
-            result,
-            model="custom-local-model",
-            opener=lambda _request, _timeout: _FakeResponse({"response": "malformed"}),
-        )
-        self.assertTrue(response["used_fallback"])
-        self.assertEqual(response["model"], "custom-local-model")
+        scene_id = project["scenes"][0]["scene_id"]
+        result = compile_scene_prompt(project, scene_id)
+        valid = "A restrained camera drift follows the accepted opening into the warm practical light."
+        self.assertIn(valid, validate_relay_description(result, valid))
+        for description in (
+            "<Subject 1> moves.",
+            "<Picture 1> moves.",
+            "<Audio 1> moves.",
+            "[Shot 1] moves.",
+            "integrated_multimodal_description: [Shot 1] moves.",
+        ):
+            with self.subTest(description=description):
+                with self.assertRaises(ProjectValidationError):
+                    validate_relay_description(result, description)
 
-    def test_ollama_timeout_falls_back_to_deterministic_prompt(self):
+    def test_custom_gpt_response_is_strict_and_machine_reassembled(self):
+        project, character_refs, location_refs = self._project()
+        scene_id = project["scenes"][0]["scene_id"]
+        project = set_generation_method(self.storage, project["project_id"], scene_id, "reference2video")
+        selected = [
+            {"entity_type": "character", "entity_id": project["characters"][0]["character_id"], "reference_id": character_refs[0]["reference_id"]},
+            {"entity_type": "location", "entity_id": project["locations"][0]["location_id"], "reference_id": location_refs[0]["reference_id"]},
+        ]
+        project = save_reference_selection(self.storage, project["project_id"], scene_id, {"selected_references": selected})
+        result = compile_scene_prompt(project, scene_id)
+        before = (self.storage.project_directory(project["project_id"]) / "project.json").read_bytes()
+        response = {
+            "prompt_relay_response_version": 1,
+            "scene_id": scene_id,
+            "request_fingerprint": result["source_fingerprint"],
+            "enhanced_description": "The camera drifts through the warm chapel while the performer moves with measured intensity.",
+        }
+        validated = validate_prompt_relay_response(result, response)
+        self.assertEqual(validated["status"], "validated")
+        self.assertIn("subject_definitions:", validated["enhanced_prompt"])
+        self.assertIn("summary:", validated["enhanced_prompt"])
+        self.assertIn("retention_analysis:", validated["enhanced_prompt"])
+        self.assertIn("<Subject 1> is Vesper", validated["enhanced_prompt"])
+        self.assertIn("<Subject 2> is Chapel", validated["enhanced_prompt"])
+        self.assertIn("<Audio 1>: fully_copy -", validated["enhanced_prompt"])
+        self.assertIn("continuous 4.000-second performance shot", validated["enhanced_prompt"])
+        self.assertIn(response["enhanced_description"], validated["enhanced_prompt"])
+        after = (self.storage.project_directory(project["project_id"]) / "project.json").read_bytes()
+        self.assertEqual(before, after)
+
+    def test_custom_gpt_response_rejects_malformed_stale_and_structural_content(self):
         project, _, _ = self._project()
-        result = compile_scene_prompt(project, project["scenes"][0]["scene_id"])
+        scene_id = project["scenes"][0]["scene_id"]
+        result = compile_scene_prompt(project, scene_id)
+        base = {
+            "prompt_relay_response_version": 1,
+            "scene_id": scene_id,
+            "request_fingerprint": result["source_fingerprint"],
+            "enhanced_description": "A measured camera drift follows the performer.",
+        }
+        for invalid in (
+            "not JSON",
+            {**base, "prompt_relay_response_version": 2},
+            {**base, "scene_id": str(uuid.uuid4())},
+            {**base, "request_fingerprint": "0" * 64},
+            {key: value for key, value in base.items() if key != "enhanced_description"},
+            {**base, "enhanced_description": ""},
+            {**base, "extra": True},
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ProjectValidationError):
+                    validate_prompt_relay_response(result, invalid)
 
-        def timeout_opener(_request, timeout):
-            raise TimeoutError()
-
-        response = enhance_prompt_with_ollama(result, opener=timeout_opener)
-        self.assertTrue(response["used_fallback"])
-        self.assertEqual(response["prompt"], result["deterministic_prompt"])
+        for description in (
+            "<Picture 1>",
+            "<Subject 1>",
+            "<Audio 1>",
+            "<Location 1>",
+            "[Shot 2] cut to a new angle.",
+            "<d>spoken words</d>",
+            "<Subject 1> fully_preserved; keep this relationship.",
+            "Change the timing to 10 seconds.",
+        ):
+            with self.subTest(description=description):
+                with self.assertRaises(ProjectValidationError):
+                    validate_relay_description(result, description)
 
     def test_preview_is_read_only_and_route_contract_is_present(self):
         project, _, _ = self._project()
@@ -563,14 +660,15 @@ class Phase7TestCase(unittest.TestCase):
         self.assertIn('await asyncio.to_thread(build_requirements_report)', routes)
         self.assertIn('/music-video-builder/projects/{project_id}/scenes/{scene_id}/prompt/preview', routes)
 
-    def test_phase7_does_not_change_schema_or_add_phase8_surface(self):
+    def test_phase7_keeps_schema_v7_and_adds_no_phase8_surface(self):
         self.assertEqual(production_manifest_registry(), WORKFLOW_MANIFESTS)
         project = self.storage.create_project("Schema check")
-        self.assertEqual(project["schema_version"], 5)
+        self.assertEqual(project["schema_version"], 7)
         extension = Path(__file__).parents[1].joinpath("web", "extension.js").read_text(encoding="utf-8")
         self.assertNotIn("localStorage", extension)
         self.assertNotIn("sessionStorage", extension)
-        self.assertNotIn("/prompt", extension)
+        self.assertIn("/prompt", extension)
+        self.assertIn('data-mvb-view="prompts"', extension)
         self.assertNotIn("/render", extension)
 
 

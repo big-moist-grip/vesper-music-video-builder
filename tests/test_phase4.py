@@ -14,7 +14,7 @@ from backend.entities import (
     update_character,
     update_location,
 )
-from backend.projects import ProjectStorage, ProjectValidationError, validate_project_document
+from backend.projects import ProjectStorage, ProjectValidationError, default_prompts_for_scenes, validate_project_document
 from backend.scenes import build_project_scenes, build_scenes
 from backend.storyboard import (
     STORYBOARD_MODE_GUIDANCE,
@@ -73,6 +73,7 @@ class Phase4TestCase(unittest.TestCase):
                 },
                 "scenes": scenes,
                 "visuals": default_visuals_for_scenes(scenes),
+                "prompts": default_prompts_for_scenes(scenes),
             },
             allow_visuals_change=True,
         )
@@ -154,7 +155,7 @@ class Phase4TestCase(unittest.TestCase):
 
     def test_new_project_and_legacy_documents_normalize_to_v4(self):
         project = self.storage.create_project("Schema v4")
-        self.assertEqual(project["schema_version"], 5)
+        self.assertEqual(project["schema_version"], 7)
         self.assertEqual(project["story_direction"], empty_story_direction())
         self.assertEqual(project["storyboard"], empty_storyboard())
 
@@ -175,10 +176,11 @@ class Phase4TestCase(unittest.TestCase):
         v3.pop("story_direction")
         v3.pop("storyboard")
         v3.pop("visuals")
+        v3.pop("prompts")
 
         for legacy in (v1, v2, v3):
             normalized = validate_project_document(legacy)
-            self.assertEqual(normalized["schema_version"], 5)
+            self.assertEqual(normalized["schema_version"], 7)
             self.assertEqual(normalized["story_direction"], empty_story_direction())
             self.assertEqual(normalized["storyboard"], empty_storyboard())
 
@@ -205,6 +207,7 @@ class Phase4TestCase(unittest.TestCase):
             },
         }
         provisional.pop("visuals")
+        provisional.pop("prompts")
         provisional_bytes = (json.dumps(provisional, indent=2) + "\n").encode("utf-8")
         project_file.write_bytes(provisional_bytes)
 
@@ -426,6 +429,7 @@ class Phase4TestCase(unittest.TestCase):
                 **project,
                 "scenes": new_scenes,
                 "visuals": default_visuals_for_scenes(new_scenes),
+                "prompts": default_prompts_for_scenes(new_scenes),
             },
             allow_visuals_change=True,
         )
@@ -703,6 +707,7 @@ class Phase4TestCase(unittest.TestCase):
                 **replaced,
                 "scenes": replacement_scenes,
                 "visuals": default_visuals_for_scenes(replacement_scenes),
+                "prompts": default_prompts_for_scenes(replacement_scenes),
             },
             allow_visuals_change=True,
         )
@@ -748,8 +753,8 @@ class Phase4TestCase(unittest.TestCase):
         self.assertIn("generation-method", routes)
         self.assertNotIn("localStorage", extension)
         self.assertNotIn("sessionStorage", extension)
-        self.assertNotIn("Prompts", extension)
-        self.assertNotIn("Render", extension)
+        self.assertIn('data-mvb-view="prompts"', extension)
+        self.assertNotIn('data-mvb-view="render"', extension)
 
     def test_frontend_relay_freshness_and_status_guards(self):
         extension = Path("web/extension.js").read_text(encoding="utf-8")
@@ -761,7 +766,9 @@ class Phase4TestCase(unittest.TestCase):
         self.assertIn("invalidateStoryboardRequestForDirectionEdit();", visual_notes_handler)
         self.assertIn("builderState.storyboardRequest = null;", extension)
         self.assertIn("builderState.storyboardPreview = null;", extension)
-        self.assertIn("copyButton.disabled = !builderState.storyboardRequest || builderState.storyboardRequestStale || blocked;", extension)
+        self.assertIn("copyButton.disabled = !canCopyStoryboardRequest(", extension)
+        self.assertIn("builderState.storyboardRequestStale = false;", extension)
+        self.assertIn("storyboardRequestJson(builderState.storyboardRequest)", extension)
 
         open_project = extension[extension.index("async function openProject(root, projectId)"):]
         self.assertIn("void loadStoryboardRequest(root, true);", open_project)

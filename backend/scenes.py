@@ -563,12 +563,14 @@ def build_project_scenes(storage, project_id: object, parse_srt: Callable[[str],
 
     scenes = build_scenes(cues, master_audio["duration_ms"])
     from .visuals import default_visuals_for_scenes
+    from .projects import default_prompts_for_scenes
 
     candidate = {
         **project,
         "scenes": scenes,
         "storyboard": {"request_fingerprint": None, "scenes": []},
         "visuals": default_visuals_for_scenes(scenes),
+        "prompts": default_prompts_for_scenes(scenes),
     }
     return storage.save_project(
         project_id,

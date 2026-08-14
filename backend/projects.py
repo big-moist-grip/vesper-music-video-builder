@@ -18,11 +18,13 @@ from .scenes import SceneValidationError, validate_scene_list
 
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 LEGACY_SCHEMA_VERSION = 1
 LEGACY_SCHEMA_VERSION_2 = 2
 LEGACY_SCHEMA_VERSION_3 = 3
 LEGACY_SCHEMA_VERSION_4 = 4
+LEGACY_SCHEMA_VERSION_5 = 5
+LEGACY_SCHEMA_VERSION_6 = 6
 PROJECT_FILENAME = "project.json"
 DEFAULT_PROJECTS_ROOT = Path(
     r"D:\User Folders\Documents\Projects\vesper-music-video-builder\projects"
@@ -57,7 +59,8 @@ V3_PROJECT_FIELDS = (
     "locations",
 )
 V4_PROJECT_FIELDS = V3_PROJECT_FIELDS + ("story_direction", "storyboard")
-PROJECT_FIELDS = V4_PROJECT_FIELDS + ("visuals",)
+V5_PROJECT_FIELDS = V4_PROJECT_FIELDS + ("visuals",)
+PROJECT_FIELDS = V5_PROJECT_FIELDS + ("prompts",)
 SOURCE_FIELDS = ("master_audio", "lyrics_srt")
 MASTER_AUDIO_FIELDS = ("stored_name", "original_name", "duration_ms")
 LYRICS_SRT_FIELDS = ("stored_name", "original_name", "cue_count")
@@ -68,6 +71,13 @@ CHARACTER_ROLES = frozenset({"performer", "band_member", "extra"})
 _MASTER_AUDIO_NAME_PATTERN = re.compile(r"^master_audio\.[a-z0-9]+$")
 _REFERENCE_EXTENSIONS = frozenset({".png", ".jpg", ".webp"})
 _INVALID_PROJECT_SIGNATURE_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_PROMPT_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+PROMPT_METHODS = ("keyframe_i2v", "reference2video")
+LEGACY_PROMPT_FIELDS = ("final_prompt", "source_fingerprint")
+PROMPT_FIELDS = LEGACY_PROMPT_FIELDS + ("relay_fingerprint",)
+PROMPT_SCENE_FIELDS = ("scene_id", "keyframe_i2v", "reference2video")
+PROMPTS_FIELDS = ("scenes",)
+PROMPT_MAX_LENGTH = 50_000
 
 
 def _empty_story_direction() -> dict[str, str]:
@@ -82,6 +92,31 @@ def _empty_visuals(scenes: list[dict[str, object]]) -> dict[str, object]:
     from .visuals import default_visuals_for_scenes
 
     return default_visuals_for_scenes(scenes)
+
+
+def _empty_prompts(scenes: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "scenes": [
+            {
+                "scene_id": scene["scene_id"],
+                "keyframe_i2v": {
+                    "final_prompt": "",
+                    "source_fingerprint": None,
+                    "relay_fingerprint": "",
+                },
+                "reference2video": {
+                    "final_prompt": "",
+                    "source_fingerprint": None,
+                    "relay_fingerprint": "",
+                },
+            }
+            for scene in scenes
+        ]
+    }
+
+
+def default_prompts_for_scenes(scenes: list[dict[str, object]]) -> dict[str, object]:
+    return _empty_prompts(scenes)
 
 
 class ProjectError(Exception):
@@ -263,6 +298,7 @@ def _validate_legacy_project(document: dict[str, object]) -> dict[str, object]:
         "story_direction": _empty_story_direction(),
         "storyboard": {"request_fingerprint": None, "scenes": []},
         "visuals": _empty_visuals([]),
+        "prompts": _empty_prompts([]),
     }
 
 
@@ -293,6 +329,7 @@ def _validate_v2_project(document: dict[str, object]) -> dict[str, object]:
         "story_direction": _empty_story_direction(),
         "storyboard": {"request_fingerprint": None, "scenes": []},
         "visuals": _empty_visuals(scenes),
+        "prompts": _empty_prompts(scenes),
     }
 
 
@@ -327,6 +364,7 @@ def _validate_v3_project(document: dict[str, object]) -> dict[str, object]:
         "story_direction": _empty_story_direction(),
         "storyboard": {"request_fingerprint": None, "scenes": []},
         "visuals": _empty_visuals(scenes),
+        "prompts": _empty_prompts(scenes),
     }
 
 
@@ -370,6 +408,7 @@ def _validate_v4_project(document: dict[str, object]) -> dict[str, object]:
         "story_direction": story_direction,
         "storyboard": storyboard,
         "visuals": _empty_visuals(scenes),
+        "prompts": _empty_prompts(scenes),
     }
 
 
@@ -427,6 +466,76 @@ def _validate_source(source: object) -> dict[str, object]:
         "master_audio": _validate_master_audio(source.get("master_audio")),
         "lyrics_srt": _validate_lyrics_srt(source.get("lyrics_srt")),
     }
+
+
+def _validate_prompt_record(
+    value: object,
+    label: str,
+    *,
+    legacy_v6: bool = False,
+) -> dict[str, object]:
+    expected_fields = LEGACY_PROMPT_FIELDS if legacy_v6 else PROMPT_FIELDS
+    if not isinstance(value, dict) or set(value) != set(expected_fields):
+        raise ProjectValidationError(f"{label} has unsupported or missing fields.")
+    final_prompt = value.get("final_prompt")
+    if not isinstance(final_prompt, str) or len(final_prompt) > PROMPT_MAX_LENGTH:
+        raise ProjectValidationError(f"{label} final_prompt is invalid.")
+    fingerprint = value.get("source_fingerprint")
+    if fingerprint is not None and (
+        not isinstance(fingerprint, str) or not _PROMPT_FINGERPRINT_PATTERN.fullmatch(fingerprint)
+    ):
+        raise ProjectValidationError(f"{label} source_fingerprint is invalid.")
+    relay_fingerprint = "" if legacy_v6 else value.get("relay_fingerprint")
+    if not isinstance(relay_fingerprint, str) or (
+        relay_fingerprint and not _PROMPT_FINGERPRINT_PATTERN.fullmatch(relay_fingerprint)
+    ):
+        raise ProjectValidationError(f"{label} relay_fingerprint is invalid.")
+    return {
+        "final_prompt": final_prompt,
+        "source_fingerprint": fingerprint,
+        "relay_fingerprint": relay_fingerprint,
+    }
+
+
+def _validate_prompts(
+    value: object,
+    scenes: list[dict[str, object]],
+    *,
+    legacy_v6: bool = False,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != set(PROMPTS_FIELDS):
+        raise ProjectValidationError("Project prompts have unsupported or missing fields.")
+    prompt_scenes = value.get("scenes")
+    if not isinstance(prompt_scenes, list) or len(prompt_scenes) != len(scenes):
+        raise ProjectValidationError("Project prompts must contain exactly one entry for every current scene.")
+
+    normalized_scenes: list[dict[str, object]] = []
+    seen_scene_ids: set[str] = set()
+    for position, prompt_scene in enumerate(prompt_scenes):
+        if not isinstance(prompt_scene, dict) or set(prompt_scene) != set(PROMPT_SCENE_FIELDS):
+            raise ProjectValidationError("Prompt scene has unsupported or missing fields.")
+        scene_id = validate_entity_id(prompt_scene.get("scene_id"), "Prompt scene ID")
+        if scene_id in seen_scene_ids:
+            raise ProjectValidationError("Prompt scene IDs must be unique.")
+        if position >= len(scenes) or scene_id != scenes[position]["scene_id"]:
+            raise ProjectValidationError("Prompt scene order must match the current scene order.")
+        seen_scene_ids.add(scene_id)
+        normalized_scenes.append(
+            {
+                "scene_id": scene_id,
+                "keyframe_i2v": _validate_prompt_record(
+                    prompt_scene.get("keyframe_i2v"),
+                    "Keyframe / Image-to-Video prompt",
+                    legacy_v6=legacy_v6,
+                ),
+                "reference2video": _validate_prompt_record(
+                    prompt_scene.get("reference2video"),
+                    "Reference-to-Video prompt",
+                    legacy_v6=legacy_v6,
+                ),
+            }
+        )
+    return {"scenes": normalized_scenes}
 
 
 def _validate_reference_metadata(metadata: object) -> dict[str, object]:
@@ -596,8 +705,11 @@ def validate_project_document(
         normalized = _validate_v3_project(document)
     elif schema_version == LEGACY_SCHEMA_VERSION_4:
         normalized = _validate_v4_project(document)
-    elif schema_version == SCHEMA_VERSION:
-        base = _validate_base_project(document, PROJECT_FIELDS)
+    elif schema_version in {LEGACY_SCHEMA_VERSION_5, LEGACY_SCHEMA_VERSION_6, SCHEMA_VERSION}:
+        base = _validate_base_project(
+            document,
+            V5_PROJECT_FIELDS if schema_version == LEGACY_SCHEMA_VERSION_5 else PROJECT_FIELDS,
+        )
         source = _validate_source(document.get("source"))
         scenes = document.get("scenes")
         if not isinstance(scenes, list):
@@ -638,6 +750,15 @@ def validate_project_document(
             allow_over_capacity=allow_visual_over_capacity,
             allow_over_capacity_scene_ids=allow_visual_over_capacity_scene_ids,
         )
+        prompts = (
+            _empty_prompts(scenes)
+            if schema_version == LEGACY_SCHEMA_VERSION_5
+            else _validate_prompts(
+                document.get("prompts"),
+                scenes,
+                legacy_v6=schema_version == LEGACY_SCHEMA_VERSION_6,
+            )
+        )
         normalized = {
             "schema_version": SCHEMA_VERSION,
             **base,
@@ -648,6 +769,7 @@ def validate_project_document(
             "story_direction": story_direction,
             "storyboard": storyboard,
             "visuals": visuals,
+            "prompts": prompts,
         }
     else:
         raise ProjectValidationError("Unsupported project schema version.")
@@ -725,6 +847,7 @@ class ProjectStorage:
             "story_direction": _empty_story_direction(),
             "storyboard": {"request_fingerprint": None, "scenes": []},
             "visuals": _empty_visuals([]),
+            "prompts": _empty_prompts([]),
         }
         project_directory = self.projects_root / project_id
         project_file = project_directory / PROJECT_FILENAME
@@ -825,6 +948,7 @@ class ProjectStorage:
         *,
         allow_storyboard_change: bool = False,
         allow_visuals_change: bool = False,
+        allow_prompts_change: bool = False,
     ) -> dict[str, object]:
         canonical_id = validate_project_id(project_id)
         project_directory = self.project_directory(canonical_id)
@@ -834,6 +958,8 @@ class ProjectStorage:
             LEGACY_SCHEMA_VERSION_2,
             LEGACY_SCHEMA_VERSION_3,
             LEGACY_SCHEMA_VERSION_4,
+            LEGACY_SCHEMA_VERSION_5,
+            LEGACY_SCHEMA_VERSION_6,
         }:
             incoming_schema_version = document["schema_version"]
             if incoming_schema_version == LEGACY_SCHEMA_VERSION_4:
@@ -852,6 +978,7 @@ class ProjectStorage:
                 or current["locations"]
                 or current["storyboard"]["scenes"]
                 or current["visuals"]["scenes"]
+                or current["prompts"]["scenes"]
             )
             if current_has_state:
                 raise ProjectValidationError("Legacy project data cannot overwrite current project state.")
@@ -865,6 +992,15 @@ class ProjectStorage:
             candidate["storyboard"] = current["storyboard"]
         if not allow_visuals_change:
             candidate["visuals"] = current["visuals"]
+        if not allow_prompts_change:
+            current_scene_ids = [scene["scene_id"] for scene in current["scenes"]]
+            candidate_scene_ids = [scene["scene_id"] for scene in candidate["scenes"]]
+            if current_scene_ids == candidate_scene_ids:
+                candidate["prompts"] = current["prompts"]
+            else:
+                # Scene replacement invalidates all prompt fingerprints/content.
+                # The caller must use the dedicated prompt route to persist prompt text.
+                candidate["prompts"] = _empty_prompts(candidate["scenes"])
         candidate["created_at"] = current["created_at"]
 
         current_updated_at = parse_timestamp(current["updated_at"])

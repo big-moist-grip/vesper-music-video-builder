@@ -104,7 +104,7 @@ class Phase3TestCase(unittest.TestCase):
 
     def test_new_projects_use_strict_schema_v4(self):
         project = self.storage.create_project("Phase 3 Project")
-        self.assertEqual(project["schema_version"], 5)
+        self.assertEqual(project["schema_version"], 7)
         self.assertEqual(project["characters"], [])
         self.assertEqual(project["locations"], [])
         self.assertEqual(validate_project_document(project), project)
@@ -121,7 +121,7 @@ class Phase3TestCase(unittest.TestCase):
         }
         project_file.write_text(json.dumps(v1), encoding="utf-8")
         loaded_v1 = self.storage.load_project(project["project_id"])
-        self.assertEqual(loaded_v1["schema_version"], 5)
+        self.assertEqual(loaded_v1["schema_version"], 7)
         self.assertEqual(loaded_v1["characters"], [])
         self.assertEqual(loaded_v1["locations"], [])
         self.assertEqual(json.loads(project_file.read_text(encoding="utf-8")), v1)
@@ -129,7 +129,7 @@ class Phase3TestCase(unittest.TestCase):
         v2 = self._v2_document(project)
         project_file.write_text(json.dumps(v2), encoding="utf-8")
         loaded_v2 = self.storage.load_project(project["project_id"])
-        self.assertEqual(loaded_v2["schema_version"], 5)
+        self.assertEqual(loaded_v2["schema_version"], 7)
         self.assertEqual(loaded_v2["source"], v2["source"])
         self.assertEqual(loaded_v2["scenes"], v2["scenes"])
         self.assertEqual(loaded_v2["characters"], [])
@@ -148,7 +148,7 @@ class Phase3TestCase(unittest.TestCase):
         }
         project_file.write_text(json.dumps(v1), encoding="utf-8")
         saved = self.storage.save_project(project["project_id"], {**v1, "name": "Upgraded"})
-        self.assertEqual(saved["schema_version"], 5)
+        self.assertEqual(saved["schema_version"], 7)
         self.assertEqual(saved["name"], "Upgraded")
 
         character_project = create_character(self.storage, project["project_id"], self._character_payload())
@@ -158,7 +158,7 @@ class Phase3TestCase(unittest.TestCase):
         with self.assertRaises(ProjectValidationError):
             self.storage.save_project(character_project["project_id"], self._v2_document(character_project))
         self.assertEqual(self.storage.load_project(character_project["project_id"])["characters"], character_project["characters"])
-        self.assertEqual(json.loads(current_file.read_text(encoding="utf-8"))["schema_version"], 5)
+        self.assertEqual(json.loads(current_file.read_text(encoding="utf-8"))["schema_version"], 7)
 
     def test_schema_v3_rejects_invalid_entities_and_references(self):
         project = self.storage.create_project("Validation")

@@ -10,7 +10,13 @@ from unittest.mock import patch
 from PIL import Image
 
 from backend.entities import delete_character, delete_location, remove_reference
-from backend.projects import ProjectPersistenceError, ProjectStorage, ProjectValidationError, validate_project_document
+from backend.projects import (
+    ProjectPersistenceError,
+    ProjectStorage,
+    ProjectValidationError,
+    default_prompts_for_scenes,
+    validate_project_document,
+)
 from backend.scenes import build_scenes
 from backend.storyboard import (
     build_storyboard_request,
@@ -92,6 +98,7 @@ class Phase5TestCase(unittest.TestCase):
                 },
                 "scenes": scenes,
                 "visuals": default_visuals_for_scenes(scenes),
+                "prompts": default_prompts_for_scenes(scenes),
             },
             allow_visuals_change=True,
         )
@@ -166,9 +173,9 @@ class Phase5TestCase(unittest.TestCase):
             allow_storyboard_change=True,
         )
 
-    def test_new_project_is_schema_v5_with_exact_empty_visuals(self):
-        project = self.storage.create_project("Schema v5")
-        self.assertEqual(project["schema_version"], 5)
+    def test_new_project_is_schema_v7_with_exact_empty_visuals_and_prompts(self):
+        project = self.storage.create_project("Schema v6")
+        self.assertEqual(project["schema_version"], 7)
         self.assertEqual(set(project["visuals"]), {"scenes"})
         self.assertEqual(project["visuals"]["scenes"], [])
         self.assertEqual(validate_project_document(project), project)
@@ -204,7 +211,7 @@ class Phase5TestCase(unittest.TestCase):
         for legacy in (v1, v2, v3, v4):
             project_file.write_text(json.dumps(legacy), encoding="utf-8")
             loaded = self.storage.load_project(project["project_id"])
-            self.assertEqual(loaded["schema_version"], 5)
+            self.assertEqual(loaded["schema_version"], 7)
             self.assertEqual(loaded["story_direction"]["storyboard_mode"], "loose")
             self.assertEqual(loaded["visuals"]["scenes"], [])
             self.assertEqual(json.loads(project_file.read_text(encoding="utf-8")), legacy)
@@ -229,13 +236,14 @@ class Phase5TestCase(unittest.TestCase):
             "storyboard": {"request_fingerprint": None, "scenes": []},
         }
         provisional.pop("visuals")
+        provisional.pop("prompts")
         project_file = self.projects_root / project["project_id"] / "project.json"
         project_file.write_text(json.dumps(provisional), encoding="utf-8")
         saved = self.storage.save_project(project["project_id"], {**provisional, "name": "Upgraded"})
-        self.assertEqual(saved["schema_version"], 5)
+        self.assertEqual(saved["schema_version"], 7)
         self.assertEqual(set(saved["story_direction"]), {"storyboard_mode", "story_brief", "visual_notes"})
         self.assertEqual(set(saved["visuals"]), {"scenes"})
-        self.assertEqual(json.loads(project_file.read_text(encoding="utf-8"))["schema_version"], 5)
+        self.assertEqual(json.loads(project_file.read_text(encoding="utf-8"))["schema_version"], 7)
 
     def _non_default_direction_project(self):
         project = self.storage.create_project("Story Direction Guard")
@@ -319,7 +327,7 @@ class Phase5TestCase(unittest.TestCase):
         project = self._project_with_scene()
         valid = project["visuals"]
         invalid_documents = (
-            {**project, "schema_version": 6},
+            {**project, "schema_version": 8},
             {**project, "visuals": {"scenes": [{**valid["scenes"][0], "generation_method": "t2v"}]}},
             {**project, "visuals": {"scenes": [{**valid["scenes"][0], "extra": True}]}},
             {**project, "visuals": {"scenes": []}},
@@ -637,6 +645,7 @@ class Phase5TestCase(unittest.TestCase):
                 },
                 "scenes": two_scenes,
                 "visuals": visuals,
+                "prompts": default_prompts_for_scenes(two_scenes),
             },
             allow_visuals_change=True,
         )
@@ -712,8 +721,8 @@ class Phase5TestCase(unittest.TestCase):
         self.assertIn("renderProjectState(root, { visualViewport })", extension)
         self.assertNotIn("localStorage", extension)
         self.assertNotIn("sessionStorage", extension)
-        self.assertNotIn("Prompts", extension)
-        self.assertNotIn("Render", extension)
+        self.assertIn('data-mvb-view="prompts"', extension)
+        self.assertNotIn('data-mvb-view="render"', extension)
         self.assertNotIn("OpenAI", extension)
 
     def test_frontend_preserves_visual_drafts_and_scene_expansion_state(self):

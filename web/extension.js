@@ -1,17 +1,30 @@
 import { api } from "../../scripts/api.js";
 import { app } from "../../scripts/app.js";
+import {
+    canCopyStoryboardRequest,
+    canApplyPromptRelayResponse,
+    canCopyPromptRelayRequest,
+    canSavePromptDraft,
+    promptDraftHasCurrentRelay,
+    promptDraftReadyForRender,
+    promptDraftStatus,
+    promptDraftIsDirty,
+    promptRelayRequestJson,
+    storyboardRequestJson,
+} from "./prompt_state.js";
+import { gptLaunchPath, isSuccessfulGptLaunch } from "./gpt_launcher.js";
 
 const NODE_CLASS = "MusicVideoBuilder";
 const STYLESHEET_ID = "music-video-builder-styles";
 const PROJECTS_PATH = "/music-video-builder/projects";
 const AUTOSAVE_DELAY_MS = 700;
 const MAX_REF2VA_STILL_REFERENCES = 9;
+const GPT_LAUNCH_FAILURE_MESSAGE = "Could not open the GPT. Open it manually or retry.";
 const STORYBOARD_MODE_HELP = {
     loose: "Interpret the song freely; lyrics guide emotion and structure rather than dictating each shot.",
     strict: "Keep the visuals closely aligned to the lyrical content and sequence.",
     band_performance: "Build a performance-only video with no narrative storyline.",
 };
-
 const NODE_COLORS = {
     title: "#73572d",
     body: "#29231a",
@@ -88,9 +101,10 @@ function hasProjectDocument(payload) {
     const storyDirection = payload?.story_direction;
     const storyboard = payload?.storyboard;
     const visuals = payload?.visuals;
+    const prompts = payload?.prompts;
     return payload !== null
         && typeof payload === "object"
-        && payload.schema_version === 5
+        && payload.schema_version === 7
         && typeof payload.project_id === "string"
         && typeof payload.name === "string"
         && typeof payload.created_at === "string"
@@ -123,7 +137,24 @@ function hasProjectDocument(payload) {
         && visuals.scenes.every((visualScene, index) => visualScene !== null
             && typeof visualScene === "object"
             && visualScene.scene_id === payload.scenes[index]?.scene_id
-            && (visualScene.generation_method === "keyframe_i2v" || visualScene.generation_method === "reference2video"));
+            && (visualScene.generation_method === "keyframe_i2v" || visualScene.generation_method === "reference2video"))
+        && prompts !== null
+        && typeof prompts === "object"
+        && Object.keys(prompts).length === 1
+        && Array.isArray(prompts.scenes)
+        && prompts.scenes.length === payload.scenes.length
+        && prompts.scenes.every((promptScene, index) => promptScene !== null
+            && typeof promptScene === "object"
+            && promptScene.scene_id === payload.scenes[index]?.scene_id
+            && ["keyframe_i2v", "reference2video"].every((method) => {
+                const record = promptScene[method];
+                return record !== null
+                    && typeof record === "object"
+                    && Object.keys(record).length === 3
+                    && typeof record.final_prompt === "string"
+                    && (record.source_fingerprint === null || typeof record.source_fingerprint === "string")
+                    && typeof record.relay_fingerprint === "string";
+            }));
 }
 
 async function fetchJson(path, options = {}) {
@@ -154,6 +185,59 @@ async function fetchJson(path, options = {}) {
     return payload;
 }
 
+function clearGptLauncherErrors() {
+    if (builderState.storyboardRelayMessage === GPT_LAUNCH_FAILURE_MESSAGE) {
+        builderState.storyboardRelayMessage = "";
+        builderState.storyboardRelayState = "ready";
+    }
+    if (builderState.promptMessage === GPT_LAUNCH_FAILURE_MESSAGE) {
+        builderState.promptMessage = "";
+        builderState.promptMessageState = "ready";
+    }
+}
+
+async function openDedicatedGpt(root, director) {
+    if (!isActive(root) || builderState.gptLaunchInFlight) {
+        return;
+    }
+    const path = gptLaunchPath(director);
+    const sourceView = director === "storyboard" ? "storyboard" : "prompts";
+    const promptViewport = capturePromptViewport(root);
+    clearGptLauncherErrors();
+    builderState.gptLaunchInFlight = true;
+    renderProjectState(root, { promptViewport });
+    try {
+        if (!path) {
+            throw new Error(GPT_LAUNCH_FAILURE_MESSAGE);
+        }
+        const result = await fetchJson(path, {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        if (!isSuccessfulGptLaunch(result, director)) {
+            throw new Error(GPT_LAUNCH_FAILURE_MESSAGE);
+        }
+    } catch (error) {
+        if (!isActive(root)) {
+            return;
+        }
+        console.error("[Music Video Builder] GPT launch failed.", error);
+        if (builderState.activeView === sourceView) {
+            if (sourceView === "storyboard") {
+                setStoryboardRelayMessage(GPT_LAUNCH_FAILURE_MESSAGE, "error");
+            } else {
+                builderState.promptMessage = GPT_LAUNCH_FAILURE_MESSAGE;
+                builderState.promptMessageState = "error";
+            }
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.gptLaunchInFlight = false;
+            renderProjectState(root, { promptViewport });
+        }
+    }
+}
+
 async function closeBuilder(root) {
     if (root !== overlay || !isActive(root)) {
         root.remove();
@@ -164,7 +248,7 @@ async function closeBuilder(root) {
     }
 
     builderState.closing = true;
-    const saved = await flushCurrentProject(root);
+    const saved = await flushProjectTransition(root);
     if (!isActive(root)) {
         return;
     }
@@ -224,6 +308,26 @@ function reconcileVisualExpansion(previousProject, nextProject, expandedScenes) 
     );
 }
 
+function promptDraftKey(sceneId, generationMethod) {
+    return `${sceneId}:${generationMethod}`;
+}
+
+function reconcilePromptDrafts(previousProject, nextProject, drafts, reconciledPromptKey = null) {
+    if (!previousProject || !nextProject || previousProject.project_id !== nextProject.project_id) {
+        return {};
+    }
+    const nextSceneIds = new Set((nextProject.scenes || []).map((scene) => scene.scene_id));
+    return Object.fromEntries(
+        Object.entries(drafts || {}).filter(([key, draft]) => {
+            const [sceneId, method] = key.split(":");
+            return key !== reconciledPromptKey
+                && nextSceneIds.has(sceneId)
+                && ["keyframe_i2v", "reference2video"].includes(method)
+                && Boolean(draft?.dirty);
+        }),
+    );
+}
+
 function setCurrentProject(root, project, options = {}) {
     if (!isActive(root)) {
         return;
@@ -242,6 +346,12 @@ function setCurrentProject(root, project, options = {}) {
         project,
         builderState.visualExpandedScenes,
     );
+    const preservedPromptDrafts = reconcilePromptDrafts(
+        previousProject,
+        project,
+        builderState.promptDrafts,
+        options.reconciledPromptKey || null,
+    );
     cancelAutosave(root);
     builderState.currentProject = project;
     if (!sameProject || !["keyframe_i2v", "reference2video"].includes(builderState.visualBulkMethod)) {
@@ -254,7 +364,10 @@ function setCurrentProject(root, project, options = {}) {
     builderState.setupMessage = "";
     builderState.storyboardMessage = "";
     builderState.storyboardRequest = null;
-    builderState.storyboardRequestStale = Boolean(project?.storyboard?.scenes?.length);
+    builderState.storyboardRequestStale = false;
+    builderState.storyboardAppliedStale = sameProject
+        ? builderState.storyboardAppliedStale
+        : Boolean(project?.storyboard?.scenes?.length);
     builderState.storyboardResponseText = "";
     builderState.storyboardPreview = null;
     builderState.storyboardRelayMessage = "";
@@ -265,6 +378,19 @@ function setCurrentProject(root, project, options = {}) {
     builderState.visualRemoveTarget = null;
     builderState.visualMessage = "";
     builderState.visualMessageState = "ready";
+    builderState.promptDrafts = preservedPromptDrafts;
+    builderState.promptRelay = sameProject ? builderState.promptRelay : {};
+    builderState.promptRelayExpanded = sameProject ? builderState.promptRelayExpanded : {};
+    builderState.promptExpandedScenes = sameProject ? builderState.promptExpandedScenes : {};
+    // Same-project updates keep the visible prompt cards until the caller's
+    // prompt-card refresh replaces them, so no blank intermediate frame renders.
+    builderState.promptCards = sameProject ? builderState.promptCards : [];
+    builderState.promptListState = project
+        ? (sameProject ? builderState.promptListState : "idle")
+        : "empty";
+    builderState.promptListMessage = "";
+    builderState.promptMessage = "";
+    builderState.promptMessageState = "ready";
 }
 
 function cancelAutosave(root) {
@@ -282,6 +408,11 @@ function hasPendingProjectSave(state) {
             || state.autosaveTimer !== null
             || state.saveState === "dirty"
             || state.saveState === "error");
+}
+
+function hasUnsavedPromptDrafts(state) {
+    return Boolean(state.currentProject)
+        && Object.values(state.promptDrafts || {}).some((draft) => Boolean(draft?.dirty));
 }
 
 function formatDurationMs(durationMs) {
@@ -419,14 +550,16 @@ function appendReferenceList(root, parent, kind, entity) {
     const projectId = builderState.currentProject.project_id;
     const references = document.createElement("div");
     references.className = "mvb-reference-list";
-    if (!entity.references.length) {
+    const retainedIds = new Set(pendingResourceReferenceIds(kind));
+    const retainedReferences = entity.references.filter((reference) => retainedIds.has(reference.reference_id));
+    if (!retainedReferences.length) {
         const empty = document.createElement("p");
         empty.className = "mvb-reference-empty";
         empty.textContent = "No reference images.";
         references.append(empty);
     }
 
-    for (const reference of entity.references) {
+    for (const reference of retainedReferences) {
         const item = document.createElement("figure");
         item.className = "mvb-reference-item";
 
@@ -444,7 +577,13 @@ function appendReferenceList(root, parent, kind, entity) {
         removeButton.type = "button";
         removeButton.textContent = "Remove";
         removeButton.disabled = Boolean(builderState.operation);
-        removeButton.addEventListener("click", () => void removeReference(root, kind, entity, reference));
+        removeButton.addEventListener("click", () => {
+            setPendingResourceReferenceIds(
+                kind,
+                pendingResourceReferenceIds(kind).filter((referenceId) => referenceId !== reference.reference_id),
+            );
+            renderResourceDialogReferences(root, kind, entity);
+        });
 
         item.append(image, caption, removeButton);
         references.append(item);
@@ -453,25 +592,25 @@ function appendReferenceList(root, parent, kind, entity) {
 }
 
 function appendReferenceUpload(root, parent, kind, entity) {
-    const entityId = entity[kind === "characters" ? "character_id" : "location_id"];
     const input = document.createElement("input");
     input.type = "file";
+    input.multiple = true;
     input.accept = "image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp";
     input.hidden = true;
     input.addEventListener("change", () => {
-        const file = input.files?.[0];
-        if (!file) {
+        const selected = [...(input.files || [])];
+        if (!selected.length) {
             return;
         }
-        void uploadReference(root, kind, entityId, file).finally(() => {
-            input.value = "";
-        });
+        setPendingResourceFiles(kind, [...pendingResourceFiles(kind), ...selected]);
+        input.value = "";
+        renderResourceDialogReferences(root, kind, entity);
     });
 
     const button = document.createElement("button");
     button.className = "mvb-button mvb-button-secondary mvb-button-small";
     button.type = "button";
-    button.textContent = "Add Reference";
+    button.textContent = entity ? "Add Reference" : "Choose Reference Images";
     button.disabled = Boolean(builderState.operation);
     button.addEventListener("click", () => input.click());
     parent.append(button, input);
@@ -514,28 +653,135 @@ function appendDeleteControls(root, parent, kind, entity) {
     parent.append(confirmation, confirmButton, cancelButton);
 }
 
+function resourceDialogPrefix(kind) {
+    return kind === "characters" ? "character" : "location";
+}
+
+function pendingResourceFiles(kind) {
+    return kind === "characters"
+        ? builderState.characterDialogFiles
+        : builderState.locationDialogFiles;
+}
+
+function setPendingResourceFiles(kind, files) {
+    if (kind === "characters") {
+        builderState.characterDialogFiles = files;
+    } else {
+        builderState.locationDialogFiles = files;
+    }
+}
+
+function pendingResourceReferenceIds(kind) {
+    return kind === "characters"
+        ? builderState.characterDialogReferenceIds
+        : builderState.locationDialogReferenceIds;
+}
+
+function setPendingResourceReferenceIds(kind, referenceIds) {
+    if (kind === "characters") {
+        builderState.characterDialogReferenceIds = referenceIds;
+    } else {
+        builderState.locationDialogReferenceIds = referenceIds;
+    }
+}
+
+function appendEntityPreview(root, parent, kind, entity) {
+    const preview = document.createElement("div");
+    preview.className = "mvb-entity-card-preview";
+    const reference = entity.references[0];
+    if (reference) {
+        const image = document.createElement("img");
+        const entityId = entity[kind === "characters" ? "character_id" : "location_id"];
+        image.src = referenceUrl(builderState.currentProject.project_id, kind, entityId, reference.reference_id);
+        image.alt = `${entity.name} reference preview`;
+        image.loading = "lazy";
+        preview.append(image);
+    } else {
+        preview.textContent = "No image";
+        preview.classList.add("mvb-entity-card-preview-empty");
+    }
+    parent.append(preview);
+}
+
+function renderResourceDialogReferences(root, kind, entity = null) {
+    if (!isActive(root)) {
+        return;
+    }
+    const prefix = resourceDialogPrefix(kind);
+    const container = root.querySelector(`[data-mvb-${prefix}-references]`);
+    if (!container) {
+        return;
+    }
+    container.replaceChildren();
+
+    const heading = document.createElement("p");
+    heading.className = "mvb-dialog-section-label";
+    heading.textContent = "Reference images";
+    container.append(heading);
+
+    if (entity) {
+        appendReferenceList(root, container, kind, entity);
+    }
+    appendReferenceUpload(root, container, kind, entity);
+
+    const files = pendingResourceFiles(kind);
+    const pending = document.createElement("ul");
+    pending.className = "mvb-dialog-reference-pending";
+    pending.hidden = files.length === 0;
+    files.forEach((file, index) => {
+        const item = document.createElement("li");
+        const name = document.createElement("span");
+        name.textContent = file.name;
+        const removeButton = document.createElement("button");
+        removeButton.className = "mvb-button mvb-button-danger mvb-button-small";
+        removeButton.type = "button";
+        removeButton.textContent = "Remove";
+        removeButton.disabled = Boolean(builderState.operation);
+        removeButton.addEventListener("click", () => {
+            const next = [...pendingResourceFiles(kind)];
+            next.splice(index, 1);
+            setPendingResourceFiles(kind, next);
+            renderResourceDialogReferences(root, kind, entity);
+        });
+        item.append(name, removeButton);
+        pending.append(item);
+    });
+    container.append(pending);
+}
+
+function refreshOpenResourceDialog(root) {
+    if (!isActive(root) || !builderState.currentProject) {
+        return;
+    }
+    const characterDialog = root.querySelector("[data-mvb-character-dialog]");
+    const characterForm = root.querySelector("[data-mvb-character-form]");
+    if (characterDialog && !characterDialog.hidden && characterForm?.dataset.entityId) {
+        const character = findCharacter(builderState.currentProject, characterForm.dataset.entityId);
+        if (character) {
+            renderResourceDialogReferences(root, "characters", character);
+        }
+        return;
+    }
+    const locationDialog = root.querySelector("[data-mvb-location-dialog]");
+    const locationForm = root.querySelector("[data-mvb-location-form]");
+    if (locationDialog && !locationDialog.hidden && locationForm?.dataset.entityId) {
+        const location = findLocation(builderState.currentProject, locationForm.dataset.entityId);
+        if (location) {
+            renderResourceDialogReferences(root, "locations", location);
+        }
+    }
+}
+
 function appendCharacterCard(root, character) {
     const card = document.createElement("article");
     card.className = "mvb-entity-card";
 
+    appendEntityPreview(root, card, "characters", character);
     const heading = document.createElement("div");
     heading.className = "mvb-entity-card-heading";
     const title = document.createElement("h3");
     title.textContent = character.name;
-    const role = document.createElement("span");
-    role.className = "mvb-entity-role";
-    role.textContent = roleLabel(character.role);
-    heading.append(title, role);
-
-    const fields = document.createElement("dl");
-    fields.className = "mvb-entity-fields";
-    appendDefinitionField(fields, "Appearance", character.appearance);
-    appendDefinitionField(fields, "Outfit", character.outfit);
-
-    const referencesHeading = document.createElement("p");
-    referencesHeading.className = "mvb-entity-section-label";
-    referencesHeading.textContent = `References · ${character.references.length}`;
-    appendReferenceList(root, card, "characters", character);
+    heading.append(title);
 
     const actions = document.createElement("div");
     actions.className = "mvb-entity-actions";
@@ -546,14 +792,8 @@ function appendCharacterCard(root, character) {
     editButton.disabled = Boolean(builderState.operation);
     editButton.addEventListener("click", () => openCharacterDialog(root, character));
     actions.append(editButton);
-    appendReferenceUpload(root, actions, "characters", character);
     appendDeleteControls(root, actions, "characters", character);
-
-    const references = card.querySelector(".mvb-reference-list");
-    card.insertBefore(heading, card.firstChild);
-    card.insertBefore(fields, references);
-    card.insertBefore(referencesHeading, references);
-    card.append(actions);
+    card.append(heading, actions);
     return card;
 }
 
@@ -561,20 +801,12 @@ function appendLocationCard(root, location) {
     const card = document.createElement("article");
     card.className = "mvb-entity-card";
 
+    appendEntityPreview(root, card, "locations", location);
     const heading = document.createElement("div");
     heading.className = "mvb-entity-card-heading";
     const title = document.createElement("h3");
     title.textContent = location.name;
     heading.append(title);
-
-    const fields = document.createElement("dl");
-    fields.className = "mvb-entity-fields";
-    appendDefinitionField(fields, "Description", location.description);
-
-    const referencesHeading = document.createElement("p");
-    referencesHeading.className = "mvb-entity-section-label";
-    referencesHeading.textContent = `References · ${location.references.length}`;
-    appendReferenceList(root, card, "locations", location);
 
     const actions = document.createElement("div");
     actions.className = "mvb-entity-actions";
@@ -585,14 +817,8 @@ function appendLocationCard(root, location) {
     editButton.disabled = Boolean(builderState.operation);
     editButton.addEventListener("click", () => openLocationDialog(root, location));
     actions.append(editButton);
-    appendReferenceUpload(root, actions, "locations", location);
     appendDeleteControls(root, actions, "locations", location);
-
-    const references = card.querySelector(".mvb-reference-list");
-    card.insertBefore(heading, card.firstChild);
-    card.insertBefore(fields, references);
-    card.insertBefore(referencesHeading, references);
-    card.append(actions);
+    card.append(heading, actions);
     return card;
 }
 
@@ -608,7 +834,7 @@ function storyboardStatus(project) {
     if (!project?.storyboard?.scenes?.length) {
         return "No storyboard applied";
     }
-    return builderState.storyboardRequestStale ? "Out of date" : "Applied";
+    return builderState.storyboardAppliedStale ? "Out of date" : "Applied";
 }
 
 function setStoryboardRelayMessage(message, state = "success") {
@@ -619,7 +845,8 @@ function setStoryboardRelayMessage(message, state = "success") {
 function invalidateStoryboardRequestForDirectionEdit() {
     builderState.storyboardRequest = null;
     builderState.storyboardPreview = null;
-    builderState.storyboardRequestStale = Boolean(builderState.currentProject?.storyboard?.scenes?.length);
+    builderState.storyboardRequestStale = true;
+    builderState.storyboardAppliedStale = Boolean(builderState.currentProject?.storyboard?.scenes?.length);
     setStoryboardRelayMessage("");
 }
 
@@ -662,7 +889,7 @@ function renderStoryboardPreview(root) {
             : "No applied scene allocations";
     previewState.dataset.state = builderState.storyboardPreview
         ? "preview"
-        : storyboardScenes.length && builderState.storyboardRequestStale
+        : storyboardScenes.length && builderState.storyboardAppliedStale
             ? "warning"
             : "ready";
 
@@ -753,12 +980,13 @@ function renderStoryboardRelay(root) {
     const responseInput = root.querySelector("[data-mvb-response-json]");
     const requestButton = root.querySelector("[data-mvb-generate-request]");
     const copyButton = root.querySelector("[data-mvb-copy-request]");
+    const openGptButton = root.querySelector("[data-mvb-storyboard-open-gpt]");
     const validateButton = root.querySelector("[data-mvb-validate-response]");
     const clearPasteButton = root.querySelector("[data-mvb-clear-paste]");
     const applyButton = root.querySelector("[data-mvb-apply-storyboard]");
     const clearButton = root.querySelector("[data-mvb-clear-storyboard]");
     const status = root.querySelector("[data-mvb-storyboard-relay-status]");
-    if (!brief || !visualNotes || !storyboardMode || !storyboardModeHelp || !requestPreview || !responseInput || !requestButton || !copyButton || !validateButton || !clearPasteButton || !applyButton || !clearButton || !status) {
+    if (!brief || !visualNotes || !storyboardMode || !storyboardModeHelp || !requestPreview || !responseInput || !requestButton || !copyButton || !openGptButton || !validateButton || !clearPasteButton || !applyButton || !clearButton || !status) {
         return;
     }
 
@@ -775,16 +1003,20 @@ function renderStoryboardRelay(root) {
         responseInput.value = builderState.storyboardResponseText;
     }
     storyboardModeHelp.textContent = STORYBOARD_MODE_HELP[direction.storyboard_mode] || STORYBOARD_MODE_HELP.loose;
-    requestPreview.value = builderState.storyboardRequest
-        ? JSON.stringify(builderState.storyboardRequest, null, 2)
-        : "Generate a request to preview its JSON.";
+    const requestJson = storyboardRequestJson(builderState.storyboardRequest);
+    requestPreview.value = requestJson || "Generate a request to preview its JSON.";
 
-    const blocked = !project || builderState.closing || builderState.transitioning || Boolean(builderState.operation);
+    const blocked = !project || builderState.closing || builderState.transitioning || Boolean(builderState.operation) || builderState.gptLaunchInFlight;
     storyboardMode.disabled = blocked;
     brief.disabled = blocked;
     visualNotes.disabled = blocked;
     requestButton.disabled = blocked || !project.scenes.length;
-    copyButton.disabled = !builderState.storyboardRequest || builderState.storyboardRequestStale || blocked;
+    copyButton.disabled = !canCopyStoryboardRequest(
+        builderState.storyboardRequest,
+        builderState.storyboardRequestStale,
+        blocked,
+    );
+    openGptButton.disabled = blocked;
     validateButton.disabled = blocked || !builderState.storyboardResponseText.trim();
     clearPasteButton.disabled = !builderState.storyboardResponseText;
     applyButton.disabled = blocked || !builderState.storyboardPreview;
@@ -805,7 +1037,7 @@ function renderStoryboardRelay(root) {
         ? builderState.storyboardRelayState
         : builderState.storyboardPreview
             ? "preview"
-            : project?.storyboard?.scenes?.length && builderState.storyboardRequestStale
+            : project?.storyboard?.scenes?.length && builderState.storyboardAppliedStale
                 ? "warning"
                 : builderState.operation
                     ? "working"
@@ -940,7 +1172,7 @@ function deriveVisualReadinessClient(project, visualScene) {
     const storyboardScene = storyboardSceneFor(project, visualScene.scene_id);
     if (!storyboardScenes.length) {
         missing.push("Apply a storyboard before continuing.");
-    } else if (builderState.storyboardRequestStale) {
+    } else if (builderState.storyboardAppliedStale) {
         missing.push("Storyboard is out of date.");
     } else if (!storyboardScene) {
         missing.push("Current storyboard scene allocation is missing.");
@@ -1551,6 +1783,7 @@ async function runVisualMutation(root, operation, sceneId, task, failureMessage,
         if (project.storyboard?.scenes?.length) {
             void loadStoryboardRequest(root, true);
         }
+        void loadPromptCards(root, true);
         void loadProjectList(root);
         succeeded = true;
         return true;
@@ -1719,9 +1952,1024 @@ async function applyVisualMethodToAllScenes(root) {
     );
 }
 
+function promptPath(projectId, sceneId, suffix = "") {
+    const tail = suffix ? `/${suffix}` : "";
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/prompt${tail}`;
+}
+
+function promptDraftFor(sceneId, generationMethod, item) {
+    const key = promptDraftKey(sceneId, generationMethod);
+    const existing = builderState.promptDrafts[key];
+    if (existing) {
+        return existing;
+    }
+    const draft = {
+        text: item.saved_final_prompt || "",
+        sourceFingerprint: item.saved_source_fingerprint || item.source_fingerprint || null,
+        relayFingerprint: item.saved_relay_fingerprint || "",
+        dirty: false,
+    };
+    builderState.promptDrafts[key] = draft;
+    return draft;
+}
+
+function promptStatusLabel(status) {
+    return {
+        needs_gpt: "NEEDS GPT",
+        current: "CURRENT",
+        unsaved: "UNSAVED",
+        stale: "STALE",
+        error: "ERROR",
+    }[status] || "NEEDS GPT";
+}
+
+function promptRelayKey(sceneId, generationMethod) {
+    return `${sceneId}:${generationMethod}`;
+}
+
+function promptRelayFor(sceneId, generationMethod) {
+    const key = promptRelayKey(sceneId, generationMethod);
+    if (!builderState.promptRelay[key]) {
+        builderState.promptRelay[key] = {
+            request: null,
+            responseText: "",
+            responseMessage: "",
+            responseMessageState: "ready",
+        };
+    }
+    return builderState.promptRelay[key];
+}
+
+function promptRelayIsCurrent(relay, item) {
+    return canCopyPromptRelayRequest(relay, item);
+}
+
+function updatePromptRelayControls(root, sceneId, generationMethod) {
+    if (!isActive(root)) {
+        return;
+    }
+    const item = promptItemFor(sceneId, generationMethod);
+    const card = promptCardFor(root, sceneId);
+    if (!item || !card) {
+        return;
+    }
+    const relay = promptRelayFor(sceneId, generationMethod);
+    const blocked = Boolean(builderState.operation) || builderState.transitioning || builderState.closing || builderState.gptLaunchInFlight;
+    const requestCurrent = promptRelayIsCurrent(relay, item);
+    const requestPreview = card.querySelector("[data-mvb-prompt-relay-request]");
+    const responseInput = card.querySelector("[data-mvb-prompt-relay-response]");
+    const copyButton = card.querySelector("[data-mvb-prompt-relay-copy]");
+    const applyButton = card.querySelector("[data-mvb-prompt-relay-apply]");
+    const relayStatus = card.querySelector("[data-mvb-prompt-relay-status]");
+    if (requestPreview && document.activeElement !== requestPreview) {
+        requestPreview.value = promptRelayRequestJson(relay.request) || "Generate a request to preview its JSON.";
+    }
+    if (responseInput && document.activeElement !== responseInput) {
+        responseInput.value = relay.responseText;
+    }
+    if (copyButton) {
+        copyButton.disabled = blocked || !canCopyPromptRelayRequest(relay, item);
+    }
+    if (applyButton) {
+        applyButton.disabled = blocked || !canApplyPromptRelayResponse(relay, item);
+    }
+    if (relayStatus) {
+        relayStatus.textContent = relay.responseMessage || (relay.request && !requestCurrent
+            ? "Request is stale — generate a new request."
+            : "");
+        relayStatus.dataset.state = relay.responseMessage
+            ? relay.responseMessageState
+            : (relay.request && !requestCurrent ? "warning" : "ready");
+    }
+}
+
+function promptCardFor(root, sceneId) {
+    if (!root || !sceneId) {
+        return null;
+    }
+    return [...root.querySelectorAll("[data-mvb-prompt-card]")]
+        .find((card) => card.dataset.mvbPromptSceneId === sceneId) || null;
+}
+
+function revealPromptReviewSection(root, sceneId, generationMethod) {
+    if (!isActive(root) || builderState.activeView !== "prompts") {
+        return;
+    }
+    const editor = [...root.querySelectorAll("[data-mvb-prompt-editor]")]
+        .find((candidate) => candidate.dataset.mvbPromptSceneId === sceneId
+            && candidate.dataset.mvbPromptGenerationMethod === generationMethod);
+    if (!editor) {
+        return;
+    }
+    const marker = generationMethod === "reference2video"
+        ? "detailed_description:"
+        : "integrated_multimodal_description:";
+    const markerIndex = editor.value.indexOf(marker);
+    if (markerIndex < 0) {
+        return;
+    }
+    const lineCount = editor.value.slice(0, markerIndex).split("\n").length;
+    const lineHeight = Number.parseFloat(window.getComputedStyle(editor).lineHeight) || 20;
+    editor.scrollTop = Math.max(0, (lineCount - 2) * lineHeight);
+}
+
+function promptScrollContainer(root) {
+    return root?.querySelector("[data-mvb-prompts]") || null;
+}
+
+function capturePromptViewport(root, anchorSceneId = null) {
+    if (!isActive(root) || builderState.activeView !== "prompts") {
+        return null;
+    }
+    const scroller = promptScrollContainer(root);
+    if (!scroller) {
+        return null;
+    }
+    const scrollerRect = scroller.getBoundingClientRect();
+    const focusedEditor = document.activeElement?.closest("[data-mvb-prompt-editor]");
+    const focusedCard = focusedEditor?.closest("[data-mvb-prompt-card]")
+        || promptCardFor(root, anchorSceneId)
+        || [...root.querySelectorAll("[data-mvb-prompt-card]")].find((card) => {
+            const rect = card.getBoundingClientRect();
+            return rect.bottom > scrollerRect.top && rect.top < scrollerRect.bottom;
+        });
+    const cardRect = focusedCard?.getBoundingClientRect();
+    return {
+        top: scroller.scrollTop,
+        left: scroller.scrollLeft,
+        sceneId: focusedCard?.dataset.mvbPromptSceneId || null,
+        generationMethod: focusedCard?.dataset.mvbPromptGenerationMethod || null,
+        cardOffset: cardRect ? cardRect.top - scrollerRect.top : null,
+        editor: focusedEditor
+            ? {
+                sceneId: focusedEditor.dataset.mvbPromptSceneId,
+                generationMethod: focusedEditor.dataset.mvbPromptGenerationMethod,
+                selectionStart: focusedEditor.selectionStart,
+                selectionEnd: focusedEditor.selectionEnd,
+            }
+            : null,
+    };
+}
+
+function restorePromptViewport(root, viewport) {
+    if (!viewport || !isActive(root) || builderState.activeView !== "prompts") {
+        return;
+    }
+    const apply = () => {
+        if (!isActive(root) || builderState.activeView !== "prompts") {
+            return;
+        }
+        const scroller = promptScrollContainer(root);
+        if (!scroller) {
+            return;
+        }
+        const card = promptCardFor(root, viewport.sceneId);
+        if (card && viewport.cardOffset !== null) {
+            const scrollerRect = scroller.getBoundingClientRect();
+            const cardRect = card.getBoundingClientRect();
+            scroller.scrollTop += cardRect.top - scrollerRect.top - viewport.cardOffset;
+        } else {
+            scroller.scrollTop = viewport.top;
+        }
+        scroller.scrollLeft = viewport.left;
+        if (viewport.editor) {
+            const editor = [...root.querySelectorAll("[data-mvb-prompt-editor]")]
+                .find((candidate) => candidate.dataset.mvbPromptSceneId === viewport.editor.sceneId
+                    && candidate.dataset.mvbPromptGenerationMethod === viewport.editor.generationMethod);
+            if (editor && document.activeElement !== editor) {
+                editor.focus({ preventScroll: true });
+                if (typeof viewport.editor.selectionStart === "number") {
+                    editor.setSelectionRange(viewport.editor.selectionStart, viewport.editor.selectionEnd);
+                }
+            }
+        }
+    };
+    apply();
+    window.requestAnimationFrame(apply);
+}
+
+function promptItemFor(sceneId, generationMethod) {
+    return builderState.promptCards.find((item) => item.scene_id === sceneId
+        && item.generation_method === generationMethod) || null;
+}
+
+function promptFinalIsVisible(item, draft) {
+    return promptDraftHasCurrentRelay(item, draft)
+        || item.status === "current"
+        || item.status === "stale";
+}
+
+function promptFinalInstruction(item, draft) {
+    if (item.status === "stale" && !promptDraftHasCurrentRelay(item, draft)) {
+        return "This saved prompt is stale because the scene changed. Run the Prompt Director again before saving a current version.";
+    }
+    if (draft.dirty || promptDraftStatus(item, draft) === "unsaved") {
+        return "Review the assembled prompt below. Edit if required, then save it for rendering.";
+    }
+    return "This is the saved current prompt. Edit it only if you intend to create a new unsaved revision.";
+}
+
+function promptCardsMatchStructure(root) {
+    const cards = builderState.promptCards;
+    if (!isActive(root) || !builderState.currentProject || !cards.length) {
+        return false;
+    }
+    const list = root.querySelector("[data-mvb-prompt-scenes]");
+    if (!list) {
+        return false;
+    }
+    const existing = [...list.querySelectorAll(":scope > [data-mvb-prompt-card]")];
+    if (existing.length !== cards.length) {
+        return false;
+    }
+    return existing.every((card, index) => card.dataset.mvbPromptSceneId === cards[index].scene_id
+        && card.dataset.mvbPromptGenerationMethod === cards[index].generation_method);
+}
+
+function buildPromptFinalSection(root, card, item, draft, blocked) {
+    const finalSection = document.createElement("section");
+    finalSection.className = "mvb-prompt-final mvb-prompt-workflow-section";
+    finalSection.dataset.mvbPromptFinal = "";
+    const finalHeading = document.createElement("h4");
+    finalHeading.textContent = "Final Prompt";
+    const finalInstruction = document.createElement("p");
+    finalInstruction.className = "mvb-prompt-instruction mvb-prompt-final-instruction";
+    finalInstruction.textContent = promptFinalInstruction(item, draft);
+    finalSection.append(finalHeading, finalInstruction);
+    const editorField = document.createElement("label");
+    editorField.className = "mvb-field mvb-prompt-editor-field";
+    const editorLabel = document.createElement("span");
+    editorLabel.textContent = "Final Prompt";
+    const editor = document.createElement("textarea");
+    editor.rows = 12;
+    editor.maxLength = 50_000;
+    editor.spellcheck = false;
+    editor.value = draft.text;
+    editor.setAttribute("aria-label", `Final Prompt for scene ${item.sequence}`);
+    editor.dataset.mvbPromptEditor = "";
+    editor.dataset.mvbPromptSceneId = item.scene_id;
+    editor.dataset.mvbPromptGenerationMethod = item.generation_method;
+    editor.disabled = blocked || item.status === "error";
+    editor.readOnly = !promptDraftHasCurrentRelay(item, draft);
+    editorField.append(editorLabel, editor);
+    finalSection.append(editorField);
+    const actions = document.createElement("div");
+    actions.className = "mvb-prompt-actions";
+    const dirtyLabel = document.createElement("span");
+    dirtyLabel.className = "mvb-prompt-dirty";
+    dirtyLabel.dataset.mvbPromptDirty = "";
+    dirtyLabel.textContent = "UNSAVED";
+    dirtyLabel.classList.toggle("mvb-prompt-dirty-visible", draft.dirty);
+    dirtyLabel.setAttribute("aria-hidden", String(!draft.dirty));
+    actions.append(dirtyLabel);
+    const copyButton = makeVisualButton("Copy", "mvb-button-secondary", () => void copyPrompt(root, item.scene_id, item.generation_method), blocked || !draft.text);
+    copyButton.dataset.mvbPromptCopy = "";
+    const saveButton = makeVisualButton("Save Prompt", "mvb-button-primary", () => void savePrompt(root, item.scene_id, item.generation_method), blocked || !canSavePromptDraft(item, draft));
+    saveButton.dataset.mvbPromptSave = "";
+    actions.append(copyButton, saveButton);
+    editor.addEventListener("input", () => {
+        draft.text = editor.value;
+        draft.dirty = promptDraftIsDirty(item, draft);
+        builderState.promptMessage = "";
+        builderState.promptMessageState = "ready";
+        const currentDraftStatus = promptDraftStatus(item, draft);
+        card.dataset.mvbPromptReadyForRender = String(promptDraftReadyForRender(item, draft));
+        const badge = card.querySelector("[data-mvb-prompt-badge]");
+        if (badge) {
+            badge.dataset.state = currentDraftStatus;
+            badge.textContent = promptStatusLabel(currentDraftStatus);
+        }
+        dirtyLabel.classList.toggle("mvb-prompt-dirty-visible", draft.dirty);
+        dirtyLabel.setAttribute("aria-hidden", String(!draft.dirty));
+        copyButton.disabled = blocked || !draft.text;
+        saveButton.disabled = blocked || !canSavePromptDraft(item, draft);
+    });
+    finalSection.append(actions);
+    return finalSection;
+}
+
+function updatePromptFinalSection(root, card, item, draft, blocked) {
+    const visible = promptFinalIsVisible(item, draft);
+    let finalSection = card.querySelector("[data-mvb-prompt-final]");
+    if (!visible) {
+        if (finalSection) {
+            finalSection.remove();
+        }
+        return;
+    }
+    if (!finalSection) {
+        finalSection = buildPromptFinalSection(root, card, item, draft, blocked);
+        const body = card.querySelector(".mvb-prompt-card-body");
+        if (body) {
+            body.insertBefore(finalSection, body.querySelector("[data-mvb-prompt-context]") || null);
+        }
+        return;
+    }
+    const instruction = finalSection.querySelector(".mvb-prompt-final-instruction");
+    if (instruction) {
+        instruction.textContent = promptFinalInstruction(item, draft);
+    }
+    const editor = finalSection.querySelector("[data-mvb-prompt-editor]");
+    if (editor) {
+        editor.disabled = blocked || item.status === "error";
+        editor.readOnly = !promptDraftHasCurrentRelay(item, draft);
+        if (document.activeElement !== editor && editor.value !== draft.text) {
+            editor.value = draft.text;
+        }
+    }
+    const dirtyLabel = finalSection.querySelector("[data-mvb-prompt-dirty]");
+    if (dirtyLabel) {
+        dirtyLabel.classList.toggle("mvb-prompt-dirty-visible", draft.dirty);
+        dirtyLabel.setAttribute("aria-hidden", String(!draft.dirty));
+    }
+    const copyButton = finalSection.querySelector("[data-mvb-prompt-copy]");
+    if (copyButton) {
+        copyButton.disabled = blocked || !draft.text;
+    }
+    const saveButton = finalSection.querySelector("[data-mvb-prompt-save]");
+    if (saveButton) {
+        saveButton.disabled = blocked || !canSavePromptDraft(item, draft);
+    }
+}
+
+function updatePromptContextInPlace(card, item) {
+    const contextSection = card.querySelector("[data-mvb-prompt-context]");
+    if (!contextSection) {
+        return;
+    }
+    const context = contextSection.querySelector(".mvb-prompt-context");
+    if (context) {
+        context.textContent = item.source_kind === "lyric" && item.lyric
+            ? item.lyric
+            : "Instrumental scene";
+    }
+    const mappingKey = JSON.stringify(item.reference_map?.pictures || []);
+    const existingMapping = contextSection.querySelector(".mvb-prompt-mapping");
+    if (existingMapping && existingMapping.dataset.mvbMappingKey !== mappingKey) {
+        existingMapping.remove();
+    }
+    const pictures = item.reference_map?.pictures || [];
+    if (pictures.length && !contextSection.querySelector(".mvb-prompt-mapping")) {
+        const mapping = document.createElement("details");
+        mapping.className = "mvb-prompt-mapping mvb-prompt-context-disclosure";
+        mapping.dataset.mvbMappingKey = mappingKey;
+        mapping.open = Boolean(builderState.promptRelayExpanded[`${promptDraftKey(item.scene_id, item.generation_method)}:mapping`]);
+        mapping.addEventListener("toggle", () => {
+            builderState.promptRelayExpanded[`${promptDraftKey(item.scene_id, item.generation_method)}:mapping`] = mapping.open;
+        });
+        const mappingSummary = document.createElement("summary");
+        mappingSummary.textContent = "Reference Mapping";
+        const mappingList = document.createElement("ul");
+        for (const picture of pictures) {
+            const entry = document.createElement("li");
+            entry.textContent = `${picture.picture_tag} → ${picture.subject_tag} → ${picture.entity_name}`;
+            mappingList.append(entry);
+        }
+        mapping.append(mappingSummary, mappingList);
+        contextSection.insertBefore(mapping, contextSection.querySelector(".mvb-relay-disclosure") || null);
+    }
+    const deterministic = contextSection.querySelector(".mvb-prompt-deterministic");
+    if (deterministic) {
+        const deterministicText = deterministic.querySelector("pre");
+        if (deterministicText) {
+            deterministicText.textContent = item.deterministic_prompt || item.error || "No deterministic prompt is available.";
+        }
+    }
+}
+
+function updatePromptCardInPlace(root, card, item, blocked) {
+    const draft = promptDraftFor(item.scene_id, item.generation_method, item);
+    card.dataset.mvbPromptReadyForRender = String(promptDraftReadyForRender(item, draft));
+    const badge = card.querySelector("[data-mvb-prompt-badge]");
+    if (badge) {
+        const draftStatus = promptDraftStatus(item, draft);
+        badge.dataset.state = draftStatus;
+        badge.textContent = promptStatusLabel(draftStatus);
+    }
+    const generateButton = card.querySelector("[data-mvb-prompt-relay-generate]");
+    if (generateButton) {
+        generateButton.disabled = blocked || item.status === "error";
+    }
+    const openGptButton = card.querySelector("[data-mvb-prompt-relay-open-gpt]");
+    if (openGptButton) {
+        openGptButton.disabled = blocked;
+    }
+    updatePromptRelayControls(root, item.scene_id, item.generation_method);
+    updatePromptFinalSection(root, card, item, draft, blocked);
+    updatePromptContextInPlace(card, item);
+}
+
+function updatePromptCardsInPlace(root, promptViewport) {
+    const list = root.querySelector("[data-mvb-prompt-scenes]");
+    const empty = root.querySelector("[data-mvb-prompt-empty]");
+    const status = root.querySelector("[data-mvb-prompt-status]");
+    if (!list || !empty || !status) {
+        return;
+    }
+    const cards = builderState.promptCards;
+    empty.hidden = cards.length > 0;
+    empty.textContent = cards.length ? "" : "Build scenes before preparing Prompts.";
+    status.textContent = builderState.promptMessage || "";
+    status.dataset.state = builderState.promptMessage
+        ? builderState.promptMessageState
+        : "ready";
+    const blocked = Boolean(builderState.operation) || builderState.transitioning || builderState.closing;
+    for (const [index, item] of cards.entries()) {
+        const card = list.children[index];
+        if (card && card.dataset.mvbPromptCard !== undefined) {
+            updatePromptCardInPlace(root, card, item, blocked);
+        }
+    }
+    restorePromptViewport(root, promptViewport);
+}
+
+function renderPromptState(root, options = {}) {
+    if (!isActive(root)) {
+        return;
+    }
+    const list = root.querySelector("[data-mvb-prompt-scenes]");
+    const empty = root.querySelector("[data-mvb-prompt-empty]");
+    const status = root.querySelector("[data-mvb-prompt-status]");
+    if (!list || !empty || !status) {
+        return;
+    }
+    const promptViewport = options.promptViewport || capturePromptViewport(root, options.anchorSceneId);
+    if (builderState.promptListState === "ready" && promptCardsMatchStructure(root)) {
+        updatePromptCardsInPlace(root, promptViewport);
+        return;
+    }
+    if (builderState.promptListState === "loading" && promptCardsMatchStructure(root)) {
+        // A silent refresh is in flight; keep the current cards on screen
+        // instead of flashing a loading placeholder or an empty list.
+        empty.hidden = true;
+        status.textContent = builderState.promptMessage || "";
+        status.dataset.state = builderState.promptMessage
+            ? builderState.promptMessageState
+            : "ready";
+        restorePromptViewport(root, promptViewport);
+        return;
+    }
+    list.replaceChildren();
+    if (!builderState.currentProject) {
+        empty.hidden = true;
+        status.textContent = "";
+        restorePromptViewport(root, promptViewport);
+        return;
+    }
+    if (builderState.promptListState === "loading") {
+        empty.hidden = false;
+        empty.textContent = "Loading prompt previews…";
+        status.textContent = "";
+        restorePromptViewport(root, promptViewport);
+        return;
+    }
+    if (builderState.promptListState === "error") {
+        empty.hidden = false;
+        empty.textContent = builderState.promptListMessage || "Prompts could not be loaded.";
+        status.textContent = builderState.promptMessage || "";
+        status.dataset.state = "error";
+        restorePromptViewport(root, promptViewport);
+        return;
+    }
+    const cards = builderState.promptCards;
+    empty.hidden = cards.length > 0;
+    empty.textContent = cards.length ? "" : "Build scenes before preparing Prompts.";
+    status.textContent = builderState.promptMessage || "";
+    status.dataset.state = builderState.promptMessage
+        ? builderState.promptMessageState
+        : "ready";
+    const blocked = Boolean(builderState.operation) || builderState.transitioning || builderState.closing;
+    for (const item of cards) {
+        const key = promptDraftKey(item.scene_id, item.generation_method);
+        const draft = promptDraftFor(item.scene_id, item.generation_method, item);
+        const card = document.createElement("details");
+        card.className = "mvb-prompt-card";
+        card.dataset.mvbPromptCard = "";
+        card.dataset.mvbPromptSceneId = item.scene_id;
+        card.dataset.mvbPromptGenerationMethod = item.generation_method;
+        card.dataset.mvbPromptReadyForRender = String(promptDraftReadyForRender(item, draft));
+        card.open = Boolean(builderState.promptExpandedScenes[item.scene_id]);
+        card.addEventListener("toggle", () => {
+            builderState.promptExpandedScenes[item.scene_id] = card.open;
+        });
+
+        const summary = document.createElement("summary");
+        summary.className = "mvb-prompt-summary";
+        const sceneLabel = document.createElement("span");
+        sceneLabel.className = "mvb-prompt-summary-title";
+        sceneLabel.textContent = `Scene ${String(item.sequence).padStart(2, "0")}`;
+        const timing = document.createElement("span");
+        timing.className = "mvb-prompt-summary-timing";
+        timing.textContent = `${formatTimelineMs(item.timeline_start_ms)} → ${formatTimelineMs(item.timeline_end_ms)} · ${formatDurationMs(item.exact_duration_ms)}`;
+        const method = document.createElement("span");
+        method.className = "mvb-prompt-summary-method";
+        method.textContent = VISUAL_METHOD_LABELS[item.generation_method] || item.generation_method;
+         const badge = document.createElement("span");
+         badge.className = "mvb-prompt-status";
+         badge.dataset.mvbPromptBadge = "";
+         const draftStatus = promptDraftStatus(item, draft);
+         badge.dataset.state = draftStatus;
+         badge.textContent = promptStatusLabel(draftStatus);
+        summary.append(sceneLabel, timing, method, badge);
+        card.append(summary);
+
+        const body = document.createElement("div");
+        body.className = "mvb-prompt-card-body";
+        const relay = promptRelayFor(item.scene_id, item.generation_method);
+        const relayDetails = document.createElement("section");
+        relayDetails.className = "mvb-prompt-relay mvb-prompt-workflow-section";
+        const relayBody = document.createElement("div");
+        relayBody.className = "mvb-prompt-relay-body";
+        const relayInstruction = document.createElement("p");
+        relayInstruction.className = "mvb-prompt-instruction";
+        relayInstruction.textContent = "Generate and copy the scene request, open the Prompt Director, then paste and apply its response.";
+        relayBody.append(relayInstruction);
+        const relayResponseField = document.createElement("label");
+        relayResponseField.className = "mvb-field mvb-prompt-relay-field";
+        const relayResponseLabel = document.createElement("span");
+        relayResponseLabel.textContent = "Paste GPT Response";
+        const relayResponseInput = document.createElement("textarea");
+        relayResponseInput.rows = 6;
+        relayResponseInput.spellcheck = false;
+        relayResponseInput.placeholder = "Paste the strict response JSON from Vesper H3 Prompt Director.";
+        relayResponseInput.dataset.mvbPromptRelayResponse = "";
+        relayResponseInput.value = relay.responseText;
+        relayResponseInput.addEventListener("input", () => {
+            relay.responseText = relayResponseInput.value;
+            relay.responseMessage = "";
+            relay.responseMessageState = "ready";
+            updatePromptRelayControls(root, item.scene_id, item.generation_method);
+        });
+        relayResponseField.append(relayResponseLabel, relayResponseInput);
+        relayBody.append(relayResponseField);
+        const relayActions = document.createElement("div");
+        relayActions.className = "mvb-prompt-actions mvb-prompt-relay-actions";
+        const generateRelayButton = makeVisualButton("Generate GPT Request", "mvb-button-secondary", () => void generatePromptRelayRequest(root, item.scene_id, item.generation_method), blocked || item.status === "error");
+        generateRelayButton.dataset.mvbPromptRelayGenerate = "";
+        const copyRelayButton = makeVisualButton("Copy Request JSON", "mvb-button-secondary", () => void copyPromptRelayRequest(root, item.scene_id, item.generation_method), blocked || !canCopyPromptRelayRequest(relay, item));
+        copyRelayButton.dataset.mvbPromptRelayCopy = "";
+        const openGptButton = makeVisualButton("Open GPT", "mvb-button-secondary", () => void openDedicatedGpt(root, "prompts"), blocked);
+        openGptButton.dataset.mvbPromptRelayOpenGpt = "";
+        openGptButton.setAttribute("aria-label", "Open Vesper H3 Prompt Director");
+        openGptButton.title = "Vesper H3 Prompt Director";
+        const applyRelayButton = makeVisualButton("Apply GPT Response", "mvb-button-primary", () => void applyPromptRelayResponse(root, item.scene_id, item.generation_method), blocked || !canApplyPromptRelayResponse(relay, item));
+        applyRelayButton.dataset.mvbPromptRelayApply = "";
+        relayActions.append(generateRelayButton, copyRelayButton, openGptButton, applyRelayButton);
+        relayBody.append(relayActions);
+        const relayStatus = document.createElement("span");
+        relayStatus.className = "mvb-prompt-relay-status";
+        relayStatus.dataset.mvbPromptRelayStatus = "";
+        relayStatus.setAttribute("aria-live", "polite");
+        relayBody.append(relayStatus);
+         relayDetails.append(relayBody);
+         body.append(relayDetails);
+
+        if (promptFinalIsVisible(item, draft)) {
+            const finalSection = document.createElement("section");
+            finalSection.className = "mvb-prompt-final mvb-prompt-workflow-section";
+            finalSection.dataset.mvbPromptFinal = "";
+            const finalHeading = document.createElement("h4");
+            finalHeading.textContent = "Final Prompt";
+            finalSection.append(finalHeading);
+            const finalInstruction = document.createElement("p");
+            finalInstruction.className = "mvb-prompt-instruction mvb-prompt-final-instruction";
+            finalInstruction.textContent = promptFinalInstruction(item, draft);
+            finalSection.append(finalInstruction);
+            const editorField = document.createElement("label");
+            editorField.className = "mvb-field mvb-prompt-editor-field";
+            const editorLabel = document.createElement("span");
+            editorLabel.textContent = "Final Prompt";
+            const editor = document.createElement("textarea");
+            editor.rows = 12;
+            editor.maxLength = 50_000;
+            editor.spellcheck = false;
+            editor.value = draft.text;
+            editor.setAttribute("aria-label", `Final Prompt for scene ${item.sequence}`);
+            editor.dataset.mvbPromptEditor = "";
+            editor.dataset.mvbPromptSceneId = item.scene_id;
+            editor.dataset.mvbPromptGenerationMethod = item.generation_method;
+            editor.disabled = blocked || item.status === "error";
+            editor.readOnly = !promptDraftHasCurrentRelay(item, draft);
+            editorField.append(editorLabel, editor);
+            finalSection.append(editorField);
+            const actions = document.createElement("div");
+            actions.className = "mvb-prompt-actions";
+            const dirtyLabel = document.createElement("span");
+            dirtyLabel.className = "mvb-prompt-dirty";
+            dirtyLabel.dataset.mvbPromptDirty = "";
+            dirtyLabel.textContent = "UNSAVED";
+            dirtyLabel.classList.toggle("mvb-prompt-dirty-visible", draft.dirty);
+            dirtyLabel.setAttribute("aria-hidden", String(!draft.dirty));
+            actions.append(dirtyLabel);
+            const copyButton = makeVisualButton("Copy", "mvb-button-secondary", () => void copyPrompt(root, item.scene_id, item.generation_method), blocked || !draft.text);
+            copyButton.dataset.mvbPromptCopy = "";
+            const saveButton = makeVisualButton("Save Prompt", "mvb-button-primary", () => void savePrompt(root, item.scene_id, item.generation_method), blocked || !canSavePromptDraft(item, draft));
+            saveButton.dataset.mvbPromptSave = "";
+            actions.append(copyButton, saveButton);
+            editor.addEventListener("input", () => {
+                draft.text = editor.value;
+                draft.dirty = promptDraftIsDirty(item, draft);
+                builderState.promptMessage = "";
+                builderState.promptMessageState = "ready";
+                const currentDraftStatus = promptDraftStatus(item, draft);
+                card.dataset.mvbPromptReadyForRender = String(promptDraftReadyForRender(item, draft));
+                badge.dataset.state = currentDraftStatus;
+                badge.textContent = promptStatusLabel(currentDraftStatus);
+                dirtyLabel.classList.toggle("mvb-prompt-dirty-visible", draft.dirty);
+                dirtyLabel.setAttribute("aria-hidden", String(!draft.dirty));
+                copyButton.disabled = blocked || !draft.text;
+                saveButton.disabled = blocked || !canSavePromptDraft(item, draft);
+            });
+            finalSection.append(actions);
+            body.append(finalSection);
+        }
+
+        const promptContextSection = document.createElement("section");
+        promptContextSection.className = "mvb-prompt-support mvb-prompt-workflow-section";
+        promptContextSection.dataset.mvbPromptContext = "";
+        const promptContextHeading = document.createElement("h4");
+        promptContextHeading.textContent = "Prompt Context";
+        promptContextSection.append(promptContextHeading);
+        const context = document.createElement("p");
+        context.className = "mvb-prompt-context";
+        context.textContent = item.source_kind === "lyric" && item.lyric
+            ? item.lyric
+            : "Instrumental scene";
+        promptContextSection.append(context);
+        if (item.generation_method === "reference2video" && item.reference_map?.pictures?.length) {
+            const mapping = document.createElement("details");
+            mapping.className = "mvb-prompt-mapping mvb-prompt-context-disclosure";
+            mapping.open = Boolean(builderState.promptRelayExpanded[`${key}:mapping`]);
+            mapping.addEventListener("toggle", () => {
+                builderState.promptRelayExpanded[`${key}:mapping`] = mapping.open;
+            });
+            const mappingSummary = document.createElement("summary");
+            mappingSummary.textContent = "Reference Mapping";
+            const mappingList = document.createElement("ul");
+            for (const picture of item.reference_map.pictures) {
+                const entry = document.createElement("li");
+                entry.textContent = `${picture.picture_tag} → ${picture.subject_tag} → ${picture.entity_name}`;
+                mappingList.append(entry);
+            }
+            mapping.append(mappingSummary, mappingList);
+            promptContextSection.append(mapping);
+        }
+        const relayRequestDisclosure = document.createElement("details");
+        relayRequestDisclosure.className = "mvb-relay-disclosure mvb-prompt-context-disclosure";
+        relayRequestDisclosure.open = Boolean(builderState.promptRelayExpanded[`${key}:request`]);
+        relayRequestDisclosure.addEventListener("toggle", () => {
+            builderState.promptRelayExpanded[`${key}:request`] = relayRequestDisclosure.open;
+        });
+        const relayRequestSummary = document.createElement("summary");
+        relayRequestSummary.textContent = "View Request JSON";
+        const relayRequestField = document.createElement("label");
+        relayRequestField.className = "mvb-field mvb-prompt-relay-field";
+        const relayRequestLabel = document.createElement("span");
+        relayRequestLabel.textContent = "GPT Request JSON";
+        const relayRequestInput = document.createElement("textarea");
+        relayRequestInput.rows = 6;
+        relayRequestInput.readOnly = true;
+        relayRequestInput.spellcheck = false;
+        relayRequestInput.dataset.mvbPromptRelayRequest = "";
+        relayRequestInput.value = promptRelayRequestJson(relay.request) || "Generate a request to preview its JSON.";
+        relayRequestField.append(relayRequestLabel, relayRequestInput);
+        relayRequestDisclosure.append(relayRequestSummary, relayRequestField);
+        promptContextSection.append(relayRequestDisclosure);
+        const deterministic = document.createElement("details");
+        deterministic.className = "mvb-prompt-deterministic mvb-prompt-context-disclosure";
+        const deterministicSummary = document.createElement("summary");
+        deterministicSummary.textContent = "View Deterministic Prompt";
+        const deterministicText = document.createElement("pre");
+        deterministicText.textContent = item.deterministic_prompt || item.error || "No deterministic prompt is available.";
+        deterministic.append(deterministicSummary, deterministicText);
+        promptContextSection.append(deterministic);
+        body.append(promptContextSection);
+        card.append(body);
+        list.append(card);
+        updatePromptRelayControls(root, item.scene_id, item.generation_method);
+    }
+    restorePromptViewport(root, promptViewport);
+}
+
+async function loadPromptCards(root, silent = false, options = {}) {
+    if (!isActive(root) || !builderState.currentProject) {
+        return false;
+    }
+    const promptViewport = options.promptViewport || capturePromptViewport(root, options.anchorSceneId);
+    const projectId = builderState.currentProject.project_id;
+    builderState.promptListState = "loading";
+    if (!silent) {
+        builderState.promptMessage = "";
+    }
+    renderPromptState(root, { promptViewport });
+    try {
+        const payload = await fetchJson(`${PROJECTS_PATH}/${encodeURIComponent(projectId)}/prompts`, {
+            method: "GET",
+            cache: "no-store",
+        });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        if (!payload || payload.project_id !== projectId || !Array.isArray(payload.scenes)) {
+            throw new Error("Prompt list response was invalid.");
+        }
+        // Refresh matching card items in place so DOM listeners that reference
+        // an item keep seeing authoritative data across silent refreshes.
+        const previousItems = new Map(
+            builderState.promptCards.map((entry) => [promptDraftKey(entry.scene_id, entry.generation_method), entry]),
+        );
+        builderState.promptCards = payload.scenes.map((entry) => {
+            const previous = previousItems.get(promptDraftKey(entry.scene_id, entry.generation_method));
+            if (!previous) {
+                return entry;
+            }
+            for (const staleKey of Object.keys(previous)) {
+                if (!(staleKey in entry)) {
+                    delete previous[staleKey];
+                }
+            }
+            Object.assign(previous, entry);
+            return previous;
+        });
+        for (const item of builderState.promptCards) {
+            const key = promptDraftKey(item.scene_id, item.generation_method);
+            if (builderState.promptDrafts[key] && !builderState.promptDrafts[key].dirty) {
+                builderState.promptDrafts[key].text = item.saved_final_prompt || "";
+                builderState.promptDrafts[key].sourceFingerprint = item.source_fingerprint;
+                builderState.promptDrafts[key].relayFingerprint = item.saved_relay_fingerprint || "";
+            }
+        }
+        builderState.promptListState = "ready";
+        builderState.promptListMessage = "";
+        return true;
+    } catch (error) {
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        console.error("[Music Video Builder] Prompt list request failed.", error);
+        builderState.promptListState = "error";
+        builderState.promptListMessage = error instanceof Error ? error.message : "Prompts could not be loaded.";
+        return false;
+    } finally {
+        if (isActive(root) && builderState.currentProject?.project_id === projectId) {
+            renderPromptState(root, { promptViewport });
+        }
+    }
+}
+
+async function copyPrompt(root, sceneId, generationMethod) {
+    const promptViewport = capturePromptViewport(root, sceneId);
+    const item = promptItemFor(sceneId, generationMethod);
+    const draft = item ? promptDraftFor(sceneId, generationMethod, item) : null;
+    if (!draft?.text) {
+        return;
+    }
+    try {
+        if (!navigator.clipboard?.writeText) {
+            throw new Error("Clipboard access is unavailable; select the visible prompt to copy it.");
+        }
+        await navigator.clipboard.writeText(draft.text);
+        builderState.promptMessage = "Prompt copied.";
+        builderState.promptMessageState = "success";
+    } catch (error) {
+        console.error("[Music Video Builder] Prompt copy failed.", error);
+        builderState.promptMessage = error instanceof Error ? error.message : "Prompt could not be copied.";
+        builderState.promptMessageState = "error";
+    }
+    renderPromptState(root, { promptViewport });
+}
+
+async function generatePromptRelayRequest(root, sceneId, generationMethod) {
+    if (!isActive(root) || builderState.operation || builderState.transitioning || builderState.closing) {
+        return;
+    }
+    const item = promptItemFor(sceneId, generationMethod);
+    if (!item) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    const promptViewport = capturePromptViewport(root, sceneId);
+    const relay = promptRelayFor(sceneId, generationMethod);
+    builderState.operation = "prompt-relay-request";
+    builderState.promptMessage = "";
+    renderProjectState(root, { promptViewport });
+    try {
+        const request = await fetchJson(promptPath(projectId, sceneId, "relay-request"), {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return;
+        }
+        const currentItem = promptItemFor(sceneId, generationMethod);
+        if (!request
+            || request.prompt_relay_request_version !== 1
+            || request.scene_id !== sceneId
+            || request.generation_method !== generationMethod
+            || request.request_fingerprint !== currentItem?.source_fingerprint) {
+            // Reconcile the prompt cards with the authoritative backend state
+            // so the next attempt compares against the current fingerprint.
+            void loadPromptCards(root, true);
+            throw new Error("Generated GPT request was invalid or stale.");
+        }
+        relay.request = request;
+        relay.responseMessage = "Request generated. Copy it into Vesper H3 Prompt Director.";
+        relay.responseMessageState = "success";
+    } catch (error) {
+        if (isActive(root) && builderState.currentProject?.project_id === projectId) {
+            console.error("[Music Video Builder] Custom GPT request generation failed.", error);
+            relay.responseMessage = error instanceof Error ? error.message : "GPT request could not be generated.";
+            relay.responseMessageState = "error";
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.operation = null;
+            renderProjectState(root, { promptViewport });
+        }
+    }
+}
+
+async function copyPromptRelayRequest(root, sceneId, generationMethod) {
+    const promptViewport = capturePromptViewport(root, sceneId);
+    const item = promptItemFor(sceneId, generationMethod);
+    const relay = promptRelayFor(sceneId, generationMethod);
+    if (!canCopyPromptRelayRequest(relay, item) || !isActive(root)) {
+        return;
+    }
+    try {
+        if (!navigator.clipboard?.writeText) {
+            throw new Error("Clipboard access is unavailable; select the visible request JSON to copy it.");
+        }
+        await navigator.clipboard.writeText(promptRelayRequestJson(relay.request));
+        relay.responseMessage = "REQUEST COPIED";
+        relay.responseMessageState = "success";
+    } catch (error) {
+        console.error("[Music Video Builder] Custom GPT request copy failed.", error);
+        relay.responseMessage = error instanceof Error ? error.message : "Request JSON could not be copied.";
+        relay.responseMessageState = "error";
+    }
+    renderPromptState(root, { promptViewport });
+}
+
+async function applyPromptRelayResponse(root, sceneId, generationMethod) {
+    if (!isActive(root) || builderState.operation || builderState.transitioning || builderState.closing) {
+        return;
+    }
+    const item = promptItemFor(sceneId, generationMethod);
+    const relay = promptRelayFor(sceneId, generationMethod);
+    if (!canApplyPromptRelayResponse(relay, item)) {
+        return;
+    }
+    let response;
+    try {
+        response = JSON.parse(relay.responseText);
+    } catch (error) {
+        relay.responseMessage = "GPT response is not valid JSON. Copy the raw JSON response again without Markdown or unescaped quotation marks.";
+        relay.responseMessageState = "error";
+        renderPromptState(root, { promptViewport: capturePromptViewport(root, sceneId) });
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    const promptViewport = capturePromptViewport(root, sceneId);
+    let changedCandidateApplied = false;
+    builderState.operation = "prompt-relay-apply";
+    builderState.promptMessage = "";
+    renderProjectState(root, { promptViewport });
+    try {
+        const result = await fetchJson(promptPath(projectId, sceneId, "relay-response"), {
+            method: "POST",
+            body: JSON.stringify(response),
+        });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return;
+        }
+        if (!result || typeof result.enhanced_prompt !== "string" || result.request_fingerprint !== item.source_fingerprint) {
+            throw new Error("Custom GPT response was invalid or stale.");
+        }
+        const currentItem = promptItemFor(sceneId, generationMethod);
+        if (!currentItem || currentItem.source_fingerprint !== item.source_fingerprint) {
+            throw new Error("Custom GPT response is stale. Generate a new request first.");
+        }
+        const draft = promptDraftFor(sceneId, generationMethod, currentItem);
+        draft.text = result.enhanced_prompt;
+        draft.sourceFingerprint = result.request_fingerprint;
+        draft.relayFingerprint = result.request_fingerprint;
+        draft.dirty = promptDraftIsDirty(currentItem, draft);
+        changedCandidateApplied = draft.dirty;
+        builderState.promptMessage = draft.dirty
+            ? "PROMPT DIRECTOR RESPONSE APPLIED — UNSAVED. Review and save the Final Prompt."
+            : "This Prompt Director response is already saved and current.";
+        builderState.promptMessageState = draft.dirty ? "warning" : "ready";
+        relay.responseMessage = draft.dirty
+            ? "Prompt Director response applied — UNSAVED. Review and save the Final Prompt."
+            : "This Prompt Director response is already saved and current.";
+        relay.responseMessageState = "success";
+    } catch (error) {
+        if (isActive(root) && builderState.currentProject?.project_id === projectId) {
+            console.error("[Music Video Builder] Custom GPT response validation failed.", error);
+            relay.responseMessage = error instanceof Error ? error.message : "Custom GPT response could not be applied.";
+            relay.responseMessageState = "error";
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.operation = null;
+            renderProjectState(root, { promptViewport });
+            if (changedCandidateApplied) {
+                window.requestAnimationFrame(() => revealPromptReviewSection(root, sceneId, generationMethod));
+            }
+        }
+    }
+}
+
+async function savePrompt(root, sceneId, generationMethod) {
+    if (!isActive(root) || builderState.operation || builderState.transitioning || builderState.closing) {
+        return;
+    }
+    const item = promptItemFor(sceneId, generationMethod);
+    const draft = item ? promptDraftFor(sceneId, generationMethod, item) : null;
+    if (!item || !canSavePromptDraft(item, draft)) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    const key = promptDraftKey(sceneId, generationMethod);
+    const promptViewport = capturePromptViewport(root, sceneId);
+    builderState.operation = "prompt-save";
+    builderState.promptMessage = "";
+    renderProjectState(root, { promptViewport });
+    let succeeded = false;
+    try {
+        const project = await fetchJson(promptPath(projectId, sceneId), {
+            method: "PUT",
+            body: JSON.stringify({
+                generation_method: generationMethod,
+                final_prompt: draft.text,
+                source_fingerprint: draft.sourceFingerprint,
+                relay_fingerprint: draft.relayFingerprint,
+            }),
+        });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId || !hasProjectDocument(project)) {
+            throw new Error("Prompt save response was invalid.");
+        }
+        setCurrentProject(root, project, { reconciledPromptKey: key });
+        // Reconcile the visible card with the authoritative save response so
+        // the badge and Final Prompt section never flash through a pre-save
+        // snapshot before the silent prompt-card refresh lands.
+        const savedRecord = project.prompts?.scenes
+            ?.find((entry) => entry.scene_id === sceneId)
+            ?.[generationMethod];
+        const savedItem = promptItemFor(sceneId, generationMethod);
+        if (savedRecord
+            && savedItem
+            && savedRecord.source_fingerprint === savedItem.source_fingerprint
+            && savedRecord.relay_fingerprint === savedItem.source_fingerprint) {
+            savedItem.saved_final_prompt = savedRecord.final_prompt;
+            savedItem.saved_source_fingerprint = savedRecord.source_fingerprint;
+            savedItem.saved_relay_fingerprint = savedRecord.relay_fingerprint;
+            savedItem.status = "current";
+            savedItem.source_validity = "current";
+            savedItem.relay_validity = "current";
+            savedItem.ready_for_render_prompt = Boolean(savedItem.visual_readiness?.ready);
+        }
+        builderState.activeView = "prompts";
+        builderState.promptMessage = "Prompt saved.";
+        builderState.promptMessageState = "success";
+        succeeded = true;
+        void loadProjectList(root);
+    } catch (error) {
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return;
+        }
+        console.error("[Music Video Builder] Prompt save failed.", error);
+        builderState.promptMessage = error instanceof Error
+            ? error.message
+            : "Prompt could not be saved.";
+        builderState.promptMessageState = "error";
+        if (String(builderState.promptMessage).includes("Scene inputs changed")) {
+            void loadPromptCards(root, true, { promptViewport });
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.operation = null;
+            if (!succeeded) {
+                builderState.promptListState = builderState.promptCards.length ? "ready" : builderState.promptListState;
+            }
+            renderProjectState(root, { promptViewport });
+            if (succeeded) {
+                void loadPromptCards(root, true, { promptViewport });
+            }
+        }
+    }
+}
+
 function closeResourceDialogs(root) {
     root.querySelector("[data-mvb-character-dialog]").hidden = true;
     root.querySelector("[data-mvb-location-dialog]").hidden = true;
+    if (builderState) {
+        builderState.characterDialogFiles = [];
+        builderState.locationDialogFiles = [];
+        builderState.characterDialogReferenceIds = [];
+        builderState.locationDialogReferenceIds = [];
+    }
 }
 
 function openCharacterDialog(root, character = null) {
@@ -1739,6 +2987,9 @@ function openCharacterDialog(root, character = null) {
     root.querySelector("[data-mvb-character-appearance]").value = character?.appearance || "";
     root.querySelector("[data-mvb-character-outfit]").value = character?.outfit || "";
     root.querySelector("[data-mvb-character-error]").hidden = true;
+    builderState.characterDialogFiles = [];
+    builderState.characterDialogReferenceIds = (character?.references || []).map((reference) => reference.reference_id);
+    renderResourceDialogReferences(root, "characters", character);
     dialog.hidden = false;
     window.requestAnimationFrame(() => root.querySelector("[data-mvb-character-name]").focus());
 }
@@ -1756,6 +3007,9 @@ function openLocationDialog(root, location = null) {
     root.querySelector("[data-mvb-location-name]").value = location?.name || "";
     root.querySelector("[data-mvb-location-description]").value = location?.description || "";
     root.querySelector("[data-mvb-location-error]").hidden = true;
+    builderState.locationDialogFiles = [];
+    builderState.locationDialogReferenceIds = (location?.references || []).map((reference) => reference.reference_id);
+    renderResourceDialogReferences(root, "locations", location);
     dialog.hidden = false;
     window.requestAnimationFrame(() => root.querySelector("[data-mvb-location-name]").focus());
 }
@@ -1780,11 +3034,12 @@ async function runResourceMutation(root, operation, task, failureMessage) {
         }
         setCurrentProject(root, project);
         builderState.activeView = activeView;
+        refreshOpenResourceDialog(root);
         builderState.deleteConfirm = null;
+        builderState.storyboardRequestStale = true;
+        builderState.storyboardAppliedStale = Boolean(project.storyboard?.scenes?.length);
         void loadProjectList(root);
-        if (project.storyboard?.scenes?.length) {
-            void loadStoryboardRequest(root, true);
-        }
+        void loadPromptCards(root, true);
         succeeded = true;
         return true;
     } catch (error) {
@@ -1805,6 +3060,66 @@ async function runResourceMutation(root, operation, task, failureMessage) {
     }
 }
 
+function findResource(project, kind, entityId) {
+    return kind === "characters"
+        ? findCharacter(project, entityId)
+        : findLocation(project, entityId);
+}
+
+async function rollbackUploadedResourceReferences(projectId, kind, entityId, referenceIds) {
+    for (const referenceId of [...referenceIds].reverse()) {
+        try {
+            await fetchJson(
+                `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/${kind}/${encodeURIComponent(entityId)}/references/${encodeURIComponent(referenceId)}`,
+                { method: "DELETE" },
+            );
+        } catch (error) {
+            console.error("[Music Video Builder] Resource reference rollback failed.", error);
+        }
+    }
+}
+
+async function saveExistingResourceDraft(projectId, kind, entityId, path, payload, retainedReferenceIds, pendingFiles) {
+    const currentEntity = findResource(builderState.currentProject, kind, entityId);
+    if (!currentEntity) {
+        throw new Error("The edited resource is no longer available.");
+    }
+    const knownReferenceIds = new Set(currentEntity.references.map((reference) => reference.reference_id));
+    const uploadedReferenceIds = [];
+    try {
+        for (const file of pendingFiles) {
+            const project = await uploadReferenceFile(projectId, kind, entityId, file);
+            if (!hasProjectDocument(project)) {
+                throw new Error("Resource reference response was invalid.");
+            }
+            const updatedEntity = findResource(project, kind, entityId);
+            const addedReferences = updatedEntity?.references.filter(
+                (reference) => !knownReferenceIds.has(reference.reference_id),
+            ) || [];
+            if (addedReferences.length !== 1) {
+                throw new Error("Resource reference identity could not be reconciled.");
+            }
+            const addedReferenceId = addedReferences[0].reference_id;
+            knownReferenceIds.add(addedReferenceId);
+            uploadedReferenceIds.push(addedReferenceId);
+        }
+        const project = await fetchJson(path, {
+            method: "PUT",
+            body: JSON.stringify({
+                ...payload,
+                reference_ids: [...retainedReferenceIds, ...uploadedReferenceIds],
+            }),
+        });
+        if (!hasProjectDocument(project)) {
+            throw new Error("Resource edit response was invalid.");
+        }
+        return project;
+    } catch (error) {
+        await rollbackUploadedResourceReferences(projectId, kind, entityId, uploadedReferenceIds);
+        throw error;
+    }
+}
+
 async function saveCharacter(root) {
     const form = root.querySelector("[data-mvb-character-form]");
     const errorElement = root.querySelector("[data-mvb-character-error]");
@@ -1819,10 +3134,47 @@ async function saveCharacter(root) {
         outfit: root.querySelector("[data-mvb-character-outfit]").value,
     };
     const path = `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/characters${characterId ? `/${encodeURIComponent(characterId)}` : ""}`;
+    const pendingFiles = [...builderState.characterDialogFiles];
+    const retainedReferenceIds = [...builderState.characterDialogReferenceIds];
     const saved = await runResourceMutation(
         root,
         "character",
-        () => fetchJson(path, { method: characterId ? "PUT" : "POST", body: JSON.stringify(payload) }),
+        async () => {
+            if (characterId) {
+                return saveExistingResourceDraft(
+                    projectId,
+                    "characters",
+                    characterId,
+                    path,
+                    payload,
+                    retainedReferenceIds,
+                    pendingFiles,
+                );
+            }
+            let project = await fetchJson(path, { method: characterId ? "PUT" : "POST", body: JSON.stringify(payload) });
+            if (!hasProjectDocument(project)) {
+                throw new Error("Character creation response was invalid.");
+            }
+            if (!characterId && pendingFiles.length) {
+                const created = project.characters[project.characters.length - 1];
+                try {
+                    for (const file of pendingFiles) {
+                        project = await uploadReferenceFile(projectId, "characters", created.character_id, file);
+                        if (!hasProjectDocument(project)) {
+                            throw new Error("Character reference response was invalid.");
+                        }
+                    }
+                } catch (error) {
+                    try {
+                        await fetchJson(`${PROJECTS_PATH}/${encodeURIComponent(projectId)}/characters/${encodeURIComponent(created.character_id)}`, { method: "DELETE" });
+                    } catch (rollbackError) {
+                        console.error("[Music Video Builder] Character creation rollback failed.", rollbackError);
+                    }
+                    throw error;
+                }
+            }
+            return project;
+        },
         "Character could not be saved.",
     );
     if (!saved && isActive(root)) {
@@ -1846,10 +3198,47 @@ async function saveLocation(root) {
         description: root.querySelector("[data-mvb-location-description]").value,
     };
     const path = `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/locations${locationId ? `/${encodeURIComponent(locationId)}` : ""}`;
+    const pendingFiles = [...builderState.locationDialogFiles];
+    const retainedReferenceIds = [...builderState.locationDialogReferenceIds];
     const saved = await runResourceMutation(
         root,
         "location",
-        () => fetchJson(path, { method: locationId ? "PUT" : "POST", body: JSON.stringify(payload) }),
+        async () => {
+            if (locationId) {
+                return saveExistingResourceDraft(
+                    projectId,
+                    "locations",
+                    locationId,
+                    path,
+                    payload,
+                    retainedReferenceIds,
+                    pendingFiles,
+                );
+            }
+            let project = await fetchJson(path, { method: locationId ? "PUT" : "POST", body: JSON.stringify(payload) });
+            if (!hasProjectDocument(project)) {
+                throw new Error("Location creation response was invalid.");
+            }
+            if (!locationId && pendingFiles.length) {
+                const created = project.locations[project.locations.length - 1];
+                try {
+                    for (const file of pendingFiles) {
+                        project = await uploadReferenceFile(projectId, "locations", created.location_id, file);
+                        if (!hasProjectDocument(project)) {
+                            throw new Error("Location reference response was invalid.");
+                        }
+                    }
+                } catch (error) {
+                    try {
+                        await fetchJson(`${PROJECTS_PATH}/${encodeURIComponent(projectId)}/locations/${encodeURIComponent(created.location_id)}`, { method: "DELETE" });
+                    } catch (rollbackError) {
+                        console.error("[Music Video Builder] Location creation rollback failed.", rollbackError);
+                    }
+                    throw error;
+                }
+            }
+            return project;
+        },
         "Location could not be saved.",
     );
     if (!saved && isActive(root)) {
@@ -1861,30 +3250,10 @@ async function saveLocation(root) {
     }
 }
 
-async function uploadReference(root, kind, entityId, file) {
-    const projectId = builderState.currentProject.project_id;
-    await runResourceMutation(
-        root,
-        "reference",
-        () => fetchJson(
-            `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/${kind}/${encodeURIComponent(entityId)}/references`,
-            { method: "POST", body: uploadFormData(file) },
-        ),
-        "Reference image is invalid or could not be saved.",
-    );
-}
-
-async function removeReference(root, kind, entity, reference) {
-    const entityId = entity[kind === "characters" ? "character_id" : "location_id"];
-    const projectId = builderState.currentProject.project_id;
-    await runResourceMutation(
-        root,
-        "reference",
-        () => fetchJson(
-            `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/${kind}/${encodeURIComponent(entityId)}/references/${encodeURIComponent(reference.reference_id)}`,
-            { method: "DELETE" },
-        ),
-        "Reference could not be removed.",
+function uploadReferenceFile(projectId, kind, entityId, file) {
+    return fetchJson(
+        `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/${kind}/${encodeURIComponent(entityId)}/references`,
+        { method: "POST", body: uploadFormData(file) },
     );
 }
 
@@ -1905,12 +3274,16 @@ function switchView(root, view) {
     if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
         return;
     }
-    if (view !== "setup" && view !== "storyboard" && view !== "visuals") {
+    if (view !== "setup" && view !== "storyboard" && view !== "visuals" && view !== "prompts") {
         return;
     }
+    clearGptLauncherErrors();
     builderState.activeView = view;
     builderState.deleteConfirm = null;
     renderProjectState(root);
+    if (view === "prompts") {
+        void loadPromptCards(root);
+    }
 }
 
 function renderProjectState(root, options = {}) {
@@ -1919,6 +3292,8 @@ function renderProjectState(root, options = {}) {
     }
 
     const state = builderState;
+    const promptViewport = options.promptViewport
+        || (state.activeView === "prompts" ? capturePromptViewport(root, options.promptAnchorSceneId) : null);
     renderMaximizeState(root);
     const currentProject = state.currentProject;
     const landingHeader = root.querySelector("[data-mvb-landing-header]");
@@ -1930,6 +3305,7 @@ function renderProjectState(root, options = {}) {
     const sceneReview = root.querySelector("[data-mvb-scene-review]");
     const storyboard = root.querySelector("[data-mvb-storyboard]");
     const visuals = root.querySelector("[data-mvb-visuals]");
+    const prompts = root.querySelector("[data-mvb-prompts]");
     const nameInput = root.querySelector("[data-mvb-project-name]");
     const saveButton = root.querySelector("[data-mvb-save]");
     const projectsButton = root.querySelector("[data-mvb-projects]");
@@ -1948,6 +3324,7 @@ function renderProjectState(root, options = {}) {
         setupView.hidden = true;
         storyboard.hidden = true;
         visuals.hidden = true;
+        prompts.hidden = true;
         setup.hidden = true;
         sceneReview.hidden = true;
         nameInput.value = "";
@@ -1963,6 +3340,7 @@ function renderProjectState(root, options = {}) {
         setupView.hidden = state.activeView !== "setup";
         storyboard.hidden = state.activeView !== "storyboard";
         visuals.hidden = state.activeView !== "visuals";
+        prompts.hidden = state.activeView !== "prompts";
         setup.hidden = false;
         sceneReview.hidden = false;
         if (nameInput.value !== currentProject.name) {
@@ -1995,10 +3373,12 @@ function renderProjectState(root, options = {}) {
         renderSetupState(root);
         renderStoryboardState(root);
         renderVisualsState(root, options.visualViewport || null);
+        renderPromptState(root, { promptViewport });
     } else {
         renderSceneReview(root);
         renderStoryboardState(root);
         renderVisualsState(root, options.visualViewport || null);
+        renderPromptState(root, { promptViewport });
     }
 }
 
@@ -2484,7 +3864,7 @@ async function openNewProjectDialog(root) {
 
     builderState.transitioning = true;
     try {
-        if (!await flushCurrentProject(root)) {
+        if (!await flushProjectTransition(root)) {
             return;
         }
         if (!isActive(root)) {
@@ -2604,7 +3984,7 @@ async function openProject(root, projectId) {
     builderState.transitioning = true;
     renderOpenProjectList(root);
     try {
-        if (!await flushCurrentProject(root)) {
+        if (!await flushProjectTransition(root)) {
             closeProjectDialogs(root);
             return;
         }
@@ -2683,6 +4063,7 @@ async function runProjectMutation(root, operation, task, successMessage) {
         builderState.setupMessage = successMessage;
         succeeded = true;
         void loadProjectList(root);
+        void loadPromptCards(root, true);
         return true;
     } catch (error) {
         if (!isActive(root)) {
@@ -2788,7 +4169,8 @@ async function loadStoryboardRequest(root, silent = false) {
             throw new Error("Storyboard request response was invalid.");
         }
         builderState.storyboardRequest = request;
-        builderState.storyboardRequestStale = Boolean(builderState.currentProject.storyboard?.scenes?.length)
+        builderState.storyboardRequestStale = false;
+        builderState.storyboardAppliedStale = Boolean(builderState.currentProject.storyboard?.scenes?.length)
             && builderState.currentProject.storyboard.request_fingerprint !== request.request_fingerprint;
         if (!silent) {
             setStoryboardRelayMessage("Request refreshed.");
@@ -2831,7 +4213,8 @@ async function generateStoryboardRequest(root) {
             throw new Error("Storyboard request response was invalid.");
         }
         builderState.storyboardRequest = request;
-        builderState.storyboardRequestStale = Boolean(builderState.currentProject.storyboard?.scenes?.length)
+        builderState.storyboardRequestStale = false;
+        builderState.storyboardAppliedStale = Boolean(builderState.currentProject.storyboard?.scenes?.length)
             && builderState.currentProject.storyboard.request_fingerprint !== request.request_fingerprint;
         builderState.storyboardResponseText = "";
         builderState.storyboardPreview = null;
@@ -2853,16 +4236,19 @@ async function generateStoryboardRequest(root) {
 }
 
 async function copyStoryboardRequest(root) {
-    if (!isActive(root) || !builderState.storyboardRequest) {
+    if (!isActive(root) || !canCopyStoryboardRequest(
+        builderState.storyboardRequest,
+        builderState.storyboardRequestStale,
+    )) {
         return;
     }
-    const requestJson = JSON.stringify(builderState.storyboardRequest, null, 2);
+    const requestJson = storyboardRequestJson(builderState.storyboardRequest);
     try {
         if (!navigator.clipboard?.writeText) {
             throw new Error("Clipboard access is unavailable; select the visible request JSON to copy it.");
         }
         await navigator.clipboard.writeText(requestJson);
-        setStoryboardRelayMessage("Request JSON copied.");
+        setStoryboardRelayMessage("REQUEST COPIED");
     } catch (error) {
         console.error("[Music Video Builder] Storyboard request copy failed.", error);
         setStoryboardRelayMessage(error instanceof Error
@@ -2952,8 +4338,10 @@ async function applyStoryboard(root) {
         setCurrentProject(root, project);
         builderState.storyboardRequest = request;
         builderState.storyboardRequestStale = false;
+        builderState.storyboardAppliedStale = false;
         setStoryboardRelayMessage("Storyboard applied.");
         void loadProjectList(root);
+        void loadPromptCards(root, true);
     } catch (error) {
         if (!isActive(root)) {
             return;
@@ -3005,6 +4393,7 @@ async function clearAppliedStoryboard(root) {
         setCurrentProject(root, project);
         setStoryboardRelayMessage("Storyboard cleared.");
         closeStoryboardClearDialog(root);
+        void loadPromptCards(root, true);
     } catch (error) {
         if (!isActive(root)) {
             return;
@@ -3019,6 +4408,63 @@ async function clearAppliedStoryboard(root) {
             renderProjectState(root);
         }
     }
+}
+
+async function flushPromptDrafts(root) {
+    if (!isActive(root) || !builderState.currentProject) {
+        return true;
+    }
+    const dirtyKeys = Object.entries(builderState.promptDrafts || {})
+        .filter(([, draft]) => Boolean(draft?.dirty))
+        .map(([key]) => key);
+    for (const key of dirtyKeys) {
+        if (!isActive(root) || !builderState.currentProject) {
+            return false;
+        }
+        const [sceneId, generationMethod] = key.split(":");
+        const draft = builderState.promptDrafts[key];
+        if (!draft || !["keyframe_i2v", "reference2video"].includes(generationMethod)) {
+            builderState.saveState = "error";
+            builderState.saveMessage = "Prompt draft could not be identified — retry Save Prompt";
+            return false;
+        }
+        try {
+            const projectId = builderState.currentProject.project_id;
+            const project = await fetchJson(promptPath(projectId, sceneId), {
+                method: "PUT",
+                body: JSON.stringify({
+                    generation_method: generationMethod,
+                    final_prompt: draft.text,
+                    source_fingerprint: draft.sourceFingerprint,
+                    relay_fingerprint: draft.relayFingerprint,
+                }),
+            });
+            if (!isActive(root) || builderState.currentProject?.project_id !== projectId || !hasProjectDocument(project)) {
+                return false;
+            }
+            setCurrentProject(root, project, { reconciledPromptKey: key });
+        } catch (error) {
+            if (!isActive(root)) {
+                return false;
+            }
+            const message = error instanceof Error ? error.message : "";
+            const unsavableDraft = message.includes("Scene inputs changed")
+                || message.includes("current Prompt Director response must be applied");
+            if (unsavableDraft) {
+                // A stale draft cannot be persisted against changed scene
+                // inputs; keep the saved prompt untouched and continue the
+                // transition instead of deadlocking on prompt readiness.
+                continue;
+            }
+            console.error("[Music Video Builder] Prompt draft flush failed.", error);
+            builderState.saveState = "error";
+            builderState.saveMessage = error instanceof Error
+                ? error.message
+                : "Prompt draft could not be saved — retry Save Prompt";
+            return false;
+        }
+    }
+    return true;
 }
 
 function scheduleAutosave(root) {
@@ -3137,17 +4583,26 @@ async function flushCurrentProject(root) {
         const state = builderState;
         const hadPendingTimer = state.autosaveTimer !== null;
         cancelAutosave(root);
-        if (!hadPendingTimer && !hasPendingProjectSave(state)) {
-            return true;
+        if (hadPendingTimer || hasPendingProjectSave(state)) {
+            const saved = await saveCurrentProject(root);
+            if (!isActive(root) || !saved) {
+                return false;
+            }
         }
-
-        const saved = await saveCurrentProject(root);
-        if (!isActive(root) || !saved) {
-            return false;
-        }
+        return true;
     }
 
     return isActive(root);
+}
+
+async function flushProjectTransition(root) {
+    if (!await flushCurrentProject(root)) {
+        return false;
+    }
+    if (hasUnsavedPromptDrafts(builderState)) {
+        return await flushPromptDrafts(root);
+    }
+    return true;
 }
 
 async function checkBackend(root) {
@@ -3249,6 +4704,7 @@ function openBuilder() {
                     <button class="mvb-view-button" data-mvb-view="setup" type="button" role="tab" aria-selected="true">Setup</button>
                     <button class="mvb-view-button" data-mvb-view="storyboard" type="button" role="tab" aria-selected="false">Storyboard</button>
                     <button class="mvb-view-button" data-mvb-view="visuals" type="button" role="tab" aria-selected="false">Visuals</button>
+                    <button class="mvb-view-button" data-mvb-view="prompts" type="button" role="tab" aria-selected="false">Prompts</button>
                 </nav>
 
                 <section class="mvb-landing" data-mvb-landing aria-labelledby="mvb-landing-heading" hidden>
@@ -3374,6 +4830,19 @@ function openBuilder() {
                     <div class="mvb-visual-scenes" data-mvb-visual-scenes></div>
                 </section>
 
+                <section class="mvb-prompts" data-mvb-prompts aria-labelledby="mvb-prompts-heading" hidden>
+                    <div class="mvb-prompts-heading">
+                        <div>
+                            <p class="mvb-eyebrow">Prompts</p>
+                            <h2 id="mvb-prompts-heading">Final Prompts</h2>
+                        </div>
+                        <span class="mvb-prompt-status-message" data-mvb-prompt-status aria-live="polite"></span>
+                    </div>
+                    <p class="mvb-prompt-intro">Generate, copy, open, paste, and apply each scene request, then review and save its Final Prompt.</p>
+                    <p class="mvb-prompt-empty" data-mvb-prompt-empty hidden>Build scenes before preparing Prompts.</p>
+                    <div class="mvb-prompt-scenes" data-mvb-prompt-scenes></div>
+                </section>
+
                 <section class="mvb-storyboard" data-mvb-storyboard aria-labelledby="mvb-storyboard-heading" hidden>
                     <div class="mvb-storyboard-heading">
                         <div>
@@ -3439,12 +4908,16 @@ function openBuilder() {
                             <div class="mvb-relay-actions">
                                 <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-generate-request type="button">Generate / Refresh Request</button>
                                 <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-copy-request type="button" disabled>Copy Request JSON</button>
+                                <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-storyboard-open-gpt type="button" aria-label="Open Vesper Storyboard Director" title="Vesper Storyboard Director">Open GPT</button>
                             </div>
                         </div>
-                        <label class="mvb-field mvb-relay-json-field">
-                            <span>Request JSON</span>
-                            <textarea data-mvb-request-json rows="8" readonly spellcheck="false">Generate a request to preview its JSON.</textarea>
-                        </label>
+                        <details class="mvb-relay-disclosure">
+                            <summary>View Request JSON</summary>
+                            <label class="mvb-field mvb-relay-json-field">
+                                <span>Request JSON</span>
+                                <textarea data-mvb-request-json rows="8" readonly spellcheck="false">Generate a request to preview its JSON.</textarea>
+                            </label>
+                        </details>
                         <div class="mvb-relay-response-heading">
                             <label class="mvb-field mvb-relay-json-field">
                                 <span>Paste response JSON</span>
@@ -3533,7 +5006,7 @@ function openBuilder() {
                 </section>
             </div>
 
-            <div class="mvb-modal-backdrop" data-mvb-character-dialog hidden>
+             <div class="mvb-modal-backdrop" data-mvb-character-dialog hidden>
                 <section class="mvb-dialog" role="dialog" aria-modal="true" aria-labelledby="mvb-character-dialog-heading">
                     <div class="mvb-dialog-heading">
                         <div>
@@ -3559,11 +5032,12 @@ function openBuilder() {
                             <span>Appearance</span>
                             <textarea data-mvb-character-appearance rows="3" maxlength="5000"></textarea>
                         </label>
-                        <label class="mvb-field">
-                            <span>Outfit</span>
-                            <textarea data-mvb-character-outfit rows="3" maxlength="5000"></textarea>
-                        </label>
-                        <p class="mvb-dialog-error" data-mvb-character-error role="alert" hidden></p>
+                         <label class="mvb-field">
+                             <span>Outfit</span>
+                             <textarea data-mvb-character-outfit rows="3" maxlength="5000"></textarea>
+                         </label>
+                         <div class="mvb-resource-dialog-references" data-mvb-character-references></div>
+                         <p class="mvb-dialog-error" data-mvb-character-error role="alert" hidden></p>
                         <div class="mvb-dialog-actions">
                             <button class="mvb-button mvb-button-secondary" data-mvb-cancel-character type="button">Cancel</button>
                             <button class="mvb-button mvb-button-primary" data-mvb-character-submit type="submit">Add Character</button>
@@ -3586,11 +5060,12 @@ function openBuilder() {
                             <span>Name</span>
                             <input data-mvb-location-name type="text" maxlength="200" autocomplete="off" required>
                         </label>
-                        <label class="mvb-field">
-                            <span>Description</span>
-                            <textarea data-mvb-location-description rows="5" maxlength="5000"></textarea>
-                        </label>
-                        <p class="mvb-dialog-error" data-mvb-location-error role="alert" hidden></p>
+                         <label class="mvb-field">
+                             <span>Description</span>
+                             <textarea data-mvb-location-description rows="5" maxlength="5000"></textarea>
+                         </label>
+                         <div class="mvb-resource-dialog-references" data-mvb-location-references></div>
+                         <p class="mvb-dialog-error" data-mvb-location-error role="alert" hidden></p>
                         <div class="mvb-dialog-actions">
                             <button class="mvb-button mvb-button-secondary" data-mvb-cancel-location type="button">Cancel</button>
                             <button class="mvb-button mvb-button-primary" data-mvb-location-submit type="submit">Add Location</button>
@@ -3638,17 +5113,32 @@ function openBuilder() {
         storyboardMessage: "",
         storyboardRequest: null,
         storyboardRequestStale: false,
+        storyboardAppliedStale: false,
         storyboardResponseText: "",
         storyboardPreview: null,
-        storyboardRelayMessage: "",
-        storyboardRelayState: "ready",
-        visualDrafts: {},
+         storyboardRelayMessage: "",
+         storyboardRelayState: "ready",
+         characterDialogFiles: [],
+         locationDialogFiles: [],
+         characterDialogReferenceIds: [],
+         locationDialogReferenceIds: [],
+         visualDrafts: {},
         visualExpandedScenes: {},
         visualBulkMethod: "keyframe_i2v",
-        visualRemoveTarget: null,
-        visualMessage: "",
-        visualMessageState: "ready",
-        activeView: "setup",
+         visualRemoveTarget: null,
+         visualMessage: "",
+         visualMessageState: "ready",
+         promptCards: [],
+         promptListState: "empty",
+         promptListMessage: "",
+         promptDrafts: {},
+         promptExpandedScenes: {},
+         promptMessage: "",
+         promptMessageState: "ready",
+         promptRelay: {},
+         promptRelayExpanded: {},
+         gptLaunchInFlight: false,
+         activeView: "setup",
         deleteConfirm: null,
         newProjectBusy: false,
         openingProject: false,
@@ -3796,6 +5286,7 @@ function openBuilder() {
     });
     requestButton.addEventListener("click", () => void generateStoryboardRequest(root));
     copyRequestButton.addEventListener("click", () => void copyStoryboardRequest(root));
+    root.querySelector("[data-mvb-storyboard-open-gpt]").addEventListener("click", () => void openDedicatedGpt(root, "storyboard"));
     validateResponseButton.addEventListener("click", () => void validateStoryboardResponseInput(root));
     clearPasteButton.addEventListener("click", () => {
         builderState.storyboardResponseText = "";

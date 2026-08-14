@@ -23,6 +23,7 @@ from backend.source import (
     import_master_audio,
     SrtValidationError,
 )
+from backend.projects import default_prompts_for_scenes
 from backend.visuals import default_visuals_for_scenes
 
 
@@ -70,6 +71,7 @@ class Phase2TestCase(unittest.TestCase):
             },
             "scenes": resolved_scenes,
             "visuals": default_visuals_for_scenes(resolved_scenes),
+            "prompts": default_prompts_for_scenes(resolved_scenes),
         }
 
 
@@ -88,7 +90,7 @@ class ProjectSchemaV2Tests(Phase2TestCase):
 
         loaded = self.storage.load_project(project["project_id"])
 
-        self.assertEqual(loaded["schema_version"], 5)
+        self.assertEqual(loaded["schema_version"], 7)
         self.assertEqual(loaded["project_id"], legacy["project_id"])
         self.assertEqual(loaded["created_at"], legacy["created_at"])
         self.assertEqual(loaded["updated_at"], legacy["updated_at"])
@@ -112,15 +114,16 @@ class ProjectSchemaV2Tests(Phase2TestCase):
 
         saved = self.storage.save_project(project["project_id"], {**legacy, "name": "Upgraded"})
 
-        self.assertEqual(saved["schema_version"], 5)
+        self.assertEqual(saved["schema_version"], 7)
         self.assertEqual(saved["name"], "Upgraded")
-        self.assertEqual(json.loads(project_file.read_text(encoding="utf-8"))["schema_version"], 5)
+        self.assertEqual(json.loads(project_file.read_text(encoding="utf-8"))["schema_version"], 7)
 
     def test_invalid_current_source_and_scene_data_is_rejected(self):
         project = self.storage.create_project("Invalid v2")
         valid = self._source_document(project, duration_ms=10_001)
         valid["scenes"] = build_scenes([], 10_001)
         valid["visuals"] = default_visuals_for_scenes(valid["scenes"])
+        valid["prompts"] = default_prompts_for_scenes(valid["scenes"])
         self.assertEqual(validate_project_document(valid), valid)
 
         invalid_source = self._source_document(project, duration_ms=0)
@@ -729,7 +732,12 @@ class SceneConstructionTests(unittest.TestCase):
         )
         project = storage.save_project(
             project["project_id"],
-            {**project, "scenes": prior_scenes, "visuals": default_visuals_for_scenes(prior_scenes)},
+            {
+                **project,
+                "scenes": prior_scenes,
+                "visuals": default_visuals_for_scenes(prior_scenes),
+                "prompts": default_prompts_for_scenes(prior_scenes),
+            },
             allow_visuals_change=True,
         )
         lyrics_path = storage.project_directory(project["project_id"]) / "source" / "lyrics.srt"
@@ -820,7 +828,12 @@ class SourceImportTests(Phase2TestCase):
         )
         project = self.storage.save_project(
             project["project_id"],
-            {**project, "scenes": scenes, "visuals": default_visuals_for_scenes(scenes)},
+            {
+                **project,
+                "scenes": scenes,
+                "visuals": default_visuals_for_scenes(scenes),
+                "prompts": default_prompts_for_scenes(scenes),
+            },
             allow_visuals_change=True,
         )
         old_audio_bytes = (self.projects_root / project["project_id"] / "source" / "master_audio.wav").read_bytes()
@@ -849,6 +862,7 @@ class SourceImportTests(Phase2TestCase):
                 **replaced_audio,
                 "scenes": replacement_scenes,
                 "visuals": default_visuals_for_scenes(replacement_scenes),
+                "prompts": default_prompts_for_scenes(replacement_scenes),
             },
             allow_visuals_change=True,
         )

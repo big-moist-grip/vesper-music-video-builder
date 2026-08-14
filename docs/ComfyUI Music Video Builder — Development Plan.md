@@ -301,7 +301,7 @@ retain an over-capacity legacy selection remain not-ready until corrected.
 
 ## Stage G — H3 prompt generation
 
-Final H3 prompts branch by the scene's `generation_method`.
+Final prompts branch by the scene's `generation_method`.
 
 For `keyframe_i2v`, prompt construction uses:
 
@@ -328,22 +328,24 @@ For `reference2video`, prompt construction uses:
 
 Both paths produce one final editable H3 prompt string before render.
 
-### Prompt-helper architecture
+### Prompt-relay architecture
 
-Prompt generation may use a local text LLM through Ollama.
+Prompt generation uses the following local, deterministic pipeline:
 
-Ollama is:
+`deterministic method-specific compiler`
+`-> optional manual Custom GPT relay`
+`-> strict response validation`
+`-> machine reassembly`
+`-> editable final prompt`
 
-- Localhost only.
-- Optional.
-- Separate from the H3 render workflow.
-- Run before video generation.
+The Builder never executes a language model, automates browser interaction, or
+calls a cloud LLM API.  The optional Custom GPT relay is a user-operated copy
+and paste workflow using a versioned request/response contract.  The H3 render
+graph always receives a completed prompt string.
 
-The H3 render graph always receives a completed prompt string.
-
-Do not run an LLM inside every H3 render.
-
-If Ollama is disabled/unavailable, builder must still support deterministic template-generated prompts and manual editing.
+The deterministic compiler remains available as internal diagnostic context,
+but a current validated Prompt Director response is required before a Final
+Prompt can be saved as current.
 
 The final editable prompt stored in the scene is authoritative.
 
@@ -546,7 +548,7 @@ Reference for:
 - 16 GB-class VRAM handling.
 - H3 sigma-shift relationships if applicable.
 
-Do not execute Ollama as part of the render graph.
+Do not execute a language model as part of the render graph.
 
 Do not retain seamless-loop or interpolation functionality unless explicitly added by Sol later.
 
@@ -577,7 +579,7 @@ Do not use it as the builder workflow.
 MVP Reference-to-Video adopts only the qualified still-image REF2VA subset plus the authoritative scene-audio path. Video-reference/motion-transfer UI remains excluded.
 
 `minimaxh3Auto_v5` is a prompt-grammar/research donor only. Do not inherit its
-ComfyUI LLM graph, Qwen3.6 GGUF or Qwen3.5 9B requirements, three-image helper
+ComfyUI prompt-generation graph, Qwen3.6 GGUF or Qwen3.5 9B requirements, three-image helper
 limitation, TextGenerate render nodes, rgthree switching, Pixaroma,
 video-reference support, additional audio-reference UI, concept-expansion UI,
 or EasyUse dependencies. Its useful contribution is structured H3 prompt
@@ -707,7 +709,7 @@ Potential final dependencies are expected to include only the minimum required s
 - H3 acceleration node(s) that survive benchmarking.
 - NVIDIA RTX nodes if RTX VSR is enabled.
 - SeedVR2 nodes only if SeedVR2 survives qualification.
-- Ollama availability only when prompt assistance is enabled.
+- Manual Custom GPT relay operation is outside the local runtime dependency scan.
 
 Avoid rgthree/EasyUse/KJ convenience nodes in the production graph when the same operation can be implemented directly or through core nodes.
 
@@ -1450,7 +1452,7 @@ evidence only.
 
 ---
 
-## PHASE 7 — Requirement checker + deterministic H3 prompt compiler
+## PHASE 7 — Requirement checker + H3 prompt service
 
 Implement:
 
@@ -1459,19 +1461,66 @@ Implement:
 - FFmpeg scan.
 - Optional RTX VSR scan.
 - Optional SeedVR2 scan.
-- Optional Ollama scan.
+- Keep the requirements checker as an internal backend service rather than a
+  permanent Setup dashboard. Later render preflight may consume it to report
+  actionable missing-node, missing-model, and tool diagnostics at the point
+  they matter.
 - A deterministic method-specific H3 prompt compiler as the authoritative
-  machine-fact layer.
-- Optional local LLM enhancement after deterministic compilation.
-- A user-editable final authoritative prompt.
+  machine-fact layer and diagnostic preview.
+- A mandatory manual Prompt Director relay after deterministic compilation,
+  with strict response validation and machine-owned structural reassembly.
+- A user-editable Final Prompt derived from a current validated Prompt Director
+  response. The deterministic preview is not a user-selectable final-prompt
+  path.
+- The Prompts workspace is the Phase 7 user-facing prompt-relay surface; the
+  requirements checker remains an internal backend service for future render
+  preflight and actionable diagnostics.
+- Schema version 7 prompt persistence, with method-specific prompt state for
+  every current scene: `keyframe_i2v` and `reference2video` each store exactly
+  `final_prompt`, `source_fingerprint`, and `relay_fingerprint`.
+- Computed `NEEDS GPT`, `UNSAVED`, `CURRENT`, and `STALE` prompt status.
+  A Final Prompt is render-ready only when the saved source and relay
+  fingerprints both match the current deterministic source fingerprint and no
+  unsaved local edit exists. Readiness remains derived rather than persisted.
+- Narrow schema-v6 normalization preserves its existing prompt text and source
+  fingerprint while initializing `relay_fingerprint` to empty. It does not
+  infer Prompt Director provenance or mutate a project merely by listing or
+  loading it. Existing v1-v5 compatibility continues to normalize through the
+  established empty/current prompt-state rules.
 
 Do not report dependencies inherited from unused donor branches.
 
 The Phase 7 prompt pipeline is:
 
 `deterministic method-specific H3 prompt compiler`
-`-> optional local LLM enhancement`
+`-> mandatory Prompt Director relay`
+`-> strict response validation`
+`-> machine reassembly`
 `-> user-editable final authoritative prompt`
+
+The saved Final Prompt is authoritative only after a current Prompt Director
+response has been applied and the user explicitly saves it. Applying a valid
+response records its request fingerprint as relay provenance and produces an
+`UNSAVED` draft, including when its text happens to equal previously saved
+text but the prior record lacked provenance. Saving cannot acknowledge a stale
+prompt: when authoritative scene inputs change, a fresh request and matching
+Prompt Director response are required before the Final Prompt can be saved as
+`CURRENT`. Prompt state is saved through a method-scoped,
+current-fingerprint-checked mutation; it is not inferred from deterministic
+previews.
+
+The Prompt Director receives a lean, deterministic JSON payload of
+creative context and selected owner facts. It does not receive the assembled
+deterministic prompt or the completed six-section/I2VA wrapper. For
+`reference2video`, the relay may use exact supplied `<Subject N>` tags naturally
+in bounded creative prose, but the Builder owns Subject numbering, Picture
+ownership, retention, Audio, section headings, `[Shot 1]`, and final machine
+reassembly. Exact supplied lyric text is also machine-owned: the relay may use
+the lyric as read-only performance context and describe delivery, breath,
+expression, and movement, but it must not repeat or quote the lyric in
+`enhanced_description`. The accepted response shape is strict bounded response
+JSON, not a copy of the request; embedded quotation marks in JSON strings must
+be escaped. Applying a response does not save a Final Prompt by itself.
 
 The deterministic compiler must supply for both generation methods:
 
@@ -1488,28 +1537,56 @@ The deterministic compiler must supply for both generation methods:
 For `reference2video`, the compiler must additionally supply ordered
 `<Picture N>` and `<Subject N>` relationships, Character/Location ownership,
 stable Subject reuse for multiple Pictures from one owner, and the
-`<Audio 1>` relationship. An LLM may improve wording and detail but must not
-invent, renumber, or reassign these structural facts.
+`<Audio 1>` relationship. The Prompt Director may improve bounded wording
+and detail but must not invent, renumber, or reassign these structural facts.
 
-The REF2VA prompt structure should be evaluated around these deterministic
-fields, informed by Auto-Prompter v5 without copying its prose or examples:
+The canonical REF2VA Final Prompt contains exactly these six sections in this
+order, with each heading on its own line and exactly one blank line between
+sections:
 
-- `subject_definitions` — machine-generated Picture/Subject/Audio relationships.
-- `summary` — concise generation intent.
+- `subject_definitions` — one natural machine-generated definition per Subject,
+  combining its Character or Location identity, ordered Picture ownership, and
+  relevant continuity context. Its Audio definition states that `<Audio 1>` is
+  the authoritative master-song scene-audio segment supplied for the target
+  video; `fully_copy` belongs only in retention analysis.
+- `summary` — concise generation intent beginning with the canonical
+  `[reference generation + audio reuse]` task prefix.
 - `retention_analysis` — explicit preservation relationships for supplied
-  reference assets.
-- `detailed_description` — actual scene/action/camera/motion description,
-  normally one continuous shot, with timestamps only for genuine timed state
-  or action changes.
+  reference assets using canonical entries such as
+  `<Subject N> (appears in [Shot 1]): fully_preserved - ...` and
+  `<Audio 1>: fully_copy - ...`.
+- `detailed_description` — a Builder-owned grounded visual/style opening,
+  followed by a blank line and one Builder-owned `[Shot 1]` wrapper. The
+  validated Prompt Director creative prose is inserted intact after that
+  wrapper. One scene remains one continuous shot unless authoritative project
+  data explicitly establishes another shot.
 - `overall_soundscape` — only relevant diegetic/environmental sound
   requirements.
 - `non_diegetic_music` — the supplied authoritative scene-audio relationship.
 
-For `keyframe_i2v`, the accepted keyframe remains the authoritative opening
-state at 0.00 seconds. The compiler conveys its actual description, scene
-action, camera, motion, continuity, exact duration, and relevant audio or
-performance relationship. It does not add REF2VA Picture/Subject labels or
-`<Audio N>` tags merely because that syntax exists for REF2VA.
+For `keyframe_i2v`, the Builder uses I2VA semantics because it supplies one
+authoritative accepted first frame. The final assembled prompt begins with:
+
+`For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.`
+
+After exactly one blank line it uses
+`integrated_multimodal_description: [Shot 1] ...`, then
+`overall_soundscape:` and `non_diegetic_music:` in that order, with exactly one
+blank line between the three fields. `<Picture 1>` is the accepted keyframe;
+its actual description owns the visible opening state. The Builder owns the
+opening sentence, field labels, `[Shot 1]` wrapper, duration, opening authority,
+soundscape, and music/audio relationship. Validated Prompt Director prose is
+inserted intact only into the integrated description after the machine-owned
+opening-state and continuity boundaries. The prompt does not add REF2VA
+Subject/Audio labels.
+
+For a visible performer singing supplied lyrics, the compiler may include the
+exact supplied lyric in the performance context using a stable speaker ID and
+MiniMax dialogue syntax such as `Vesper (S1) sings: <d>[English] ...</d>`.
+Narrative lyrics are not turned into dialogue, and instrumental scenes receive
+no invented vocal content. In REF2VA `retention_analysis`, Character and
+Location Subjects use the machine-owned `fully_preserved` relationship and
+the authoritative `<Audio 1>` uses `fully_copy`.
 
 The master song remains authoritative. The prompt system must not invent
 lyrics, dialogue, vocal words, soundtrack, music genre, or an extra score
@@ -1522,6 +1599,75 @@ One Builder scene is one continuous H3 shot by default. Do not invent multiple
 shots to fill a prompt template. A cut, transition, or timed state change may
 justify timestamps only when storyboard data explicitly establishes it; small
 camera-position changes remain camera movement.
+
+The Prompts workspace presents each scene as a compact linear relay. A readable
+instruction precedes the Paste GPT Response field, followed immediately by one
+ordered, wrapping action row: Generate GPT Request, Copy Request JSON, Open GPT,
+and Apply GPT Response. For a `NEEDS GPT` scene, `Final Prompt` remains hidden
+until a current response is applied. It is then user-editable and explicitly
+saveable; current and stale saved prompts remain visible with their appropriate
+status guidance. `Prompt Context` follows at the bottom with collapsed
+Reference Mapping, Request JSON, and deterministic-prompt disclosures.
+
+Project persistence is a durability contract, not a prompt or render-readiness
+gate. Schema-v7 projects may be saved and reopened with `NEEDS GPT`, empty prompt
+records, stale prompts, incomplete Visuals, or other valid work-in-progress
+state. Only the method-scoped Save Prompt mutation requires a non-empty canonical
+Final Prompt and current relay provenance. Relevant saved Storyboard, resource,
+or Visuals edits may therefore make a previously current prompt stale while
+preserving its text; render preflight remains responsible for rejecting
+incomplete or stale work before rendering.
+
+The UI must not describe the Prompt Director as optional, expose a
+`Use Deterministic` action, or label the editor `Final H3 Prompt`.
+
+Prompt freshness has exactly one authoritative source. Per scene and generation
+method, the deterministic source fingerprint is computed once from the
+method-specific authoritative basis (exact scene source/duration, scene type,
+action, visual instructions, camera, motion, continuity, lyric/performance
+context, relevant Character and Location facts, and — per method — the accepted
+keyframe identity plus its actual description, or the ordered selected
+references with Picture-to-Subject ownership). Saved-prompt status, generated
+request freshness, pasted-response rejection, Save Prompt eligibility, inline
+stale notices, and render readiness all derive from that one fingerprint and
+the saved `source_fingerprint`/`relay_fingerprint` provenance pair, graded as
+current, stale, or missing. Only scenes whose relevant inputs changed become
+stale; unrelated scenes and unrelated entity edits do not.
+
+Internally, source/relay validity is kept separate from editor state. The
+single visible badge uses the precedence `STALE` over `UNSAVED` over `CURRENT`
+over `NEEDS GPT` whenever a Final Prompt or draft exists, because a stale
+unsaved draft cannot be saved against changed scene inputs. A stale unsaved
+draft is retained non-destructively, its Save Prompt control stays disabled,
+and a fresh Prompt Director relay is required. An unsaved draft that carries a
+current relay provenance against the current source remains `UNSAVED` and
+saveable; that is the recovery path after an upstream edit. Ordinary Save
+Project never stamps prompt provenance: only the explicit method-scoped Save
+Prompt mutation persists current fingerprints. Transition flushes never block
+on a stale draft that can no longer be saved.
+
+The production I2VA Final Prompt reads as natural audiovisual generation prose.
+Its integrated description opens with a concise accepted-first-frame anchor
+derived from the actual keyframe description, continues only with useful
+identity, wardrobe, and environment continuity, then carries the exact
+machine-owned vocal line where appropriate and the validated Prompt Director
+prose. Internal compiler invariants — opening-authority rules, exact duration,
+keyframe reference restatements, continuity-context labels, forward-generation
+intent, lyric-handling guidance, fingerprints, and other diagnostic prose —
+stay inside the compiler, relay request, and validators; they must not appear
+in the production prompt. Removing that prose does not weaken authority: the
+accepted keyframe and its actual description remain authoritative for frame
+zero, and when storyboard or entity context conflicts with the accepted image,
+the accepted image wins.
+
+The Prompts workspace renders flicker-free. State refreshes update the existing
+scene cards narrowly — badge, button states, notices, request JSON state, Final
+Prompt visibility, editor value, and Save state — instead of rebuilding the
+stage. Cards, textareas, disclosures, focus, caret, internal scroll, page
+scroll, and disclosure state survive Generate, Apply, Save, and status
+refreshes. A legitimate Final Prompt reveal inserts its section atomically;
+silent refreshes keep visible cards on screen until fresh data lands;
+same-project saves never render a blank intermediate prompt list.
 
 ---
 

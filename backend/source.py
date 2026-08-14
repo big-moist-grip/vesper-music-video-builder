@@ -299,6 +299,7 @@ def _replace_source_file(
             "scenes": [],
             "storyboard": {"request_fingerprint": None, "scenes": []},
             "visuals": {"scenes": []},
+            "prompts": {"scenes": []},
         }
         saved_project = storage.save_project(
             project_id,

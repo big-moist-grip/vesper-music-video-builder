@@ -35,6 +35,7 @@ REFERENCE_FORMATS = {
 }
 EDITABLE_CHARACTER_FIELDS = ("name", "role", "appearance", "outfit")
 EDITABLE_LOCATION_FIELDS = ("name", "description")
+RESOURCE_DRAFT_REFERENCE_FIELD = "reference_ids"
 _SAFE_UPLOAD_NAME_PATTERN = re.compile(r"^[^\x00-\x1f\x7f]+$")
 
 
@@ -182,6 +183,139 @@ def update_location(
     if not updated:
         raise EntityNotFoundError("The requested location was not found.")
     return storage.save_project(project_id, {**project, "locations": locations})
+
+
+def _resource_draft_payload(kind: str, payload: object) -> tuple[dict[str, object], list[str]]:
+    editable_fields = EDITABLE_CHARACTER_FIELDS if kind == "characters" else EDITABLE_LOCATION_FIELDS
+    expected_fields = {*editable_fields, RESOURCE_DRAFT_REFERENCE_FIELD}
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        label = "Character" if kind == "characters" else "Location"
+        raise ProjectValidationError(f"{label} edit request has unsupported or missing fields.")
+
+    values = (
+        _character_payload({field: payload[field] for field in editable_fields})
+        if kind == "characters"
+        else _location_payload({field: payload[field] for field in editable_fields})
+    )
+    reference_ids = payload.get(RESOURCE_DRAFT_REFERENCE_FIELD)
+    if not isinstance(reference_ids, list):
+        raise ProjectValidationError("Resource reference_ids must be an array.")
+
+    normalized_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for reference_id in reference_ids:
+        canonical_id = validate_entity_id(reference_id, "Reference ID")
+        if canonical_id in seen_ids:
+            raise ProjectValidationError("Resource reference_ids must be unique.")
+        seen_ids.add(canonical_id)
+        normalized_ids.append(canonical_id)
+    return values, normalized_ids
+
+
+def _without_reference_selectors(
+    project: dict[str, object],
+    entity_type: str,
+    entity_id: str,
+    removed_reference_ids: set[str],
+) -> tuple[dict[str, object], dict[str, object]]:
+    if not removed_reference_ids:
+        return project["storyboard"], project["visuals"]
+
+    def retained(selector: dict[str, object]) -> bool:
+        return not (
+            selector["entity_type"] == entity_type
+            and selector["entity_id"] == entity_id
+            and selector["reference_id"] in removed_reference_ids
+        )
+
+    storyboard = {
+        **project["storyboard"],
+        "scenes": [
+            {
+                **scene,
+                "required_references": [
+                    selector for selector in scene["required_references"] if retained(selector)
+                ],
+            }
+            for scene in project["storyboard"]["scenes"]
+        ],
+    }
+    visuals = {
+        **project["visuals"],
+        "scenes": [
+            {
+                **scene,
+                "reference2video": {
+                    **scene["reference2video"],
+                    "selected_references": [
+                        selector
+                        for selector in scene["reference2video"]["selected_references"]
+                        if retained(selector)
+                    ],
+                },
+            }
+            for scene in project["visuals"]["scenes"]
+        ],
+    }
+    return storyboard, visuals
+
+
+def update_resource_draft(
+    storage: ProjectStorage,
+    project_id: object,
+    kind: str,
+    entity_id: object,
+    payload: object,
+) -> dict[str, object]:
+    """Commit entity fields and its ordered retained-reference set in one project save."""
+
+    project = storage.load_project(project_id)
+    collection = _collection_for_kind(kind)
+    entity_label = "Character" if collection == "characters" else "Location"
+    canonical_entity_id = validate_entity_id(entity_id, f"{entity_label} ID")
+    values, retained_reference_ids = _resource_draft_payload(collection, payload)
+    entity = _find_entity(project, collection, canonical_entity_id)
+    references_by_id = {reference["reference_id"]: reference for reference in entity["references"]}
+    unknown_ids = [reference_id for reference_id in retained_reference_ids if reference_id not in references_by_id]
+    if unknown_ids:
+        raise ReferenceNotFoundError("The resource draft contains an unknown reference.")
+
+    retained_id_set = set(retained_reference_ids)
+    removed_references = [
+        reference for reference in entity["references"] if reference["reference_id"] not in retained_id_set
+    ]
+    updated_entity = {
+        **entity,
+        **values,
+        "references": [references_by_id[reference_id] for reference_id in retained_reference_ids],
+    }
+    entity_id_field = "character_id" if collection == "characters" else "location_id"
+    updated_entities = [
+        updated_entity if current[entity_id_field] == canonical_entity_id else current
+        for current in project[collection]
+    ]
+    entity_type = "character" if collection == "characters" else "location"
+    storyboard, visuals = _without_reference_selectors(
+        project,
+        entity_type,
+        canonical_entity_id,
+        {reference["reference_id"] for reference in removed_references},
+    )
+    saved = storage.save_project(
+        project_id,
+        {
+            **project,
+            collection: updated_entities,
+            "storyboard": storyboard,
+            "visuals": visuals,
+        },
+        allow_storyboard_change=True,
+        allow_visuals_change=True,
+    )
+    entity_directory = _entity_directory(storage, project_id, collection, canonical_entity_id)
+    for reference in removed_references:
+        _remove_file(entity_directory / reference["stored_name"])
+    return saved
 
 
 def delete_location(storage: ProjectStorage, project_id: object, location_id: object) -> dict[str, object]:

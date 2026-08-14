@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 
+from .gpt_launcher import GptDirectorNotFoundError, GptLaunchError, launch_gpt_director
 from .scenes import SceneConstructionError, build_project_scenes
 from .entities import (
     EntityNotFoundError,
@@ -16,6 +17,7 @@ from .entities import (
     remove_reference,
     update_character,
     update_location,
+    update_resource_draft,
 )
 from .projects import (
     ProjectNotFoundError,
@@ -39,7 +41,14 @@ from .storyboard import (
     empty_storyboard,
     validate_storyboard_response,
 )
-from .prompt_service import compile_scene_prompt
+from .prompt_service import (
+    PromptConflictError,
+    build_prompt_relay_request,
+    build_prompt_list,
+    compile_scene_prompt,
+    save_scene_prompt,
+    validate_prompt_relay_response,
+)
 from .requirements import build_requirements_report
 from .visuals import (
     KeyframeNotFoundError,
@@ -97,6 +106,20 @@ def register_routes():
             return await request.json()
         except (ContentTypeError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return None
+
+    @PromptServer.instance.routes.post("/music-video-builder/gpt/{director}/open")
+    async def music_video_builder_open_gpt(request):
+        payload = await read_json(request)
+        if payload is not None and (not isinstance(payload, dict) or payload):
+            return api_error("GPT launch does not accept request fields.", 400)
+        try:
+            result = await asyncio.to_thread(launch_gpt_director, request.match_info["director"])
+        except GptDirectorNotFoundError:
+            return api_error("GPT Director target was not found.", 404)
+        except GptLaunchError:
+            LOGGER.warning("The system browser could not open the requested Vesper GPT.")
+            return api_error("Could not open the GPT. Open it manually or retry.", 502)
+        return web.json_response(result)
 
     async def read_file_part(request):
         try:
@@ -343,6 +366,92 @@ def register_routes():
             LOGGER.exception("Could not load the project for prompt preview.")
             return api_error("Prompt preview could not be built.", 500)
         return web.json_response(preview)
+
+    @PromptServer.instance.routes.get("/music-video-builder/projects/{project_id}/prompts")
+    async def music_video_builder_prompt_list(request):
+        project_id = request.match_info["project_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+        try:
+            project = PROJECT_STORAGE.load_project(project_id)
+            prompts = build_prompt_list(project, PROJECT_STORAGE)
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not load the project for prompt listing.")
+            return api_error("Prompts could not be loaded.", 500)
+        return web.json_response(prompts)
+
+    @PromptServer.instance.routes.put("/music-video-builder/projects/{project_id}/scenes/{scene_id}/prompt")
+    async def music_video_builder_save_prompt(request):
+        try:
+            project_id, scene_id = validate_visual_route_ids(request)
+        except ProjectValidationError:
+            return api_error("The project or scene ID is invalid.", 400)
+        payload = await read_json(request)
+        if not isinstance(payload, dict):
+            return api_error("Request body must be a prompt save object.", 400)
+        try:
+            project = save_scene_prompt(PROJECT_STORAGE, project_id, scene_id, payload)
+        except ProjectNotFoundError:
+            return api_error("Project or scene was not found.", 404)
+        except PromptConflictError as error:
+            return api_error(str(error), 409)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist Music Video Builder final prompt.")
+            return api_error("Prompt could not be saved.", 500)
+        return web.json_response(project)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/scenes/{scene_id}/prompt/relay-request")
+    async def music_video_builder_prompt_relay_request(request):
+        try:
+            project_id, scene_id = validate_visual_route_ids(request)
+        except ProjectValidationError:
+            return api_error("The project or scene ID is invalid.", 400)
+        payload = await read_json(request)
+        if payload is not None and (not isinstance(payload, dict) or payload):
+            return api_error("Prompt relay request does not accept request fields.", 400)
+        try:
+            project = PROJECT_STORAGE.load_project(project_id)
+            relay_request = build_prompt_relay_request(project, scene_id)
+        except ProjectNotFoundError:
+            return api_error("Project or scene was not found.", 404)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not load the project for a prompt relay request.")
+            return api_error("Prompt relay request could not be prepared.", 500)
+        return web.json_response(relay_request)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/scenes/{scene_id}/prompt/relay-response")
+    async def music_video_builder_prompt_relay_response(request):
+        try:
+            project_id, scene_id = validate_visual_route_ids(request)
+        except ProjectValidationError:
+            return api_error("The project or scene ID is invalid.", 400)
+        payload = await read_json(request)
+        if not isinstance(payload, dict):
+            return api_error("Request body must be a Custom GPT response object.", 400)
+        try:
+            project = PROJECT_STORAGE.load_project(project_id)
+            compiled = compile_scene_prompt(project, scene_id)
+            relay_response = validate_prompt_relay_response(compiled, payload)
+        except ProjectNotFoundError:
+            return api_error("Project or scene was not found.", 404)
+        except PromptConflictError as error:
+            return api_error(str(error), 409)
+        except ProjectValidationError as error:
+            return api_error(str(error), 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not load the project for Custom GPT response validation.")
+            return api_error("Custom GPT response could not be validated.", 500)
+        return web.json_response(relay_response)
 
     @PromptServer.instance.routes.put("/music-video-builder/projects/{project_id}/visuals/scenes/{scene_id}/generation-method")
     async def music_video_builder_set_generation_method(request):
@@ -733,11 +842,10 @@ def register_routes():
         character_id = request.match_info["character_id"]
         return await run_entity_json_mutation(
             request,
-            lambda storage, current_project_id, payload: update_character(
-                storage,
-                current_project_id,
-                character_id,
-                payload,
+            lambda storage, current_project_id, payload: (
+                update_resource_draft(storage, current_project_id, "characters", character_id, payload)
+                if isinstance(payload, dict) and "reference_ids" in payload
+                else update_character(storage, current_project_id, character_id, payload)
             ),
         )
 
@@ -773,11 +881,10 @@ def register_routes():
         location_id = request.match_info["location_id"]
         return await run_entity_json_mutation(
             request,
-            lambda storage, current_project_id, payload: update_location(
-                storage,
-                current_project_id,
-                location_id,
-                payload,
+            lambda storage, current_project_id, payload: (
+                update_resource_draft(storage, current_project_id, "locations", location_id, payload)
+                if isinstance(payload, dict) and "reference_ids" in payload
+                else update_location(storage, current_project_id, location_id, payload)
             ),
         )
 

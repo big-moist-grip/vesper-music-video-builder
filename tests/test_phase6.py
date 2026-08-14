@@ -5,7 +5,7 @@ import uuid
 from copy import deepcopy
 from pathlib import Path
 
-from backend.projects import ProjectStorage, ProjectValidationError
+from backend.projects import ProjectStorage, ProjectValidationError, default_prompts_for_scenes
 from backend.scenes import build_scenes
 from backend.visuals import (
     MAX_REF2VA_STILL_REFERENCES,
@@ -81,6 +81,7 @@ class Phase6ContractTestCase(unittest.TestCase):
                     }
                 ],
                 "visuals": default_visuals_for_scenes(scenes),
+                "prompts": default_prompts_for_scenes(scenes),
             },
             allow_visuals_change=True,
         )
@@ -374,9 +375,9 @@ class Phase6ContractTestCase(unittest.TestCase):
         self.assertNotIn("sessionStorage", extension)
         self.assertNotIn("localStorage", extension)
 
-    def test_schema_remains_v5(self):
+    def test_schema_is_v6_with_prompt_persistence(self):
         project = self.storage.create_project("Schema v5 contract")
-        self.assertEqual(project["schema_version"], 5)
+        self.assertEqual(project["schema_version"], 7)
 
 
 if __name__ == "__main__":
