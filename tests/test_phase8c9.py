@@ -190,7 +190,10 @@ class Phase8C9CssDomTests(unittest.TestCase):
 
     def test_30_header_layout_avoids_horizontal_overflow(self):
         header_css = CSS[CSS.index(".mvb-render-heading {") : CSS.index(".mvb-render-status[data-state")]
-        self.assertIn("minmax(140px, 1fr)", header_css)
+        # Phase 8D adds Render All Ready and Select Scenes beside the existing
+        # Refresh Preflight / Rescan Runtime controls; the flexible status
+        # column still absorbs remaining width so the header never overflows.
+        self.assertIn("minmax(120px, 1fr)", header_css)
         self.assertIn("min-width: 0", header_css)
         self.assertIn("white-space: nowrap", header_css)
         self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", CSS)

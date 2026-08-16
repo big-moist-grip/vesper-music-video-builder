@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -817,7 +818,12 @@ def validate_project_document(
 
 
 def atomic_write_json(destination: Path, document: dict[str, object]) -> None:
-    """Replace a JSON file atomically using a temporary file in its directory."""
+    """Replace a JSON file atomically using a temporary file in its directory.
+
+    On Windows, ``os.replace`` can be denied for a few milliseconds while a
+    concurrent reader still holds the destination open.  The replacement is
+    retried briefly so background writers and observing readers coexist safely.
+    """
 
     serialized = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
     temporary_path: Path | None = None
@@ -837,7 +843,16 @@ def atomic_write_json(destination: Path, document: dict[str, object]) -> None:
             if hasattr(os, "fsync"):
                 os.fsync(handle.fileno())
 
-        os.replace(temporary_path, destination)
+        attempts = 0
+        while True:
+            try:
+                os.replace(temporary_path, destination)
+                break
+            except PermissionError:
+                attempts += 1
+                if attempts >= 12:
+                    raise
+                time.sleep(0.005 * attempts)
     except Exception as error:
         if temporary_path is not None:
             try:

@@ -409,6 +409,11 @@ function setCurrentProject(root, project, options = {}) {
     builderState.renderSubmittingSceneId = null;
     builderState.renderJobActionId = null;
     builderState.renderFinalizingJobId = null;
+    builderState.renderBatch = sameProject ? builderState.renderBatch : null;
+    builderState.renderBatchLoading = false;
+    builderState.renderBatchBusy = false;
+    builderState.renderBatchSelection = null;
+    builderState.renderBatchConfirm = null;
 }
 
 function cancelAutosave(root) {
@@ -2842,6 +2847,47 @@ function renderJobFinalizePath(projectId, jobId) {
     return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/jobs/${encodeURIComponent(jobId)}/finalize`;
 }
 
+function renderBatchPath(projectId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/batch`;
+}
+
+function renderBatchPreviewPath(projectId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/batch/preview`;
+}
+
+function renderBatchStartPath(projectId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/batch/start`;
+}
+
+function renderBatchPausePath(projectId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/batch/pause`;
+}
+
+function renderBatchResumePath(projectId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/batch/resume`;
+}
+
+function renderBatchEndPath(projectId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/batch/end`;
+}
+
+function renderBatchRetryFailedPath(projectId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/batch/retry-failed`;
+}
+
+const BATCH_ELIGIBLE_ACTIONS = ["FINALIZE_RAW", "RENDER_PREPARED", "PREPARE_AND_RENDER"];
+
+function batchIsExecuting(batch) {
+    return Boolean(batch) && ["RUNNING", "PAUSE_REQUESTED"].includes(batch.state);
+}
+
+function batchSelectionBody(selection) {
+    if (!selection) {
+        return {};
+    }
+    return { scene_ids: [...selection.selected] };
+}
+
 function renderJobLabel(state) {
     return {
         READY_TO_SUBMIT: "READY TO SUBMIT",
@@ -2932,6 +2978,10 @@ function renderJobShellKey(scene, prompt, job, state) {
         operation: state.operation,
         transitioning: state.transitioning,
         closing: state.closing,
+        batchExecuting: batchIsExecuting(state.renderBatch),
+        batchBusy: state.renderBatchBusy,
+        selecting: Boolean(state.renderBatchSelection),
+        selected: Boolean(state.renderBatchSelection?.selected?.has(scene.scene_id)),
     });
 }
 
@@ -3094,19 +3144,45 @@ function renderRenderState(root) {
     const empty = root.querySelector("[data-mvb-render-empty]");
     const refresh = root.querySelector("[data-mvb-render-refresh]");
     const rescan = root.querySelector("[data-mvb-render-rescan]");
+    const batchAllButton = root.querySelector("[data-mvb-batch-all]");
+    const batchSelectButton = root.querySelector("[data-mvb-batch-select]");
     if (!section || !status || !list || !empty || !refresh || !rescan) {
         return;
     }
 
     const state = builderState;
     const preflight = state.renderPreflight;
+    const batchExecuting = batchIsExecuting(state.renderBatch);
+    const selectionActive = Boolean(state.renderBatchSelection);
     refresh.disabled = !state.currentProject || state.renderState === "loading" || Boolean(state.operation) || state.transitioning || state.closing;
     rescan.disabled = !state.currentProject || state.renderState === "loading" || Boolean(state.operation) || state.transitioning || state.closing;
+    if (batchAllButton) {
+        batchAllButton.disabled = !state.currentProject
+            || state.renderState === "loading"
+            || Boolean(state.operation)
+            || state.transitioning
+            || state.closing
+            || batchExecuting
+            || selectionActive
+            || state.renderBatchBusy;
+    }
+    if (batchSelectButton) {
+        batchSelectButton.disabled = !state.currentProject
+            || state.renderState === "loading"
+            || Boolean(state.operation)
+            || state.transitioning
+            || state.closing
+            || batchExecuting
+            || selectionActive
+            || state.renderBatchBusy;
+    }
     if (!state.currentProject) {
         status.textContent = "Open a project to inspect render readiness.";
         status.dataset.state = "empty";
         empty.hidden = false;
         list.replaceChildren();
+        renderSelectionBar(root);
+        renderBatchPanel(root);
         return;
     }
     if (state.renderState === "loading") {
@@ -3115,6 +3191,8 @@ function renderRenderState(root) {
             : "Refreshing renders…";
         status.dataset.state = "working";
         empty.hidden = true;
+        renderSelectionBar(root);
+        renderBatchPanel(root);
         return;
     }
     if (state.renderState === "error") {
@@ -3122,6 +3200,8 @@ function renderRenderState(root) {
         status.dataset.state = "error";
         empty.hidden = true;
         list.replaceChildren();
+        renderSelectionBar(root);
+        renderBatchPanel(root);
         return;
     }
     if (!preflight || !Array.isArray(preflight.scenes)) {
@@ -3129,6 +3209,8 @@ function renderRenderState(root) {
         status.dataset.state = "empty";
         empty.hidden = false;
         list.replaceChildren();
+        renderSelectionBar(root);
+        renderBatchPanel(root);
         return;
     }
 
@@ -3179,6 +3261,10 @@ function renderRenderState(root) {
             list.append(card);
             continue;
         }
+        const selection = state.renderBatchSelection;
+        const selectionAction = selection ? selection.actions.get(scene.scene_id) : null;
+        const selectionEligible = Boolean(selection) && BATCH_ELIGIBLE_ACTIONS.includes(selectionAction);
+        const isSelected = Boolean(selection) && selection.selected.has(scene.scene_id);
         card.className = "mvb-render-card";
         card.dataset.mvbRenderCard = scene.scene_id;
         card.dataset.mvbRenderShellKey = shellKey;
@@ -3277,7 +3363,7 @@ function renderRenderState(root) {
         prepareButton.type = "button";
         prepareButton.dataset.mvbRenderPrepare = scene.scene_id;
         prepareButton.textContent = scene.preparation_status === "stale" ? "Re-prepare Render Inputs" : "Prepare Render Inputs";
-        prepareButton.disabled = !ready || Boolean(job && renderJobIsActive(job)) || state.renderPreparingSceneId === scene.scene_id || Boolean(state.operation) || state.transitioning || state.closing;
+        prepareButton.disabled = !ready || Boolean(job && renderJobIsActive(job)) || state.renderPreparingSceneId === scene.scene_id || Boolean(state.operation) || state.transitioning || state.closing || batchExecuting;
         actions.append(prepareButton);
         const renderButton = document.createElement("button");
         renderButton.className = "mvb-button mvb-button-primary mvb-button-small";
@@ -3290,10 +3376,13 @@ function renderRenderState(root) {
             || state.renderSubmittingSceneId === scene.scene_id
             || Boolean(state.operation)
             || state.transitioning
-            || state.closing;
-        renderButton.title = executionEligible
-            ? "Submit the current project-owned preparation package to local ComfyUI."
-            : (scene.execution_eligibility?.blockers?.[0]?.message || "Current scene execution requirements are not ready.");
+            || state.closing
+            || batchExecuting;
+        renderButton.title = batchExecuting
+            ? "A batch render is active; manual scene renders are paused."
+            : executionEligible
+                ? "Submit the current project-owned preparation package to local ComfyUI."
+                : (scene.execution_eligibility?.blockers?.[0]?.message || "Current scene execution requirements are not ready.");
         const retryableJob = Boolean(job && ["FAILED", "CANCELLED", "INTERRUPTED", "ORPHANED"].includes(job.state));
         if (!retryableJob) {
             actions.append(renderButton);
@@ -3313,7 +3402,7 @@ function renderRenderState(root) {
             retryButton.type = "button";
             retryButton.dataset.mvbRenderRetry = job.job_id;
             retryButton.textContent = "Retry";
-            retryButton.disabled = !executionEligible || state.renderJobActionId === job.job_id || Boolean(state.operation) || state.transitioning || state.closing;
+            retryButton.disabled = !executionEligible || state.renderJobActionId === job.job_id || Boolean(state.operation) || state.transitioning || state.closing || batchExecuting;
             actions.append(retryButton);
         }
         if (renderFinalizationEligible(job)) {
@@ -3325,7 +3414,8 @@ function renderRenderState(root) {
             finalizeButton.disabled = state.renderFinalizingJobId === job.job_id
                 || Boolean(state.operation)
                 || state.transitioning
-                || state.closing;
+                || state.closing
+                || batchExecuting;
             actions.append(finalizeButton);
         }
         const blockersList = document.createElement("ul");
@@ -3336,7 +3426,30 @@ function renderRenderState(root) {
             item.textContent = renderDiagnosticText(blocker);
             blockersList.append(item);
         }
+        const children = [];
+        if (selection) {
+            const choice = document.createElement("label");
+            choice.className = "mvb-render-select";
+            if (!selectionEligible) {
+                choice.className += " mvb-render-select-disabled";
+            }
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.dataset.mvbRenderSelectScene = scene.scene_id;
+            checkbox.checked = isSelected;
+            checkbox.disabled = !selectionEligible || state.renderBatchBusy;
+            checkbox.setAttribute("aria-label", `Select Scene ${scene.sequence} for batch rendering`);
+            const choiceLabel = document.createElement("span");
+            choiceLabel.textContent = selectionEligible
+                ? "Include in batch"
+                : selectionAction === "ALREADY_COMPLETE"
+                    ? "Final scene already ready"
+                    : "Not ready for batch rendering";
+            choice.append(checkbox, choiceLabel);
+            children.push(choice);
+        }
         card.replaceChildren(
+            ...children,
             heading,
             facts,
             detail,
@@ -3355,6 +3468,8 @@ function renderRenderState(root) {
     if (content) {
         content.scrollTop = contentScrollTop;
     }
+    renderSelectionBar(root);
+    renderBatchPanel(root);
 }
 
 async function loadRenderJobs(root, silent = false) {
@@ -3400,6 +3515,7 @@ async function loadRenderJobs(root, silent = false) {
     } finally {
         if (isActive(root) && builderState.currentProject?.project_id === projectId) {
             builderState.renderJobsLoading = false;
+            void loadRenderBatch(root, true);
             renderRenderState(root);
             scheduleRenderJobPoll(root);
         }
@@ -3518,6 +3634,449 @@ async function finalizeRenderScene(root, jobId) {
         if (isActive(root)) {
             builderState.renderFinalizingJobId = null;
             renderRenderState(root);
+        }
+    }
+}
+
+function renderBatchStageLabel(root, batch) {
+    const current = batch?.current;
+    if (!current || typeof current.scene_id !== "string") {
+        return null;
+    }
+    const sequence = Number.isInteger(current.sequence) ? current.sequence : null;
+    const sceneLabel = sequence ? `Scene ${sequence}` : null;
+    const job = builderState.renderJobs?.[current.scene_id] || null;
+    const presentation = renderTelemetryPresentation(job);
+    const stage = presentation?.stageLabel || (job?.progress && typeof job.progress.label === "string" ? job.progress.label : null);
+    if (current.disposition === "PREPARING") {
+        return sceneLabel ? `${sceneLabel} · Preparing render inputs` : "Preparing render inputs";
+    }
+    if (current.disposition === "FINALIZING") {
+        return sceneLabel ? `${sceneLabel} · Finalizing scene` : "Finalizing scene";
+    }
+    if (sceneLabel && stage) {
+        return `${sceneLabel} · ${stage}`;
+    }
+    if (sceneLabel) {
+        return `${sceneLabel} · Rendering`;
+    }
+    return stage || null;
+}
+
+function renderBatchPanel(root) {
+    if (!isActive(root)) {
+        return;
+    }
+    const panel = root.querySelector("[data-mvb-batch-panel]");
+    if (!panel) {
+        return;
+    }
+    const batch = builderState.renderBatch;
+    if (!batch || typeof batch.state !== "string") {
+        panel.hidden = true;
+        panel.replaceChildren();
+        panel.dataset.shellKey = "";
+        return;
+    }
+    const counts = batch.counts || {};
+    const attention = batch.attention && typeof batch.attention.message === "string" ? batch.attention.message : null;
+    const stageLabel = renderBatchStageLabel(root, batch);
+    const parts = [];
+    if (Number.isInteger(counts.complete) && counts.complete > 0) parts.push(`${counts.complete} complete`);
+    if (Number.isInteger(counts.failed) && counts.failed > 0) parts.push(`${counts.failed} failed`);
+    if (Number.isInteger(counts.cancelled) && counts.cancelled > 0) parts.push(`${counts.cancelled} cancelled`);
+    if (Number.isInteger(counts.skipped) && counts.skipped > 0) parts.push(`${counts.skipped} skipped`);
+    if (Number.isInteger(counts.remaining) && counts.remaining > 0) parts.push(`${counts.remaining} remaining`);
+    const shellKey = JSON.stringify([
+        batch.state,
+        batch.pause_requested,
+        counts,
+        attention,
+        stageLabel,
+        batch.current || null,
+        batch.retryable_count,
+    ]);
+    if (panel.dataset.shellKey === shellKey && panel.childElementCount > 0) {
+        return;
+    }
+    panel.dataset.shellKey = shellKey;
+    panel.hidden = false;
+    panel.className = "mvb-batch-panel";
+    panel.dataset.state = batch.state;
+    panel.replaceChildren();
+
+    const heading = document.createElement("div");
+    heading.className = "mvb-batch-heading";
+    const title = document.createElement("h3");
+    title.className = "mvb-batch-title";
+    const status = document.createElement("span");
+    status.className = "mvb-batch-status";
+    if (batch.state === "RUNNING" || batch.state === "PAUSE_REQUESTED") {
+        title.textContent = "Batch render";
+        status.textContent = batch.state === "PAUSE_REQUESTED" ? "Pausing after current scene" : "Running";
+    } else if (batch.state === "PAUSED") {
+        title.textContent = "Batch paused";
+        status.textContent = attention || "Paused";
+        status.dataset.state = attention ? "warning" : "neutral";
+    } else if (batch.state === "PAUSED_RECOVERY") {
+        title.textContent = "Batch paused after restart";
+        status.textContent = attention || "Resume to continue production.";
+        status.dataset.state = "warning";
+    } else if (batch.state === "COMPLETED") {
+        title.textContent = "Batch complete";
+        status.textContent = parts.length ? parts.join(" · ") : "All selected scenes are complete.";
+    } else if (batch.state === "COMPLETED_WITH_ISSUES") {
+        title.textContent = "Batch complete";
+        status.textContent = parts.length ? parts.join(" · ") : "Completed with issues.";
+        status.dataset.state = "warning";
+    } else if (batch.state === "ENDED") {
+        title.textContent = "Batch ended";
+        status.textContent = parts.length ? parts.join(" · ") : "Ended.";
+    }
+    heading.append(title, status);
+    panel.append(heading);
+
+    if (Number.isInteger(counts.total) && counts.total > 0 && batch.state !== "COMPLETED" && batch.state !== "COMPLETED_WITH_ISSUES" && batch.state !== "ENDED") {
+        const summary = document.createElement("p");
+        summary.className = "mvb-batch-summary";
+        summary.textContent = `${counts.processed || 0} of ${counts.total} scenes processed${parts.length ? ` · ${parts.join(" · ")}` : ""}`;
+        panel.append(summary);
+    }
+
+    if ((batch.state === "RUNNING" || batch.state === "PAUSE_REQUESTED") && stageLabel) {
+        const currentLine = document.createElement("p");
+        currentLine.className = "mvb-batch-current";
+        currentLine.textContent = `Current: ${stageLabel}`;
+        panel.append(currentLine);
+    }
+
+    if (Number.isInteger(counts.total) && counts.total > 0) {
+        const progress = document.createElement("div");
+        progress.className = "mvb-batch-progress";
+        const label = document.createElement("span");
+        label.className = "mvb-batch-progress-label";
+        label.textContent = "Scenes processed";
+        const track = document.createElement("div");
+        track.className = "mvb-batch-progress-track";
+        track.setAttribute("role", "progressbar");
+        track.setAttribute("aria-label", "Scenes processed");
+        const processed = Math.max(0, Math.min(counts.total, counts.processed || 0));
+        const percent = Math.round((processed / counts.total) * 100);
+        track.setAttribute("aria-valuemin", "0");
+        track.setAttribute("aria-valuemax", String(counts.total));
+        track.setAttribute("aria-valuenow", String(processed));
+        track.setAttribute("aria-valuetext", `${processed} of ${counts.total} scenes processed`);
+        const bar = document.createElement("div");
+        bar.className = "mvb-batch-progress-bar";
+        bar.style.width = `${percent}%`;
+        track.append(bar);
+        const value = document.createElement("span");
+        value.className = "mvb-batch-progress-value";
+        value.textContent = `${processed} / ${counts.total}`;
+        progress.append(label, track, value);
+        panel.append(progress);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "mvb-batch-actions";
+    const busy = builderState.renderBatchBusy;
+    if (batch.state === "RUNNING") {
+        const pauseButton = document.createElement("button");
+        pauseButton.className = "mvb-button mvb-button-secondary mvb-button-small";
+        pauseButton.type = "button";
+        pauseButton.dataset.mvbBatchPause = "true";
+        pauseButton.textContent = "Pause After Current";
+        pauseButton.disabled = busy;
+        actions.append(pauseButton);
+    } else if (batch.state === "PAUSE_REQUESTED") {
+        const pausing = document.createElement("span");
+        pausing.className = "mvb-batch-note";
+        pausing.textContent = "Pausing after the current scene…";
+        actions.append(pausing);
+    } else if (batch.state === "PAUSED" || batch.state === "PAUSED_RECOVERY") {
+        const resumeButton = document.createElement("button");
+        resumeButton.className = "mvb-button mvb-button-primary mvb-button-small";
+        resumeButton.type = "button";
+        resumeButton.dataset.mvbBatchResume = "true";
+        resumeButton.textContent = "Resume Batch";
+        resumeButton.disabled = busy;
+        actions.append(resumeButton);
+        const endButton = document.createElement("button");
+        endButton.className = "mvb-button mvb-button-secondary mvb-button-small";
+        endButton.type = "button";
+        endButton.dataset.mvbBatchEnd = "true";
+        endButton.textContent = "End Batch";
+        endButton.disabled = busy;
+        actions.append(endButton);
+    } else if ((batch.state === "COMPLETED_WITH_ISSUES" || batch.state === "ENDED") && Number.isInteger(batch.retryable_count) && batch.retryable_count > 0) {
+        const retryButton = document.createElement("button");
+        retryButton.className = "mvb-button mvb-button-primary mvb-button-small";
+        retryButton.type = "button";
+        retryButton.dataset.mvbBatchRetryFailed = "true";
+        retryButton.textContent = "Retry Failed";
+        retryButton.disabled = busy;
+        actions.append(retryButton);
+    }
+    if (actions.childElementCount > 0) {
+        panel.append(actions);
+    }
+}
+
+async function loadRenderBatch(root, silent = false) {
+    if (!isActive(root) || !builderState.currentProject || builderState.renderBatchLoading) {
+        return false;
+    }
+    const projectId = builderState.currentProject.project_id;
+    builderState.renderBatchLoading = true;
+    try {
+        const payload = await fetchJson(renderBatchPath(projectId), { method: "GET", cache: "no-store" });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        builderState.renderBatch = payload && typeof payload.batch === "object" ? payload.batch : null;
+        renderBatchPanel(root);
+        return true;
+    } catch (error) {
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        if (!silent) {
+            console.error("[Music Video Builder] Batch status request failed.", error);
+        }
+        return false;
+    } finally {
+        builderState.renderBatchLoading = false;
+    }
+}
+
+function renderSelectionBar(root) {
+    const bar = root.querySelector("[data-mvb-render-selection]");
+    if (!bar) {
+        return;
+    }
+    const selection = builderState.renderBatchSelection;
+    if (!selection) {
+        bar.hidden = true;
+        bar.replaceChildren();
+        return;
+    }
+    bar.hidden = false;
+    const eligibleIds = [...selection.actions.entries()]
+        .filter(([, action]) => BATCH_ELIGIBLE_ACTIONS.includes(action))
+        .map(([sceneId]) => sceneId);
+    const selectedCount = selection.selected.size;
+    bar.replaceChildren();
+    const count = document.createElement("span");
+    count.className = "mvb-render-selection-count";
+    count.textContent = `${selectedCount} selected`;
+    const selectAll = document.createElement("button");
+    selectAll.className = "mvb-button mvb-button-secondary mvb-button-small";
+    selectAll.type = "button";
+    selectAll.dataset.mvbBatchSelectAll = "true";
+    selectAll.textContent = "Select All Ready";
+    selectAll.disabled = eligibleIds.length === 0;
+    const clear = document.createElement("button");
+    clear.className = "mvb-button mvb-button-secondary mvb-button-small";
+    clear.type = "button";
+    clear.dataset.mvbBatchClear = "true";
+    clear.textContent = "Clear";
+    clear.disabled = selectedCount === 0;
+    const renderSelected = document.createElement("button");
+    renderSelected.className = "mvb-button mvb-button-primary mvb-button-small";
+    renderSelected.type = "button";
+    renderSelected.dataset.mvbBatchRenderSelected = "true";
+    renderSelected.textContent = "Render Selected";
+    renderSelected.disabled = selectedCount === 0 || builderState.renderBatchBusy;
+    const cancel = document.createElement("button");
+    cancel.className = "mvb-button mvb-button-secondary mvb-button-small";
+    cancel.type = "button";
+    cancel.dataset.mvbBatchCancelSelection = "true";
+    cancel.textContent = "Cancel Selection";
+    cancel.disabled = builderState.renderBatchBusy;
+    bar.append(count, selectAll, clear, renderSelected, cancel);
+}
+
+async function enterBatchSelectionMode(root) {
+    if (!isActive(root) || !builderState.currentProject || builderState.renderBatchSelection || builderState.renderBatchBusy) {
+        return;
+    }
+    if (batchIsExecuting(builderState.renderBatch)) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    builderState.renderBatchBusy = true;
+    try {
+        const payload = await fetchJson(renderBatchPreviewPath(projectId), {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return;
+        }
+        const actions = new Map(
+            (Array.isArray(payload?.scenes) ? payload.scenes : [])
+                .filter((entry) => entry && typeof entry.scene_id === "string")
+                .map((entry) => [entry.scene_id, entry.action]),
+        );
+        builderState.renderBatchSelection = { selected: new Set(), actions };
+    } catch (error) {
+        if (isActive(root)) {
+            builderState.renderMessage = error instanceof Error ? error.message : "Batch selection could not be prepared.";
+            builderState.renderMessageState = "error";
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.renderBatchBusy = false;
+            renderRenderState(root);
+        }
+    }
+}
+
+function exitBatchSelectionMode(root) {
+    builderState.renderBatchSelection = null;
+    builderState.renderBatchConfirm = null;
+    const dialog = root.querySelector("[data-mvb-batch-confirm]");
+    if (dialog) {
+        dialog.hidden = true;
+    }
+    renderRenderState(root);
+}
+
+async function openBatchConfirmation(root, selection) {
+    if (!isActive(root) || !builderState.currentProject || builderState.renderBatchBusy) {
+        return;
+    }
+    if (batchIsExecuting(builderState.renderBatch)) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    const body = batchSelectionBody(selection);
+    builderState.renderBatchBusy = true;
+    try {
+        const payload = await fetchJson(renderBatchPreviewPath(projectId), {
+            method: "POST",
+            body: JSON.stringify(body),
+        });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return;
+        }
+        const counts = payload?.counts || {};
+        if (!Number.isInteger(counts.eligible) || counts.eligible <= 0) {
+            builderState.renderMessage = "No scenes are currently ready for batch production.";
+            builderState.renderMessageState = "warning";
+            renderRenderState(root);
+            return;
+        }
+        builderState.renderBatchConfirm = { body, counts };
+        const dialog = root.querySelector("[data-mvb-batch-confirm]");
+        const title = root.querySelector("[data-mvb-batch-confirm-title]");
+        const summary = root.querySelector("[data-mvb-batch-confirm-summary]");
+        const errorLine = root.querySelector("[data-mvb-batch-confirm-error]");
+        if (dialog && title && summary && errorLine) {
+            title.textContent = `Render ${counts.eligible} scene${counts.eligible === 1 ? "" : "s"}?`;
+            const detailParts = [];
+            if (Number.isInteger(counts.needs_render) && counts.needs_render > 0) {
+                detailParts.push(`${counts.needs_render} require H3 rendering`);
+            }
+            if (Number.isInteger(counts.finalize_only) && counts.finalize_only > 0) {
+                detailParts.push(`${counts.finalize_only} require finalization only`);
+            }
+            summary.textContent = detailParts.length ? detailParts.join(" · ") : "";
+            summary.hidden = detailParts.length === 0;
+            errorLine.hidden = true;
+            errorLine.textContent = "";
+            dialog.hidden = false;
+        }
+    } catch (error) {
+        if (isActive(root)) {
+            builderState.renderMessage = error instanceof Error ? error.message : "Batch preview could not be loaded.";
+            builderState.renderMessageState = "error";
+            renderRenderState(root);
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.renderBatchBusy = false;
+        }
+    }
+}
+
+function closeBatchConfirmation(root) {
+    builderState.renderBatchConfirm = null;
+    const dialog = root.querySelector("[data-mvb-batch-confirm]");
+    if (dialog) {
+        dialog.hidden = true;
+    }
+}
+
+async function startConfirmedBatch(root) {
+    if (!isActive(root) || !builderState.currentProject || !builderState.renderBatchConfirm || builderState.renderBatchBusy) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    const confirm = builderState.renderBatchConfirm;
+    builderState.renderBatchBusy = true;
+    const startButton = root.querySelector("[data-mvb-batch-confirm-start]");
+    const errorLine = root.querySelector("[data-mvb-batch-confirm-error]");
+    if (startButton) {
+        startButton.disabled = true;
+    }
+    try {
+        await fetchJson(renderBatchStartPath(projectId), {
+            method: "POST",
+            body: JSON.stringify(confirm.body),
+        });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return;
+        }
+        closeBatchConfirmation(root);
+        builderState.renderBatchSelection = null;
+        builderState.renderMessage = "";
+        builderState.renderMessageState = "ready";
+        await loadRenderBatch(root, true);
+        await loadRenderJobs(root, true);
+        await loadRenderPreflight(root, true);
+    } catch (error) {
+        if (isActive(root) && errorLine) {
+            errorLine.textContent = error instanceof Error ? error.message : "The batch could not be started.";
+            errorLine.hidden = false;
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.renderBatchBusy = false;
+            if (startButton) {
+                startButton.disabled = false;
+            }
+            renderRenderState(root);
+            renderBatchPanel(root);
+        }
+    }
+}
+
+async function batchControlAction(root, path) {
+    if (!isActive(root) || !builderState.currentProject || builderState.renderBatchBusy) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    builderState.renderBatchBusy = true;
+    renderBatchPanel(root);
+    try {
+        await fetchJson(path(projectId), { method: "POST", body: JSON.stringify({}) });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return;
+        }
+        await loadRenderBatch(root, true);
+        await loadRenderJobs(root, true);
+    } catch (error) {
+        if (isActive(root)) {
+            builderState.renderMessage = error instanceof Error ? error.message : "The batch control could not be completed.";
+            builderState.renderMessageState = "error";
+            await loadRenderBatch(root, true);
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.renderBatchBusy = false;
+            renderRenderState(root);
+            renderBatchPanel(root);
         }
     }
 }
@@ -5749,12 +6308,35 @@ function openBuilder() {
                     <header class="mvb-render-heading">
                         <h2 class="mvb-render-page-title" id="mvb-render-heading">Renders</h2>
                         <span class="mvb-render-status" data-mvb-render-status aria-live="polite"></span>
+                        <button class="mvb-button mvb-button-primary mvb-button-small" data-mvb-batch-all type="button">Render All Ready</button>
+                        <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-batch-select type="button">Select Scenes</button>
                         <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-render-refresh type="button">Refresh Preflight</button>
                         <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-render-rescan type="button">Rescan Runtime</button>
                     </header>
+                    <div class="mvb-render-selection" data-mvb-render-selection hidden></div>
+                    <div class="mvb-batch-panel" data-mvb-batch-panel hidden aria-live="polite"></div>
                     <p class="mvb-render-empty" data-mvb-render-empty hidden>Build scenes before preparing Render inputs.</p>
                     <div class="mvb-render-scenes" data-mvb-render-scenes></div>
                 </section>
+
+                <div class="mvb-modal-backdrop" data-mvb-batch-confirm hidden>
+                    <section class="mvb-dialog" role="dialog" aria-modal="true" aria-labelledby="mvb-batch-confirm-heading">
+                        <div class="mvb-dialog-heading">
+                            <div>
+                                <p class="mvb-eyebrow">Batch render</p>
+                                <h2 id="mvb-batch-confirm-heading" data-mvb-batch-confirm-title>Render scenes?</h2>
+                            </div>
+                            <button class="mvb-dialog-close" data-mvb-batch-confirm-cancel type="button">Cancel</button>
+                        </div>
+                        <p data-mvb-batch-confirm-summary class="mvb-dialog-note" hidden></p>
+                        <p class="mvb-dialog-note">Scenes will be processed one at a time in scene order. Render inputs will be prepared automatically where needed and successful raw renders will be finalized automatically.</p>
+                        <p class="mvb-dialog-error" data-mvb-batch-confirm-error role="alert" hidden></p>
+                        <div class="mvb-dialog-actions">
+                            <button class="mvb-button mvb-button-secondary" data-mvb-batch-confirm-cancel type="button">Cancel</button>
+                            <button class="mvb-button mvb-button-primary" data-mvb-batch-confirm-start type="button">Start Batch</button>
+                        </div>
+                    </section>
+                </div>
 
                 <section class="mvb-storyboard" data-mvb-storyboard aria-labelledby="mvb-storyboard-heading" hidden>
                     <div class="mvb-storyboard-heading">
@@ -6067,6 +6649,11 @@ function openBuilder() {
            renderSubmittingSceneId: null,
            renderJobActionId: null,
            renderFinalizingJobId: null,
+           renderBatch: null,
+           renderBatchLoading: false,
+           renderBatchBusy: false,
+           renderBatchSelection: null,
+           renderBatchConfirm: null,
            activeView: "setup",
         deleteConfirm: null,
         newProjectBusy: false,
@@ -6237,6 +6824,88 @@ function openBuilder() {
     visualBulkApply.addEventListener("click", () => void applyVisualMethodToAllScenes(root));
     renderRefreshButton.addEventListener("click", () => void loadRenderPreflight(root));
     renderRescanButton.addEventListener("click", () => void loadRenderPreflight(root, false, { forceRefresh: true }));
+    const batchAllButton = root.querySelector("[data-mvb-batch-all]");
+    const batchSelectButton = root.querySelector("[data-mvb-batch-select]");
+    const renderSection = root.querySelector("[data-mvb-render]");
+    const batchConfirmCancelButtons = root.querySelectorAll("[data-mvb-batch-confirm-cancel]");
+    const batchConfirmStartButton = root.querySelector("[data-mvb-batch-confirm-start]");
+    if (batchAllButton) {
+        batchAllButton.addEventListener("click", () => void openBatchConfirmation(root, null));
+    }
+    if (batchSelectButton) {
+        batchSelectButton.addEventListener("click", () => void enterBatchSelectionMode(root));
+    }
+    for (const cancelButton of batchConfirmCancelButtons) {
+        cancelButton.addEventListener("click", () => closeBatchConfirmation(root));
+    }
+    if (batchConfirmStartButton) {
+        batchConfirmStartButton.addEventListener("click", () => void startConfirmedBatch(root));
+    }
+    if (renderSection) {
+        renderSection.addEventListener("click", (event) => {
+            const selectAll = event.target.closest("[data-mvb-batch-select-all]");
+            if (selectAll) {
+                const selection = builderState.renderBatchSelection;
+                if (selection) {
+                    for (const [sceneId, action] of selection.actions) {
+                        if (BATCH_ELIGIBLE_ACTIONS.includes(action)) {
+                            selection.selected.add(sceneId);
+                        }
+                    }
+                    renderRenderState(root);
+                }
+                return;
+            }
+            const clearButton = event.target.closest("[data-mvb-batch-clear]");
+            if (clearButton) {
+                builderState.renderBatchSelection?.selected.clear();
+                renderRenderState(root);
+                return;
+            }
+            const cancelSelection = event.target.closest("[data-mvb-batch-cancel-selection]");
+            if (cancelSelection) {
+                exitBatchSelectionMode(root);
+                return;
+            }
+            const renderSelected = event.target.closest("[data-mvb-batch-render-selected]");
+            if (renderSelected) {
+                void openBatchConfirmation(root, builderState.renderBatchSelection);
+                return;
+            }
+            const pauseButton = event.target.closest("[data-mvb-batch-pause]");
+            if (pauseButton) {
+                void batchControlAction(root, renderBatchPausePath);
+                return;
+            }
+            const resumeButton = event.target.closest("[data-mvb-batch-resume]");
+            if (resumeButton) {
+                void batchControlAction(root, renderBatchResumePath);
+                return;
+            }
+            const endButton = event.target.closest("[data-mvb-batch-end]");
+            if (endButton) {
+                void batchControlAction(root, renderBatchEndPath);
+                return;
+            }
+            const retryFailedButton = event.target.closest("[data-mvb-batch-retry-failed]");
+            if (retryFailedButton) {
+                void batchControlAction(root, renderBatchRetryFailedPath);
+            }
+        });
+        renderSection.addEventListener("change", (event) => {
+            const checkbox = event.target.closest("[data-mvb-render-select-scene]");
+            if (!checkbox || !builderState.renderBatchSelection) {
+                return;
+            }
+            const sceneId = checkbox.dataset.mvbRenderSelectScene;
+            if (checkbox.checked) {
+                builderState.renderBatchSelection.selected.add(sceneId);
+            } else {
+                builderState.renderBatchSelection.selected.delete(sceneId);
+            }
+            renderSelectionBar(root);
+        });
+    }
     renderSceneList.addEventListener("click", (event) => {
         const prepareButton = event.target.closest("[data-mvb-render-prepare]");
         if (prepareButton) {

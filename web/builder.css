@@ -2176,13 +2176,149 @@
 
 .mvb-render-heading {
     display: grid;
-    grid-template-columns: max-content minmax(140px, 1fr) max-content max-content;
+    grid-template-columns: max-content minmax(120px, 1fr) max-content max-content max-content max-content;
     flex: 0 0 auto;
     align-items: center;
     gap: 10px;
     min-width: 0;
     padding: 2px 2px 8px;
     border-bottom: 1px solid var(--mvb-line-soft);
+}
+
+.mvb-render-selection {
+    display: flex;
+    flex: 0 0 auto;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 2px 4px;
+}
+
+.mvb-render-selection[hidden] {
+    display: none;
+}
+
+.mvb-render-selection-count {
+    min-width: 72px;
+    color: var(--mvb-text);
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.mvb-render-select {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--mvb-muted);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.mvb-render-select input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    margin: 0;
+    accent-color: var(--mvb-gold);
+}
+
+.mvb-render-select-disabled {
+    color: rgba(158, 154, 146, 0.62);
+}
+
+.mvb-batch-panel {
+    display: grid;
+    flex: 0 0 auto;
+    gap: 8px;
+    margin: 10px 0 2px;
+    padding: 12px 14px;
+    border: 1px solid var(--mvb-line);
+    border-radius: 7px;
+    background: var(--mvb-charcoal-soft);
+}
+
+.mvb-batch-panel[hidden] {
+    display: none;
+}
+
+.mvb-batch-heading {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 10px;
+}
+
+.mvb-batch-title {
+    margin: 0;
+    color: var(--mvb-text);
+    font-size: 14px;
+    font-weight: 750;
+}
+
+.mvb-batch-status {
+    color: var(--mvb-muted);
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.mvb-batch-status[data-state="warning"] {
+    color: var(--mvb-amber);
+}
+
+.mvb-batch-summary,
+.mvb-batch-current,
+.mvb-batch-note {
+    margin: 0;
+    color: var(--mvb-muted);
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+.mvb-batch-current {
+    color: var(--mvb-text);
+}
+
+.mvb-batch-progress {
+    display: grid;
+    grid-template-columns: max-content minmax(120px, 1fr) max-content;
+    align-items: center;
+    gap: 10px;
+}
+
+.mvb-batch-progress-label {
+    color: var(--mvb-muted);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.mvb-batch-progress-track {
+    position: relative;
+    height: 4px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.mvb-batch-progress-bar {
+    height: 100%;
+    border-radius: inherit;
+    background: var(--mvb-amber);
+    transition: width 160ms ease-out;
+}
+
+.mvb-batch-progress-value {
+    color: var(--mvb-text);
+    font-size: 12px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.mvb-batch-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
 }
 
 .mvb-render-actions {
@@ -2726,6 +2862,10 @@
     }
 
     .mvb-button {
+        transition: none;
+    }
+
+    .mvb-batch-progress-bar {
         transition: none;
     }
 

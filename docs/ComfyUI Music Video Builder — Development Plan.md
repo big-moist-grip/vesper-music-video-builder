@@ -2387,7 +2387,131 @@ MT-62 remains intentionally open: it requires a naturally completed real H3
 render to validate automatic raw-output association end-to-end, and is carried
 forward without forcing an extended AMD render solely for this evidence. When a
 real production render completes naturally, perform the MT-62 live validation.
-Phase 8D is not started.
+
+### Phase 8D — Batch production orchestration
+
+Phase 8D adds project-level batch production that takes many eligible scenes
+from their current project state to FINAL SCENE READY with one user action. It
+orchestrates the existing authoritative per-scene services and never
+reimplements them: Phase 8A readiness/preparation, Phase 8B
+submission/lifecycle/reconciliation, and Phase 8C runtime-validation/
+finalization/recovery all remain the single per-scene authority.
+
+The batch runner is backend-owned. A persistent Builder batch record and a
+backend orchestration loop advance scenes; the frontend observes and controls
+(start, pause after current, resume, end, retry failed) but never drives
+advancement, so a closed browser tab does not stop production. Exactly ONE
+Builder batch H3 render is active or submitted at a time; scenes are processed
+sequentially in canonical project scene order and the ComfyUI queue is never
+flooded with future prompts.
+
+For each selected scene the batch resolves the minimum work to reach a current
+final scene output through one authoritative planner shared by preview, start,
+and dispatch: ALREADY_COMPLETE (current final scene exists, no work),
+FINALIZE_RAW (current raw H3 exists, finalize only, no new H3),
+RENDER_PREPARED (current preparation, render directly), PREPARE_AND_RENDER
+(content ready but preparation missing/stale, auto-prepare then render), and
+BLOCKED (content/prompt/visual/reference blockers, excluded). Automatic
+preparation reuses Phase 8A unchanged; automatic finalization reuses Phase 8C
+unchanged after a successful current raw output is associated. At most ONE new
+H3 attempt is made per batch item per run; there is no automatic retry loop.
+
+The batch state machine is backend-authoritative (RUNNING, PAUSE_REQUESTED,
+PAUSED, PAUSED_RECOVERY, COMPLETED, COMPLETED_WITH_ISSUES, ENDED). Pause After
+Current lets the active scene reach a stable disposition before pausing;
+Resume revalidates runtime and scene currentness before dispatching. Cancelling
+the batch-owned current job pauses the batch rather than surprising the user
+with the next render. Scene-local failures (preparation, submission, execution,
+invalid raw, finalization) are isolated and the batch continues; systemic
+blockers (ComfyUI unavailable, runtime requirements/workflow contract not
+ready, FFmpeg missing, storage unavailable) pause the batch for attention
+instead of mass-failing remaining scenes. Retry Failed builds a NEW batch from
+retryable dispositions, revalidates each scene against current state, and never
+mutates old batch history or reuses old job/prompt IDs.
+
+Batch state persists atomically in project-owned runtime JSON outside schema-v7
+project JSON, alongside the durable Phase 8B job records. After a full
+backend/runtime restart a batch with a recovered active job resumes tracking
+it; a batch with no recoverable active job enters PAUSED_RECOVERY rather than
+auto-submitting new H3 work. Batch progress is deterministic scene-count
+progress (processed / total, with complete, failed, cancelled, skipped,
+remaining); no time, ETA, or GPU-throughput estimates are ever fabricated.
+
+The Renders workspace gains Render All Ready (primary) and Select Scenes with a
+temporary selection mode (blocked and already-complete scenes cannot be
+selected), a concise Start Batch confirmation, a compact batch panel with
+count-based progress and Pause/Resume/End/Retry controls, and reuse of the
+accepted per-scene telemetry for the current scene. Internal batch/job/prompt
+identifiers stay out of the UI. Manual per-scene production actions are
+truthfully gated while a batch is executing.
+
+Phase 8D manual test statuses:
+
+- MT-72 — Batch Renders UI / Selection — PENDING
+- MT-73 — Sequential Batch Orchestration — PENDING_STRUCTURAL
+- MT-74 — Batch Failure Isolation / Retry Failed — PENDING_STRUCTURAL
+- MT-75 — Batch Persistence / Pause / Recovery — PENDING_STRUCTURAL
+- MT-76 — Batch Automatic Finalization — PENDING_LIVE_BATCH
+
+MT-73, MT-74, and MT-75 are supported this round by automated fake-ComfyUI
+structural evidence (sequential single-submission ordering, failure isolation
+and retry-failed behavior, and persistence/pause/restart-recovery behavior);
+they remain pending reviewer structural acceptance. MT-76 awaits a natural
+production batch render. MT-62 remains PENDING_LIVE_COMPLETION and may close
+together with MT-76 when a batch-owned real H3 scene auto-associates its raw
+output and finalizes. Phase 8E (Resolve/export, scenes.csv, concatenation,
+upscale, AMD-vs-RTX benchmarking) is out of scope and not started.
+
+### Phase 8D final acceptance
+
+Phase 8D completes automated, structural, and manual UI acceptance. The
+accepted scope retains the authoritative shared planner (ALREADY_COMPLETE,
+FINALIZE_RAW, RENDER_PREPARED, PREPARE_AND_RENDER, BLOCKED) used identically
+by preview, start, and runtime dispatch; backend-owned sequential orchestration
+with exactly one Builder H3 scene active at a time; automatic preparation
+through the Phase 8A service and automatic finalization through the Phase 8C
+service; canonical scene order for full and selected runs; at most one new H3
+attempt per batch item per run; Pause After Current / Resume / Cancel-current-
+pauses semantics; scene-local failure isolation versus systemic pause-for-
+attention; Retry Failed as a new revalidated batch with immutable history;
+atomic project-owned batch persistence under `renders/batches/` with bounded
+Windows sharing retry in the shared atomic writer; restart recovery that never
+auto-submits new H3 work; browser reload versus backend restart distinction;
+duplicate-runner and one-active-batch protection; manual-action gating during
+an executing batch; foreign-ComfyUI-job separation; factual count-based batch
+progress with no ETA fabrication; and the production-facing Renders UI
+(Render All Ready, Select Scenes, Start Batch confirmation, compact batch
+panel, no internal identifiers).
+
+Final manual test statuses:
+
+- MT-58 — Render Execution Gate / AMD Safety — SUPERSEDED_PRODUCT_DECISION
+- MT-59 — ComfyUI Queue Submission Contract — PASS
+- MT-60 — Render Job Lifecycle / Recovery — PASS_STRUCTURAL
+- MT-61 — Failure / Retry / Cancellation — PASS_STRUCTURAL
+- MT-62 — Raw Output Discovery / Association — PENDING_LIVE_COMPLETION
+- MT-63 — Post-Processing Eligibility / UI — PASS
+- MT-64 — Exact Scene Finalization / Authoritative Audio — PASS_STRUCTURAL
+- MT-65 — Finalization Invalidation / Idempotence — PASS_STRUCTURAL
+- MT-66 — Frame-Plan Coverage — PASS
+- MT-67 — Cross-Hardware Render Eligibility — PASS
+- MT-68 — ComfyUI Validation Error Diagnostics — PASS_STRUCTURAL
+- MT-69 — Live Render Progress Telemetry — PASS
+- MT-70 — Orphaned Job Recovery / Output Fallback — PASS
+- MT-71 — Renders UI Production Cleanup — PASS
+- MT-72 — Batch Renders UI / Selection — PASS
+- MT-73 — Sequential Batch Orchestration — PASS_STRUCTURAL
+- MT-74 — Batch Failure Isolation / Retry Failed — PASS_STRUCTURAL
+- MT-75 — Batch Persistence / Pause / Recovery — PASS_STRUCTURAL
+- MT-76 — Batch Automatic Finalization — PENDING_LIVE_BATCH
+
+MT-62 remains intentionally open: it requires a naturally completed real H3
+render proving Render Job SUCCEEDED → Raw H3 AVAILABLE automatically. MT-76
+remains intentionally open: it requires natural real batch-production evidence
+proving a batch-owned H3 success auto-associates its raw output, auto-finalizes
+to Final Scene READY, and the batch advances to the next scene. Neither is a
+Phase 8D checkpoint blocker, and no long render is forced solely to close them.
+Phase 8E remains the Resolve/export production handoff and is not started.
 
 ---
 

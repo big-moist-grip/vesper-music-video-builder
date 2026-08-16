@@ -56,6 +56,17 @@ from .render import (
     build_render_preflight,
     prepare_render_scene,
 )
+from .render_batch import (
+    RenderBatchError,
+    batch_status,
+    end_batch,
+    manual_action_blocker,
+    pause_batch_after_current,
+    preview_batch,
+    retry_failed_batch,
+    resume_batch,
+    start_batch,
+)
 from .render_finalize import (
     RenderFinalizationError,
     enrich_render_jobs_with_finalization,
@@ -193,6 +204,10 @@ def register_routes():
         if payload is not None and (not isinstance(payload, dict) or payload):
             return api_error("Render preparation does not accept filesystem paths or request fields.", 400)
 
+        blocker = await asyncio.to_thread(manual_action_blocker, PROJECT_STORAGE, project_id)
+        if blocker is not None:
+            return api_error(blocker, 409)
+
         try:
             result = await asyncio.to_thread(prepare_render_scene, PROJECT_STORAGE, project_id, scene_id)
         except RenderPreparationBlocked as error:
@@ -246,6 +261,9 @@ def register_routes():
         payload = await read_json(request)
         if payload is not None and (not isinstance(payload, dict) or payload):
             return api_error("Render submission does not accept workflows, prompts, paths, hosts, or request fields.", 400)
+        blocker = await asyncio.to_thread(manual_action_blocker, PROJECT_STORAGE, project_id)
+        if blocker is not None:
+            return api_error(blocker, 409)
         try:
             result = await asyncio.to_thread(submit_render_job, PROJECT_STORAGE, project_id, scene_id)
         except ProjectNotFoundError:
@@ -291,6 +309,9 @@ def register_routes():
         payload = await read_json(request)
         if payload is not None and (not isinstance(payload, dict) or payload):
             return api_error("Render retry does not accept prompt IDs, workflows, or request fields.", 400)
+        blocker = await asyncio.to_thread(manual_action_blocker, PROJECT_STORAGE, project_id)
+        if blocker is not None:
+            return api_error(blocker, 409)
         try:
             result = await asyncio.to_thread(retry_render_job, PROJECT_STORAGE, project_id, job_id)
         except ProjectValidationError:
@@ -315,6 +336,9 @@ def register_routes():
         payload = await read_json(request)
         if payload is not None and (not isinstance(payload, dict) or payload):
             return api_error("Finalization does not accept raw paths, audio paths, or request fields.", 400)
+        blocker = await asyncio.to_thread(manual_action_blocker, PROJECT_STORAGE, project_id)
+        if blocker is not None:
+            return api_error(blocker, 409)
         try:
             result = await asyncio.to_thread(finalize_render_job, PROJECT_STORAGE, project_id, job_id)
         except ProjectValidationError:
@@ -329,6 +353,118 @@ def register_routes():
             LOGGER.exception("Could not persist finalization state.")
             return api_error("Finalization state could not be persisted.", 500)
         return web.json_response(result)
+
+    async def read_batch_selection(request):
+        """Accept either no body/{} (all ready) or exactly {scene_ids: [...]}."""
+
+        payload = await read_json(request)
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return None, api_error("Batch requests must be a JSON object.", 400)
+        if not payload:
+            return None, None
+        if set(payload) != {"scene_ids"}:
+            return None, api_error("Batch selection accepts only scene_ids.", 400)
+        scene_ids = payload["scene_ids"]
+        if (
+            not isinstance(scene_ids, list)
+            or not scene_ids
+            or any(not isinstance(item, str) or not item for item in scene_ids)
+        ):
+            return None, api_error("scene_ids must be a non-empty list of scene identifiers.", 400)
+        return scene_ids, None
+
+    async def run_batch_operation(request, operation, *, read_selection=False):
+        project_id = request.match_info["project_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+        scene_ids = None
+        if read_selection:
+            scene_ids, error_response = await read_batch_selection(request)
+            if error_response is not None:
+                return error_response
+        else:
+            payload = await read_json(request)
+            if payload is not None and (not isinstance(payload, dict) or payload):
+                return api_error("Batch controls do not accept batch IDs, scene objects, or request fields.", 400)
+        try:
+            if scene_ids is None:
+                result = await asyncio.to_thread(operation, PROJECT_STORAGE, project_id)
+            else:
+                result = await asyncio.to_thread(operation, PROJECT_STORAGE, project_id, scene_ids=scene_ids)
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except ProjectValidationError:
+            return api_error("Project or scene selection is invalid.", 400)
+        except RenderBatchError as error:
+            return render_job_error(error)
+        except RenderJobError as error:
+            return render_job_error(error)
+        except RenderFinalizationError as error:
+            return render_job_error(error)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist batch state.")
+            return api_error("Batch state could not be persisted.", 500)
+        return result
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/render/batch/preview")
+    async def music_video_builder_batch_preview(request):
+        response = await run_batch_operation(request, preview_batch, read_selection=True)
+        if isinstance(response, dict):
+            return web.json_response(response)
+        return response
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/render/batch/start")
+    async def music_video_builder_batch_start(request):
+        response = await run_batch_operation(request, start_batch, read_selection=True)
+        if isinstance(response, dict):
+            return web.json_response(response, status=202)
+        return response
+
+    @PromptServer.instance.routes.get("/music-video-builder/projects/{project_id}/render/batch")
+    async def music_video_builder_batch_status(request):
+        project_id = request.match_info["project_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+        try:
+            result = await asyncio.to_thread(batch_status, PROJECT_STORAGE, project_id)
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except RenderBatchError as error:
+            return render_job_error(error)
+        except RenderJobError as error:
+            return render_job_error(error)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not load batch state.")
+            return api_error("Batch state could not be loaded.", 500)
+        return web.json_response(result)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/render/batch/pause")
+    async def music_video_builder_batch_pause(request):
+        response = await run_batch_operation(request, pause_batch_after_current)
+        return web.json_response(response) if isinstance(response, dict) else response
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/render/batch/resume")
+    async def music_video_builder_batch_resume(request):
+        response = await run_batch_operation(request, resume_batch)
+        return web.json_response(response) if isinstance(response, dict) else response
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/render/batch/end")
+    async def music_video_builder_batch_end(request):
+        response = await run_batch_operation(request, end_batch)
+        return web.json_response(response) if isinstance(response, dict) else response
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/render/batch/retry-failed")
+    async def music_video_builder_batch_retry_failed(request):
+        response = await run_batch_operation(request, retry_failed_batch)
+        if isinstance(response, dict):
+            return web.json_response(response, status=202)
+        return response
 
     @PromptServer.instance.routes.post("/music-video-builder/gpt/{director}/open")
     async def music_video_builder_open_gpt(request):
