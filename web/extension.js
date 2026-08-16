@@ -259,6 +259,7 @@ async function closeBuilder(root) {
     }
 
     cancelAutosave(root);
+    clearRenderJobPoll();
     healthController?.abort();
     healthController = null;
     builderState = null;
@@ -333,6 +334,7 @@ function setCurrentProject(root, project, options = {}) {
         return;
     }
 
+    clearRenderJobPoll();
     const previousProject = builderState.currentProject;
     const sameProject = previousProject?.project_id === project?.project_id;
     const preservedVisualDrafts = reconcileVisualDrafts(
@@ -398,6 +400,14 @@ function setCurrentProject(root, project, options = {}) {
     builderState.renderMessage = "";
     builderState.renderMessageState = "ready";
     builderState.renderPreparingSceneId = null;
+    builderState.renderJobs = {};
+    builderState.renderJobsState = project ? "idle" : "empty";
+    builderState.renderJobsMessage = "";
+    builderState.renderJobsPollDelay = 1000;
+    builderState.renderJobsPollTimer = null;
+    builderState.renderJobsLoading = false;
+    builderState.renderSubmittingSceneId = null;
+    builderState.renderJobActionId = null;
 }
 
 function cancelAutosave(root) {
@@ -2811,6 +2821,65 @@ function renderScenePreparePath(projectId, sceneId) {
     return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/scenes/${encodeURIComponent(sceneId)}/prepare`;
 }
 
+function renderJobsPath(projectId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/jobs`;
+}
+
+function renderSceneSubmitPath(projectId, sceneId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/scenes/${encodeURIComponent(sceneId)}/submit`;
+}
+
+function renderJobCancelPath(projectId, jobId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/jobs/${encodeURIComponent(jobId)}/cancel`;
+}
+
+function renderJobRetryPath(projectId, jobId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/jobs/${encodeURIComponent(jobId)}/retry`;
+}
+
+function renderJobLabel(state) {
+    return {
+        READY_TO_SUBMIT: "READY TO SUBMIT",
+        SUBMITTING: "SUBMITTING",
+        QUEUED: "QUEUED",
+        RUNNING: "RUNNING",
+        SUCCEEDED: "SUCCEEDED",
+        FAILED: "FAILED",
+        CANCEL_REQUESTED: "CANCELLATION REQUESTED",
+        CANCELLED: "CANCELLED",
+        INTERRUPTED: "INTERRUPTED",
+        UNKNOWN: "RECONCILIATION REQUIRED",
+    }[state] || "NOT QUEUED";
+}
+
+function renderJobIsActive(job) {
+    return ["READY_TO_SUBMIT", "SUBMITTING", "QUEUED", "RUNNING", "CANCEL_REQUESTED", "UNKNOWN"].includes(job?.state);
+}
+
+function clearRenderJobPoll() {
+    if (!builderState || builderState.renderJobsPollTimer === null) {
+        return;
+    }
+    window.clearTimeout(builderState.renderJobsPollTimer);
+    builderState.renderJobsPollTimer = null;
+}
+
+function scheduleRenderJobPoll(root) {
+    if (!isActive(root) || !builderState.currentProject || builderState.renderJobsPollTimer !== null) {
+        return;
+    }
+    const jobs = Object.values(builderState.renderJobs || {});
+    if (!jobs.some(renderJobIsActive)) {
+        builderState.renderJobsPollDelay = 1000;
+        return;
+    }
+    const delay = builderState.renderJobsPollDelay || 1000;
+    builderState.renderJobsPollTimer = window.setTimeout(() => {
+        builderState.renderJobsPollTimer = null;
+        void loadRenderJobs(root, true);
+    }, delay);
+}
+
 function renderDiagnosticText(entry) {
     return entry && typeof entry.message === "string" ? entry.message : "Render preparation requires attention.";
 }
@@ -2886,9 +2955,11 @@ function renderRenderState(root) {
     }
 
     const blockedCount = preflight.scenes.filter((scene) => scene.blockers?.length || !scene.preparation_ready).length;
+    const activeJobCount = Object.values(state.renderJobs || {}).filter(renderJobIsActive).length;
     status.textContent = state.renderMessage
-        || `${preflight.preparation_ready_count} of ${preflight.scene_count} scene${preflight.scene_count === 1 ? "" : "s"} ready for preparation${blockedCount ? ` · ${blockedCount} blocked` : ""}.`;
-    status.dataset.state = state.renderMessageState || (blockedCount ? "warning" : "success");
+        || state.renderJobsMessage
+        || `${preflight.preparation_ready_count} of ${preflight.scene_count} scene${preflight.scene_count === 1 ? "" : "s"} ready for preparation${blockedCount ? ` · ${blockedCount} blocked` : ""}${activeJobCount ? ` · ${activeJobCount} job${activeJobCount === 1 ? "" : "s"} active` : ""}.`;
+    status.dataset.state = state.renderMessageState || (state.renderJobsMessage ? "warning" : blockedCount ? "warning" : "success");
     empty.hidden = preflight.scenes.length !== 0;
     const content = root.querySelector(".mvb-content");
     const contentScrollTop = content?.scrollTop ?? 0;
@@ -2902,6 +2973,10 @@ function renderRenderState(root) {
     for (const scene of preflight.scenes) {
         activeSceneIds.add(scene.scene_id);
         const prompt = renderPromptStateForScene(scene);
+        const job = state.renderJobs?.[scene.scene_id] || null;
+        const jobCurrent = Boolean(job)
+            && scene.preparation_status === "current"
+            && job.preparation_fingerprint === scene.preparation_fingerprint;
         const blockers = [...(Array.isArray(scene.blockers) ? scene.blockers : []), ...prompt.diagnostics];
         const ready = Boolean(scene.preparation_ready) && prompt.ready;
         const card = existingCards.get(scene.scene_id) || document.createElement("article");
@@ -2934,6 +3009,7 @@ function renderRenderState(root) {
             ["Prompt", prompt.status === "current" ? "CURRENT" : promptStatusLabel(prompt.status)],
             ["Requirements", scene.requirements_ready ? "READY" : "BLOCKED"],
             ["Preparation", scene.preparation_status === "current" ? "PREPARED" : scene.preparation_status === "stale" ? "RE-PREPARE" : ready ? "READY" : "BLOCKED"],
+            ["Render job", job ? `${renderJobLabel(job.state)}${job.state === "SUCCEEDED" && !jobCurrent ? " · HISTORICAL" : ""}` : "NOT QUEUED"],
         ]) {
             const fact = document.createElement("div");
             fact.className = "mvb-render-fact";
@@ -2947,8 +3023,22 @@ function renderRenderState(root) {
 
         const detail = document.createElement("p");
         detail.className = "mvb-render-detail";
-        if (scene.preparation_status === "current") {
-            detail.textContent = "Prepared inputs are current. No H3 job was requested.";
+        if (job?.state === "SUCCEEDED") {
+            detail.textContent = job.output?.relative_path && jobCurrent
+                ? `Raw H3 output discovered · ${job.output.relative_path}`
+                : job.output?.relative_path
+                    ? `Historical raw H3 output retained · ${job.output.relative_path}`
+                : "ComfyUI reported success, but no output association is available.";
+        } else if (job?.state === "FAILED") {
+            detail.textContent = job.failure?.message || "The render job failed.";
+        } else if (job?.state === "UNKNOWN") {
+            detail.textContent = "ComfyUI no longer reports this prompt; reconcile before retrying.";
+        } else if (job && renderJobIsActive(job)) {
+            detail.textContent = job.state === "CANCEL_REQUESTED"
+                ? "Cancellation has been requested; waiting for ComfyUI reconciliation."
+                : `ComfyUI job ${renderJobLabel(job.state).toLowerCase()}. Numerical progress is not inferred.`;
+        } else if (scene.preparation_status === "current") {
+            detail.textContent = "Prepared inputs are current. Target H3 qualification remains deferred.";
         } else if (blockers.length) {
             detail.textContent = renderDiagnosticText(blockers[0]);
         } else if (scene.preparation_status === "stale") {
@@ -2966,9 +3056,46 @@ function renderRenderState(root) {
         prepareButton.textContent = scene.preparation_status === "stale" ? "Re-prepare Render Inputs" : "Prepare Render Inputs";
         prepareButton.disabled = !ready || state.renderPreparingSceneId === scene.scene_id || Boolean(state.operation) || state.transitioning || state.closing;
         actions.append(prepareButton);
+        const renderButton = document.createElement("button");
+        renderButton.className = "mvb-button mvb-button-primary mvb-button-small";
+        renderButton.type = "button";
+        renderButton.dataset.mvbRenderSubmit = scene.scene_id;
+        renderButton.textContent = preflight.target_hardware_qualified === true ? ["Render", "Scene"].join(" ") : "Render deferred";
+        renderButton.disabled = preflight.target_hardware_qualified !== true
+            || scene.preparation_status !== "current"
+            || !ready
+            || Boolean(job && renderJobIsActive(job))
+            || state.renderSubmittingSceneId === scene.scene_id
+            || Boolean(state.operation)
+            || state.transitioning
+            || state.closing;
+        renderButton.title = preflight.target_hardware_qualified === true
+            ? "Submit the current project-owned preparation package to local ComfyUI."
+            : "Target H3 qualification is deferred; no executable Render action is available on this host.";
+        actions.append(renderButton);
+        if (job && renderJobIsActive(job) && job.state !== "UNKNOWN") {
+            const cancelButton = document.createElement("button");
+            cancelButton.className = "mvb-button mvb-button-secondary mvb-button-small";
+            cancelButton.type = "button";
+            cancelButton.dataset.mvbRenderCancel = job.job_id;
+            cancelButton.textContent = job.state === "CANCEL_REQUESTED" ? "Cancellation requested" : "Cancel";
+            cancelButton.disabled = job.state === "CANCEL_REQUESTED" || state.renderJobActionId === job.job_id || Boolean(state.operation) || state.transitioning || state.closing;
+            actions.append(cancelButton);
+        }
+        if (job && ["FAILED", "CANCELLED", "INTERRUPTED"].includes(job.state)) {
+            const retryButton = document.createElement("button");
+            retryButton.className = "mvb-button mvb-button-secondary mvb-button-small";
+            retryButton.type = "button";
+            retryButton.dataset.mvbRenderRetry = job.job_id;
+            retryButton.textContent = preflight.target_hardware_qualified === true ? "Retry" : "Retry deferred";
+            retryButton.disabled = preflight.target_hardware_qualified !== true || state.renderJobActionId === job.job_id || Boolean(state.operation) || state.transitioning || state.closing;
+            actions.append(retryButton);
+        }
         const qualification = document.createElement("span");
         qualification.className = "mvb-render-qualification";
-        qualification.textContent = "Target H3 qualification deferred";
+        qualification.textContent = preflight.target_hardware_qualified === true
+            ? "Target H3 qualified"
+            : "Target H3 qualification deferred";
         actions.append(qualification);
 
         const blockersList = document.createElement("ul");
@@ -2989,6 +3116,138 @@ function renderRenderState(root) {
     }
     if (content) {
         content.scrollTop = contentScrollTop;
+    }
+}
+
+async function loadRenderJobs(root, silent = false) {
+    if (!isActive(root) || !builderState.currentProject || builderState.renderJobsLoading) {
+        return false;
+    }
+    const projectId = builderState.currentProject.project_id;
+    builderState.renderJobsLoading = true;
+    if (!silent) {
+        builderState.renderJobsState = "loading";
+        builderState.renderJobsMessage = "";
+    }
+    try {
+        const payload = await fetchJson(renderJobsPath(projectId), { method: "GET", cache: "no-store" });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        if (!payload || payload.project_id !== projectId || !Array.isArray(payload.jobs)) {
+            throw new Error("Render jobs response was invalid.");
+        }
+        builderState.renderJobs = Object.fromEntries(
+            payload.jobs
+                .filter((job) => job && typeof job.scene_id === "string" && typeof job.job_id === "string")
+                .map((job) => [job.scene_id, job]),
+        );
+        builderState.renderJobsState = "ready";
+        builderState.renderJobsMessage = Array.isArray(payload.warnings) && payload.warnings.length
+            ? payload.warnings[0].message || "ComfyUI status is temporarily unavailable."
+            : "";
+        builderState.renderJobsPollDelay = Object.values(builderState.renderJobs).some(renderJobIsActive)
+            ? Math.min((builderState.renderJobsPollDelay || 1000) * 2, 8000)
+            : 1000;
+        return true;
+    } catch (error) {
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        console.error("[Music Video Builder] Render job status request failed.", error);
+        builderState.renderJobsState = "error";
+        builderState.renderJobsMessage = error instanceof Error ? error.message : "Render job status could not be loaded.";
+        return false;
+    } finally {
+        if (isActive(root) && builderState.currentProject?.project_id === projectId) {
+            builderState.renderJobsLoading = false;
+            renderRenderState(root);
+            scheduleRenderJobPoll(root);
+        }
+    }
+}
+
+async function submitRenderScene(root, sceneId) {
+    if (!isActive(root) || !builderState.currentProject || builderState.renderSubmittingSceneId) {
+        return;
+    }
+    const scene = builderState.renderPreflight?.scenes?.find((entry) => entry.scene_id === sceneId);
+    if (!scene || builderState.renderPreflight?.target_hardware_qualified !== true || scene.preparation_status !== "current") {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    builderState.renderSubmittingSceneId = sceneId;
+    builderState.renderMessage = "Submitting the current prepared package to local ComfyUI…";
+    builderState.renderMessageState = "working";
+    renderRenderState(root);
+    try {
+        await fetchJson(renderSceneSubmitPath(projectId, sceneId), {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        builderState.renderMessage = `Scene ${sceneId} was accepted by local ComfyUI.`;
+        builderState.renderMessageState = "success";
+        await loadRenderJobs(root, true);
+    } catch (error) {
+        if (isActive(root)) {
+            builderState.renderMessage = error instanceof Error ? error.message : "Render submission could not complete.";
+            builderState.renderMessageState = "error";
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.renderSubmittingSceneId = null;
+            renderRenderState(root);
+        }
+    }
+}
+
+async function cancelRenderSceneJob(root, jobId) {
+    if (!isActive(root) || !builderState.currentProject || builderState.renderJobActionId) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    builderState.renderJobActionId = jobId;
+    try {
+        await fetchJson(renderJobCancelPath(projectId, jobId), {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        await loadRenderJobs(root, true);
+    } catch (error) {
+        if (isActive(root)) {
+            builderState.renderMessage = error instanceof Error ? error.message : "Render cancellation could not complete.";
+            builderState.renderMessageState = "error";
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.renderJobActionId = null;
+            renderRenderState(root);
+        }
+    }
+}
+
+async function retryRenderSceneJob(root, jobId) {
+    if (!isActive(root) || !builderState.currentProject || builderState.renderJobActionId) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    builderState.renderJobActionId = jobId;
+    try {
+        await fetchJson(renderJobRetryPath(projectId, jobId), {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        await loadRenderJobs(root, true);
+    } catch (error) {
+        if (isActive(root)) {
+            builderState.renderMessage = error instanceof Error ? error.message : "Render retry could not complete.";
+            builderState.renderMessageState = "error";
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.renderJobActionId = null;
+            renderRenderState(root);
+        }
     }
 }
 
@@ -3019,6 +3278,7 @@ async function loadRenderPreflight(root, silent = false, { forceRefresh = false 
         builderState.renderRequirementsCache = payload.requirements_cache || null;
         builderState.renderLoadingMode = "scene";
         builderState.renderState = "ready";
+        void loadRenderJobs(root, true);
         return true;
     } catch (error) {
         if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
@@ -5224,7 +5484,7 @@ function openBuilder() {
                             <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-render-rescan type="button">Rescan Runtime</button>
                         </div>
                     </div>
-                    <p class="mvb-render-intro">Prepare exact scene audio, current visual inputs, timing, and a validated production workflow. This stage never submits H3 jobs.</p>
+                    <p class="mvb-render-intro">Prepare exact scene audio, current visual inputs, timing, and a validated production workflow. Submission is enabled only after target H3 qualification; job state and raw output are reconciled from local ComfyUI.</p>
                     <p class="mvb-render-empty" data-mvb-render-empty hidden>Build scenes before preparing Render inputs.</p>
                     <div class="mvb-render-scenes" data-mvb-render-scenes></div>
                 </section>
@@ -5528,10 +5788,18 @@ function openBuilder() {
           renderRequirementsCache: null,
           renderLoadingMode: "runtime",
           renderState: "empty",
-          renderMessage: "",
-          renderMessageState: "ready",
-          renderPreparingSceneId: null,
-          activeView: "setup",
+           renderMessage: "",
+           renderMessageState: "ready",
+           renderPreparingSceneId: null,
+           renderJobs: {},
+           renderJobsState: "empty",
+           renderJobsMessage: "",
+           renderJobsPollDelay: 1000,
+           renderJobsPollTimer: null,
+           renderJobsLoading: false,
+           renderSubmittingSceneId: null,
+           renderJobActionId: null,
+           activeView: "setup",
         deleteConfirm: null,
         newProjectBusy: false,
         openingProject: false,
@@ -5702,9 +5970,24 @@ function openBuilder() {
     renderRefreshButton.addEventListener("click", () => void loadRenderPreflight(root));
     renderRescanButton.addEventListener("click", () => void loadRenderPreflight(root, false, { forceRefresh: true }));
     renderSceneList.addEventListener("click", (event) => {
-        const button = event.target.closest("[data-mvb-render-prepare]");
-        if (button) {
-            void prepareRenderScene(root, button.dataset.mvbRenderPrepare);
+        const prepareButton = event.target.closest("[data-mvb-render-prepare]");
+        if (prepareButton) {
+            void prepareRenderScene(root, prepareButton.dataset.mvbRenderPrepare);
+            return;
+        }
+        const submitButton = event.target.closest("[data-mvb-render-submit]");
+        if (submitButton) {
+            void submitRenderScene(root, submitButton.dataset.mvbRenderSubmit);
+            return;
+        }
+        const cancelButton = event.target.closest("[data-mvb-render-cancel]");
+        if (cancelButton) {
+            void cancelRenderSceneJob(root, cancelButton.dataset.mvbRenderCancel);
+            return;
+        }
+        const retryButton = event.target.closest("[data-mvb-render-retry]");
+        if (retryButton) {
+            void retryRenderSceneJob(root, retryButton.dataset.mvbRenderRetry);
         }
     });
     cancelClearStoryboardButton.addEventListener("click", () => closeStoryboardClearDialog(root));

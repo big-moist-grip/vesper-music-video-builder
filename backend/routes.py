@@ -56,6 +56,14 @@ from .render import (
     build_render_preflight,
     prepare_render_scene,
 )
+from .render_jobs import (
+    RenderJobError,
+    RenderJobNotFound,
+    cancel_render_job,
+    reconcile_project_jobs,
+    retry_render_job,
+    submit_render_job,
+)
 from .visuals import (
     KeyframeNotFoundError,
     MAX_REF2VA_STILL_REFERENCES,
@@ -124,6 +132,17 @@ def register_routes():
             payload["preflight"] = preflight
         return web.json_response(payload, status=status)
 
+    def render_job_error(error):
+        status = getattr(error, "status", 422)
+        payload = {
+            "error_code": error.code,
+            "error": error.message,
+        }
+        details = getattr(error, "details", None)
+        if isinstance(details, dict):
+            payload.update(details)
+        return web.json_response(payload, status=status)
+
     @PromptServer.instance.routes.get("/music-video-builder/projects/{project_id}/render/preflight")
     async def music_video_builder_render_preflight(request):
         project_id = request.match_info["project_id"]
@@ -184,6 +203,93 @@ def register_routes():
             LOGGER.exception("Could not persist render preparation artifacts.")
             return api_error("Render preparation artifacts could not be persisted.", 500)
         return web.json_response(result)
+
+    @PromptServer.instance.routes.get("/music-video-builder/projects/{project_id}/render/jobs")
+    async def music_video_builder_render_jobs(request):
+        project_id = request.match_info["project_id"]
+        try:
+            validate_project_id(project_id)
+            result = await asyncio.to_thread(reconcile_project_jobs, PROJECT_STORAGE, project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except RenderJobError as error:
+            return render_job_error(error)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not load durable render jobs.")
+            return api_error("Render jobs could not be loaded.", 500)
+        return web.json_response(result)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/render/scenes/{scene_id}/submit")
+    async def music_video_builder_submit_render_job(request):
+        project_id = request.match_info["project_id"]
+        scene_id = request.match_info["scene_id"]
+        try:
+            validate_project_id(project_id)
+            validate_entity_id(scene_id, "Scene ID")
+        except ProjectValidationError:
+            return api_error("Invalid project or scene ID.", 400)
+        payload = await read_json(request)
+        if payload is not None and (not isinstance(payload, dict) or payload):
+            return api_error("Render submission does not accept workflows, prompts, paths, hosts, or request fields.", 400)
+        try:
+            result = await asyncio.to_thread(submit_render_job, PROJECT_STORAGE, project_id, scene_id)
+        except ProjectNotFoundError:
+            return api_error("Project or scene was not found.", 404)
+        except ProjectValidationError:
+            return api_error("Project data is invalid.", 422)
+        except RenderJobError as error:
+            return render_job_error(error)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist render job state.")
+            return api_error("Render job state could not be persisted.", 500)
+        return web.json_response(result, status=202)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/render/jobs/{job_id}/cancel")
+    async def music_video_builder_cancel_render_job(request):
+        project_id = request.match_info["project_id"]
+        job_id = request.match_info["job_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+        payload = await read_json(request)
+        if payload is not None and (not isinstance(payload, dict) or payload):
+            return api_error("Render cancellation does not accept prompt IDs or request fields.", 400)
+        try:
+            result = await asyncio.to_thread(cancel_render_job, PROJECT_STORAGE, project_id, job_id)
+        except ProjectValidationError:
+            return api_error("Invalid render job ID.", 400)
+        except (ProjectNotFoundError, RenderJobNotFound):
+            return api_error("Render job was not found.", 404)
+        except RenderJobError as error:
+            return render_job_error(error)
+        return web.json_response(result)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/render/jobs/{job_id}/retry")
+    async def music_video_builder_retry_render_job(request):
+        project_id = request.match_info["project_id"]
+        job_id = request.match_info["job_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+        payload = await read_json(request)
+        if payload is not None and (not isinstance(payload, dict) or payload):
+            return api_error("Render retry does not accept prompt IDs, workflows, or request fields.", 400)
+        try:
+            result = await asyncio.to_thread(retry_render_job, PROJECT_STORAGE, project_id, job_id)
+        except ProjectValidationError:
+            return api_error("Invalid render job ID.", 400)
+        except (ProjectNotFoundError, RenderJobNotFound):
+            return api_error("Render job was not found.", 404)
+        except RenderJobError as error:
+            return render_job_error(error)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist retried render job state.")
+            return api_error("Render job state could not be persisted.", 500)
+        return web.json_response(result, status=202)
 
     @PromptServer.instance.routes.post("/music-video-builder/gpt/{director}/open")
     async def music_video_builder_open_gpt(request):

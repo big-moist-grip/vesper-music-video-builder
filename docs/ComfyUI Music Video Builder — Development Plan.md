@@ -1781,21 +1781,53 @@ preserves content scroll position.
 
 Manual contract:
 
-- MT-57 — Preflight Performance and Requirements Cache — PENDING
+- MT-57 — Preflight Performance and Requirements Cache — PASS
 
-Queue execution, output detection, trimming, and final scene output
-association are explicitly deferred to the next Phase 8 round.
+### Phase 8B — Queue job lifecycle, progress, recovery, and output discovery
 
-Deferred Phase 8B execution:
+Phase 8B adds the real local execution boundary above the accepted Phase 8A
+preparation package. A centralized local ComfyUI adapter uses the installed
+core `/prompt`, `/queue`, `/interrupt`, and `/history` API contract. Builder
+job IDs are distinct from ComfyUI prompt IDs; job records are atomically
+persisted under the project-owned `renders/<scene>/jobs` workspace and do not
+change schema v7.
 
-- Local queue submission.
-- Progress.
-- failure reporting.
-- output detection.
-- exact-duration trim if needed.
-- authoritative source audio in final scene output.
-- optional selected upscale.
-- output association.
+The durable job state machine distinguishes READY_TO_SUBMIT, SUBMITTING,
+QUEUED, RUNNING, SUCCEEDED, FAILED, CANCEL_REQUESTED, CANCELLED,
+INTERRUPTED, and UNKNOWN / reconciliation required. Illegal transitions and
+terminal mutation are rejected. A retry preserves the old record and creates
+both a new Builder job ID and a new ComfyUI prompt ID. Submission failures are
+separate from execution failures. Queue/history reconciliation is one
+coordinator per project refresh, uses bounded local requests, preserves the
+last known state across transient polling failures, and never fabricates a
+numeric progress value. Restart recovery treats a missing prompt ID or a
+prompt absent from both queue and history as UNKNOWN rather than success.
+
+The target-hardware gate is checked before any `/prompt` request. The AMD
+development host remains structural-only; target NVIDIA qualification is a
+separate dimension and remains deferred. Queued cancellation uses the owned
+prompt ID for queue deletion. Running cancellation uses the installed global
+engine interrupt API targeted by that prompt ID and is represented with that
+scope explicitly.
+
+Successful output association is derived only from the prompt-owned ComfyUI
+history entry, the manifest-declared production output node, and the expected
+deterministic filename prefix. Missing, ambiguous, unsafe, or wrong-type
+outputs fail closed. The associated file is the raw H3 output; trimming,
+remuxing, authoritative-audio replacement, upscaling, final-duration
+correction, export assembly, and batch lifecycle remain later work.
+
+The Render card exposes compact lifecycle state, guarded cancel/retry actions,
+reconciliation-required status, and raw output association without scroll
+jumps or fake executable controls while target qualification is deferred.
+
+Manual contracts for this structural round:
+
+- MT-58 — Render Execution Gate / AMD Safety — PASS
+- MT-59 — ComfyUI Queue Submission Contract — DEFERRED_TARGET_HARDWARE
+- MT-60 — Render Job Lifecycle / Recovery — PASS_STRUCTURAL
+- MT-61 — Failure / Retry / Cancellation — PASS_STRUCTURAL
+- MT-62 — Raw Output Discovery / Association — DEFERRED_TARGET_HARDWARE
 
 Before batch work begins, one real H3 scene must pass in each supported generation method:
 
