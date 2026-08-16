@@ -593,7 +593,7 @@ if (state.canApplyPromptRelayResponse({...relay, responseText: ""}, item)) throw
         self.assertNotIn('localhost:11434', extension)
         self.assertNotIn("localStorage", extension)
         self.assertNotIn("sessionStorage", extension)
-        self.assertNotIn('data-mvb-view="render"', extension)
+        self.assertIn('data-mvb-view="render"', extension)
 
     def test_frontend_flushes_prompt_drafts_by_key_before_close_and_transition(self):
         extension = Path(__file__).parents[1].joinpath("web", "extension.js").read_text(encoding="utf-8")

@@ -6,19 +6,69 @@ workflow files are not a source of runtime requirements for the Builder.
 
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import dataclass, replace
+import hashlib
 import importlib
+import json
+import logging
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Callable
 
 from .workflows import production_manifest_registry
 
 
+LOGGER = logging.getLogger(__name__)
+
 STATUS_AVAILABLE = "AVAILABLE"
 STATUS_MISSING = "MISSING"
 STATUS_UNKNOWN = "UNKNOWN"
 REQUIREMENT_STATUSES = (STATUS_AVAILABLE, STATUS_MISSING, STATUS_UNKNOWN)
+REQUIREMENTS_CACHE_VERSION = "phase8a4-runtime-requirements-v1"
+
+
+@dataclass(frozen=True)
+class RequirementsSnapshot:
+    """Process-local stable runtime discovery result and its provenance."""
+
+    report: dict[str, object]
+    generated_at: float
+    cache_identity: str
+    source_state: str
+    scan_duration_ms: float
+    cache_status: str
+    error: str | None = None
+
+    def report_copy(self) -> dict[str, object]:
+        return deepcopy(self.report)
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "status": self.cache_status,
+            "source_state": self.source_state,
+            "generated_at": self.generated_at,
+            "cache_identity": self.cache_identity,
+            "scan_duration_ms": round(self.scan_duration_ms, 3),
+            "error": self.error,
+        }
+
+
+@dataclass
+class _RequirementsScan:
+    identity: str
+    generation: int
+    event: threading.Event
+    snapshot: RequirementsSnapshot | None = None
+
+
+_CACHE_LOCK = threading.Lock()
+_CACHE_GENERATION = 0
+_CACHED_SNAPSHOT: RequirementsSnapshot | None = None
+_IN_FLIGHT_SCAN: _RequirementsScan | None = None
 
 OPTIONAL_NODE_TYPES = {
     "rtx_vsr": ("RTXVideoSuperResolution",),
@@ -37,6 +87,137 @@ def _status_item(status: str, **values: object) -> dict[str, object]:
     if status not in REQUIREMENT_STATUSES:
         raise ValueError("Unknown requirement status.")
     return {"status": status, **values}
+
+
+def _requirements_cache_identity() -> str:
+    """Return a cheap identity for the stable runtime contract inputs."""
+
+    registry = production_manifest_registry()
+    serialized = json.dumps(registry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return f"{REQUIREMENTS_CACHE_VERSION}:{digest}"
+
+
+def _failed_scan_report(message: str) -> dict[str, object]:
+    return {
+        "response_version": 1,
+        "source": "backend.requirements",
+        "methods": {},
+        "shared": {"nodes": [], "models": []},
+        "required_tools": {},
+        "required_ready": False,
+        "optional": {},
+        "discovery_status": "ERROR",
+        "error": message,
+    }
+
+
+def _run_requirements_scan(
+    scanner: Callable[[], dict[str, object]],
+    identity: str,
+    cache_status: str,
+) -> RequirementsSnapshot:
+    started = time.perf_counter()
+    error: str | None = None
+    source_state = "success"
+    try:
+        report = scanner()
+        if not isinstance(report, dict):
+            raise TypeError("Requirements discovery returned an invalid report.")
+    except Exception as scan_error:  # Runtime discovery must fail closed, not crash preflight.
+        source_state = "error"
+        error = str(scan_error) or scan_error.__class__.__name__
+        LOGGER.warning("Runtime requirements discovery failed: %s", error)
+        report = _failed_scan_report(error)
+    return RequirementsSnapshot(
+        report=deepcopy(report),
+        generated_at=time.time(),
+        cache_identity=identity,
+        source_state=source_state,
+        scan_duration_ms=(time.perf_counter() - started) * 1000,
+        cache_status=cache_status,
+        error=error,
+    )
+
+
+def get_requirements_snapshot(
+    *,
+    force_refresh: bool = False,
+    scanner: Callable[[], dict[str, object]] | None = None,
+    cache_key: str | None = None,
+) -> RequirementsSnapshot:
+    """Return stable runtime discovery, coalescing identical in-flight scans.
+
+    The default scanner is the authoritative :func:`scan_requirements` path.
+    ``scanner`` and ``cache_key`` are intentionally injectable for deterministic
+    tests; project state is never part of this cache identity.
+    """
+
+    authoritative = scanner is None
+    scan_callable = scan_requirements if scanner is None else scanner
+    identity = cache_key or (
+        _requirements_cache_identity()
+        if authoritative
+        else f"{REQUIREMENTS_CACHE_VERSION}:injected:{id(scan_callable)}"
+    )
+
+    global _IN_FLIGHT_SCAN, _CACHED_SNAPSHOT
+    while True:
+        with _CACHE_LOCK:
+            cached = _CACHED_SNAPSHOT
+            if (
+                not force_refresh
+                and cached is not None
+                and cached.cache_identity == identity
+                and cached.source_state == "success"
+            ):
+                return replace(cached, cache_status="warm")
+
+            in_flight = _IN_FLIGHT_SCAN
+            if in_flight is None or in_flight.identity != identity:
+                in_flight = _RequirementsScan(
+                    identity=identity,
+                    generation=_CACHE_GENERATION,
+                    event=threading.Event(),
+                )
+                _IN_FLIGHT_SCAN = in_flight
+                owner = True
+            else:
+                owner = False
+
+        if owner:
+            break
+
+        in_flight.event.wait()
+        if in_flight.snapshot is not None:
+            return replace(in_flight.snapshot, cache_status="coalesced")
+
+    status = "rescan" if force_refresh else "cold"
+    snapshot = _run_requirements_scan(scan_callable, identity, status)
+    with _CACHE_LOCK:
+        if snapshot.source_state == "success" and in_flight.generation == _CACHE_GENERATION:
+            _CACHED_SNAPSHOT = snapshot
+        in_flight.snapshot = snapshot
+        if _IN_FLIGHT_SCAN is in_flight:
+            _IN_FLIGHT_SCAN = None
+        in_flight.event.set()
+    return snapshot
+
+
+def clear_requirements_snapshot_cache() -> None:
+    """Invalidate process-local runtime discovery without touching projects."""
+
+    global _CACHE_GENERATION, _CACHED_SNAPSHOT
+    with _CACHE_LOCK:
+        _CACHE_GENERATION += 1
+        _CACHED_SNAPSHOT = None
+
+
+def requirements_snapshot_cache_info() -> dict[str, object]:
+    with _CACHE_LOCK:
+        if _CACHED_SNAPSHOT is None:
+            return {"status": "empty", "cache_identity": None}
+        return _CACHED_SNAPSHOT.metadata()
 
 
 def _load_active_node_types() -> tuple[set[str] | None, str]:
@@ -257,7 +438,17 @@ def scan_requirements(
     }
 
 
-def build_requirements_report(**kwargs: object) -> dict[str, object]:
-    """Named alias used by route callers and tests."""
+def build_requirements_report(
+    *,
+    force_refresh: bool = False,
+    **kwargs: object,
+) -> dict[str, object]:
+    """Return the authoritative report, caching only stable runtime discovery.
 
-    return scan_requirements(**kwargs)
+    Injected scanner arguments remain an uncached direct scan for compatibility
+    with the existing deterministic unit-test and diagnostic hooks.
+    """
+
+    if kwargs:
+        return scan_requirements(**kwargs)
+    return get_requirements_snapshot(force_refresh=force_refresh).report_copy()

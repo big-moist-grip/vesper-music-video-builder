@@ -143,6 +143,15 @@ class Phase5TestCase(unittest.TestCase):
                 ],
             },
         )
+        project_root = self.storage.project_directory(project["project_id"])
+        for collection, entity_id, references in (
+            ("characters", character_id, [character_reference, second_character_reference]),
+            ("locations", location_id, [location_reference]),
+        ):
+            reference_directory = project_root / "references" / collection / entity_id
+            reference_directory.mkdir(parents=True, exist_ok=True)
+            for reference in references:
+                (reference_directory / reference["stored_name"]).write_bytes(b"reference still")
         return project, character_reference, second_character_reference, location_reference
 
     def _apply_storyboard(self, project, required_references=None):
@@ -467,17 +476,17 @@ class Phase5TestCase(unittest.TestCase):
         project = self._apply_storyboard(project, required)
         scene_id = project["scenes"][0]["scene_id"]
         selected = [
+            {"entity_type": "character", "entity_id": character["character_id"], "reference_id": character_reference["reference_id"]},
             {"entity_type": "character", "entity_id": character["character_id"], "reference_id": second_character_reference["reference_id"]},
             {"entity_type": "location", "entity_id": location["location_id"], "reference_id": location_reference["reference_id"]},
-            {"entity_type": "character", "entity_id": character["character_id"], "reference_id": character_reference["reference_id"]},
         ]
         project = save_reference_selection(self.storage, project["project_id"], scene_id, {"selected_references": selected})
         self.assertEqual(project["visuals"]["scenes"][0]["reference2video"]["selected_references"], selected)
         mapping = planned_reference_mapping(project, scene_id)
         self.assertEqual([item["picture_tag"] for item in mapping], ["<Picture 1>", "<Picture 2>", "<Picture 3>"])
         self.assertEqual(mapping[0]["subject_tag"], "<Subject 1>")
-        self.assertEqual(mapping[1]["subject_tag"], "<Subject 2>")
-        self.assertEqual(mapping[2]["subject_tag"], "<Subject 1>")
+        self.assertEqual(mapping[1]["subject_tag"], "<Subject 1>")
+        self.assertEqual(mapping[2]["subject_tag"], "<Subject 2>")
 
     def test_reference_mapping_numbers_distinct_character_and_location_owners_in_order(self):
         project, character_reference, second_character_reference, location_reference = self._project_with_references()
@@ -571,7 +580,12 @@ class Phase5TestCase(unittest.TestCase):
         project = run_async(assign_keyframe(self.storage, project["project_id"], scene_id, "ready.png", FakeUpload(image_bytes("PNG"))))
         self.assertTrue(derive_visual_readiness(project, scene_id, self.storage)["ready"])
         project = set_generation_method(self.storage, project["project_id"], scene_id, "reference2video")
-        project = save_reference_selection(self.storage, project["project_id"], scene_id, {"selected_references": required})
+        visual_selected = [
+            *required[:1],
+            {"entity_type": "character", "entity_id": character["character_id"], "reference_id": project["characters"][0]["references"][1]["reference_id"]},
+            required[1],
+        ]
+        project = save_reference_selection(self.storage, project["project_id"], scene_id, {"selected_references": visual_selected})
         self.assertTrue(derive_visual_readiness(project, scene_id, self.storage)["ready"])
 
     def test_readiness_becomes_blocked_when_applied_storyboard_is_out_of_date(self):
@@ -722,7 +736,7 @@ class Phase5TestCase(unittest.TestCase):
         self.assertNotIn("localStorage", extension)
         self.assertNotIn("sessionStorage", extension)
         self.assertIn('data-mvb-view="prompts"', extension)
-        self.assertNotIn('data-mvb-view="render"', extension)
+        self.assertIn('data-mvb-view="render"', extension)
         self.assertNotIn("OpenAI", extension)
 
     def test_frontend_preserves_visual_drafts_and_scene_expansion_state(self):

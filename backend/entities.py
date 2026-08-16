@@ -478,10 +478,27 @@ def get_reference_path(
     reference_id: object,
 ) -> Path:
     project = storage.load_project(project_id)
+    return get_reference_path_for_project(storage, project, kind, entity_id, reference_id)
+
+
+def get_reference_path_for_project(
+    storage: ProjectStorage,
+    project: dict[str, object],
+    kind: str,
+    entity_id: object,
+    reference_id: object,
+) -> Path:
+    """Resolve a reference using an already loaded project document.
+
+    Render preflight already owns the current project snapshot. Avoiding a
+    second project load for every selected image keeps readiness dynamic while
+    preserving the same path and ownership checks as ``get_reference_path``.
+    """
+
     canonical_reference_id = validate_entity_id(reference_id, "Reference ID")
     entity = _find_entity(project, kind, entity_id)
     metadata = _reference_metadata(entity, canonical_reference_id)
-    entity_directory = _entity_directory(storage, project_id, kind, entity_id)
+    entity_directory = _entity_directory(storage, project["project_id"], kind, entity_id)
     reference_path = entity_directory / metadata["stored_name"]
     if reference_path.is_symlink() or not reference_path.is_file():
         raise ReferenceNotFoundError("Reference file is missing.")

@@ -49,9 +49,16 @@ from .prompt_service import (
     save_scene_prompt,
     validate_prompt_relay_response,
 )
-from .requirements import build_requirements_report
+from .requirements import build_requirements_report, get_requirements_snapshot
+from .render import (
+    RenderPreparationBlocked,
+    RenderPreparationError,
+    build_render_preflight,
+    prepare_render_scene,
+)
 from .visuals import (
     KeyframeNotFoundError,
+    MAX_REF2VA_STILL_REFERENCES,
     VisualSceneNotFoundError,
     assign_keyframe,
     generate_and_save_keyframe_prompt,
@@ -61,6 +68,7 @@ from .visuals import (
     save_reference_selection,
     set_all_generation_method,
     set_generation_method,
+    synchronize_storyboard_required_references,
 )
 
 
@@ -106,6 +114,76 @@ def register_routes():
             return await request.json()
         except (ContentTypeError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return None
+
+    def render_error(error, status=422, *, preflight=None):
+        payload = {
+            "error_code": error.code,
+            "error": error.message,
+        }
+        if preflight is not None:
+            payload["preflight"] = preflight
+        return web.json_response(payload, status=status)
+
+    @PromptServer.instance.routes.get("/music-video-builder/projects/{project_id}/render/preflight")
+    async def music_video_builder_render_preflight(request):
+        project_id = request.match_info["project_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+
+        try:
+            project = PROJECT_STORAGE.load_project(project_id)
+            force_requirements_refresh = request.query.get("force") in {"1", "true", "yes"}
+            requirements_snapshot = await asyncio.to_thread(
+                get_requirements_snapshot,
+                force_refresh=force_requirements_refresh,
+            )
+            preflight = await asyncio.to_thread(
+                build_render_preflight,
+                project,
+                PROJECT_STORAGE,
+                requirements_snapshot=requirements_snapshot,
+            )
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except ProjectValidationError:
+            LOGGER.warning("Invalid project data encountered during render preflight.")
+            return api_error("Project data is invalid.", 422)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not load project for render preflight.")
+            return api_error("Render preflight could not load the project.", 500)
+        return web.json_response(preflight)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/render/scenes/{scene_id}/prepare")
+    async def music_video_builder_prepare_render_scene(request):
+        project_id = request.match_info["project_id"]
+        scene_id = request.match_info["scene_id"]
+        try:
+            validate_project_id(project_id)
+            validate_entity_id(scene_id, "Scene ID")
+        except ProjectValidationError:
+            return api_error("Invalid project or scene ID.", 400)
+
+        payload = await read_json(request)
+        if payload is not None and (not isinstance(payload, dict) or payload):
+            return api_error("Render preparation does not accept filesystem paths or request fields.", 400)
+
+        try:
+            result = await asyncio.to_thread(prepare_render_scene, PROJECT_STORAGE, project_id, scene_id)
+        except RenderPreparationBlocked as error:
+            return render_error(error, preflight=error.preflight)
+        except ProjectNotFoundError:
+            return api_error("Project or scene was not found.", 404)
+        except ProjectValidationError:
+            LOGGER.warning("Invalid project data encountered during render preparation.")
+            return api_error("Project data is invalid.", 422)
+        except RenderPreparationError as error:
+            return render_error(error)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist render preparation artifacts.")
+            return api_error("Render preparation artifacts could not be persisted.", 500)
+        return web.json_response(result)
 
     @PromptServer.instance.routes.post("/music-video-builder/gpt/{director}/open")
     async def music_video_builder_open_gpt(request):
@@ -277,10 +355,20 @@ def register_routes():
         try:
             project = PROJECT_STORAGE.load_project(project_id)
             storyboard = validate_storyboard_response(project, payload)
+            synchronized_project = synchronize_storyboard_required_references(
+                {**project, "storyboard": storyboard}
+            )
+            over_capacity_scene_ids = {
+                visual_scene["scene_id"]
+                for visual_scene in synchronized_project["visuals"]["scenes"]
+                if len(visual_scene["reference2video"]["selected_references"]) > MAX_REF2VA_STILL_REFERENCES
+            }
             saved_project = PROJECT_STORAGE.save_project(
                 project_id,
-                {**project, "storyboard": storyboard},
+                synchronized_project,
                 allow_storyboard_change=True,
+                allow_visuals_change=True,
+                allow_visual_over_capacity_scene_ids=over_capacity_scene_ids,
             )
         except ProjectNotFoundError:
             return api_error("Project was not found.", 404)

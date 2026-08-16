@@ -754,7 +754,7 @@ class Phase4TestCase(unittest.TestCase):
         self.assertNotIn("localStorage", extension)
         self.assertNotIn("sessionStorage", extension)
         self.assertIn('data-mvb-view="prompts"', extension)
-        self.assertNotIn('data-mvb-view="render"', extension)
+        self.assertIn('data-mvb-view="render"', extension)
 
     def test_frontend_relay_freshness_and_status_guards(self):
         extension = Path("web/extension.js").read_text(encoding="utf-8")

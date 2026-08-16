@@ -398,11 +398,11 @@ if (state.promptDraftReadyForRender(current, noOp)) throw new Error("unsaved dra
         self.assertIn("function capturePromptViewport", EXTENSION)
         self.assertIn("window.requestAnimationFrame(apply);", EXTENSION)
 
-    def test_schema_is_exactly_v7_and_phase8_surface_is_absent(self):
+    def test_schema_is_exactly_v7_and_phase8_render_surface_is_additive(self):
         project = self.storage.create_project("Schema v7")
         self.assertEqual(project["schema_version"], 7)
         self.assertEqual(validate_project_document(project), project)
-        self.assertNotIn('data-mvb-view="render"', EXTENSION)
+        self.assertIn('data-mvb-view="render"', EXTENSION)
 
 
 if __name__ == "__main__":

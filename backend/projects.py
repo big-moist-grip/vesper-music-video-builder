@@ -740,15 +740,50 @@ def validate_project_document(
             characters,
             locations,
         )
-        from .visuals import validate_visuals
+        from .visuals import (
+            MAX_REF2VA_STILL_REFERENCES,
+            _required_references_for_scene,
+            reconcile_project_reference_selections,
+            validate_visuals,
+        )
+
+        reconciled_visual_project = reconcile_project_reference_selections(
+            {
+                **base,
+                "characters": characters,
+                "locations": locations,
+                "storyboard": storyboard,
+                "visuals": document.get("visuals"),
+            }
+        )
+        reconciled_visuals = reconciled_visual_project.get("visuals")
+        required_over_capacity_scene_ids = set(allow_visual_over_capacity_scene_ids or set())
+        if isinstance(reconciled_visuals, dict) and isinstance(reconciled_visuals.get("scenes"), list):
+            for visual_scene in reconciled_visuals["scenes"]:
+                if not isinstance(visual_scene, dict) or not isinstance(visual_scene.get("scene_id"), str):
+                    continue
+                reference2video = visual_scene.get("reference2video")
+                selected_references = (
+                    reference2video.get("selected_references")
+                    if isinstance(reference2video, dict)
+                    else None
+                )
+                if not isinstance(selected_references, list):
+                    continue
+                if (
+                    len(selected_references) > MAX_REF2VA_STILL_REFERENCES
+                    and len(_required_references_for_scene(reconciled_visual_project, visual_scene["scene_id"]))
+                    > MAX_REF2VA_STILL_REFERENCES
+                ):
+                    required_over_capacity_scene_ids.add(visual_scene["scene_id"])
 
         visuals = validate_visuals(
-            document.get("visuals"),
+            reconciled_visuals,
             scenes,
             characters,
             locations,
             allow_over_capacity=allow_visual_over_capacity,
-            allow_over_capacity_scene_ids=allow_visual_over_capacity_scene_ids,
+            allow_over_capacity_scene_ids=required_over_capacity_scene_ids,
         )
         prompts = (
             _empty_prompts(scenes)
@@ -939,7 +974,10 @@ class ProjectStorage:
     def load_project(self, project_id: object) -> dict[str, object]:
         canonical_id = validate_project_id(project_id)
         project_directory = self.project_directory(canonical_id)
-        return self._read_project(project_directory, canonical_id)
+        project = self._read_project(project_directory, canonical_id)
+        from .visuals import reconcile_project_reference_selections
+
+        return reconcile_project_reference_selections(project)
 
     def save_project(
         self,
@@ -949,6 +987,7 @@ class ProjectStorage:
         allow_storyboard_change: bool = False,
         allow_visuals_change: bool = False,
         allow_prompts_change: bool = False,
+        allow_visual_over_capacity_scene_ids: set[str] | None = None,
     ) -> dict[str, object]:
         canonical_id = validate_project_id(project_id)
         project_directory = self.project_directory(canonical_id)
@@ -983,10 +1022,16 @@ class ProjectStorage:
             if current_has_state:
                 raise ProjectValidationError("Legacy project data cannot overwrite current project state.")
 
+        explicit_over_capacity_scene_ids = set(allow_visual_over_capacity_scene_ids or set())
+        if not all(isinstance(scene_id, str) for scene_id in explicit_over_capacity_scene_ids):
+            raise ProjectValidationError("Visual over-capacity scene IDs are invalid.")
         candidate = validate_project_document(
             document,
             expected_project_id=canonical_id,
-            allow_visual_over_capacity_scene_ids=_preserved_visual_over_capacity_scene_ids(current, document),
+            allow_visual_over_capacity_scene_ids=(
+                _preserved_visual_over_capacity_scene_ids(current, document)
+                | explicit_over_capacity_scene_ids
+            ),
         )
         if not allow_storyboard_change:
             candidate["storyboard"] = current["storyboard"]
@@ -1001,6 +1046,9 @@ class ProjectStorage:
                 # Scene replacement invalidates all prompt fingerprints/content.
                 # The caller must use the dedicated prompt route to persist prompt text.
                 candidate["prompts"] = _empty_prompts(candidate["scenes"])
+        from .visuals import reconcile_project_reference_selections
+
+        candidate = reconcile_project_reference_selections(candidate)
         candidate["created_at"] = current["created_at"]
 
         current_updated_at = parse_timestamp(current["updated_at"])

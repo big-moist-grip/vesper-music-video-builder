@@ -660,7 +660,7 @@ class Phase7TestCase(unittest.TestCase):
         self.assertIn('await asyncio.to_thread(build_requirements_report)', routes)
         self.assertIn('/music-video-builder/projects/{project_id}/scenes/{scene_id}/prompt/preview', routes)
 
-    def test_phase7_keeps_schema_v7_and_adds_no_phase8_surface(self):
+    def test_phase7_keeps_schema_v7_with_additive_phase8_render_surface(self):
         self.assertEqual(production_manifest_registry(), WORKFLOW_MANIFESTS)
         project = self.storage.create_project("Schema check")
         self.assertEqual(project["schema_version"], 7)
@@ -669,7 +669,7 @@ class Phase7TestCase(unittest.TestCase):
         self.assertNotIn("sessionStorage", extension)
         self.assertIn("/prompt", extension)
         self.assertIn('data-mvb-view="prompts"', extension)
-        self.assertNotIn("/render", extension)
+        self.assertIn("render/preflight", extension)
 
 
 if __name__ == "__main__":

@@ -203,7 +203,7 @@ if (state.canSavePromptDraft({...base, status: "error"}, {text: "changed", sourc
         self.assertNotIn("sessionStorage", EXTENSION)
 
     def test_phase7c3_keeps_product_architecture_and_protected_phase6_contract(self):
-        self.assertNotIn('data-mvb-view="render"', EXTENSION)
+        self.assertIn('data-mvb-view="render"', EXTENSION)
         self.assertNotIn('data-mvb-view="prompts"', EXTENSION.split('data-mvb-view="prompts"', 1)[0])
         self.assertNotIn("H3 execution", EXTENSION)
         self.assertNotIn("fetch(\"https://api.openai.com", EXTENSION)

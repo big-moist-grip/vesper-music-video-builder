@@ -109,7 +109,7 @@ class Phase7C7PromptWorkflowTestCase(unittest.TestCase):
         self.assertIn('window.requestAnimationFrame(apply);', EXTENSION)
         self.assertNotIn('localStorage', EXTENSION)
         self.assertNotIn('sessionStorage', EXTENSION)
-        self.assertNotIn('data-mvb-view="render"', EXTENSION)
+        self.assertIn('data-mvb-view="render"', EXTENSION)
 
 
 if __name__ == "__main__":

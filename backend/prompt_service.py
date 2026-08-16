@@ -981,8 +981,14 @@ def prompt_scene_state(
     *,
     storage: ProjectStorage | None = None,
     generation_method: str | None = None,
+    include_visual_readiness: bool = True,
 ) -> dict[str, object]:
-    """Return one scene's computed prompt state without persisting derived status."""
+    """Return one scene's computed prompt state without persisting derived status.
+
+    Render preflight computes Visuals readiness in its own dynamic stage; the
+    opt-out avoids doing that same read-only calculation twice while preserving
+    the existing complete result for Prompt-stage callers.
+    """
 
     scene = _find_scene(project, scene_id)
     visual_scene = _find_visual_scene(project, scene["scene_id"])
@@ -995,7 +1001,11 @@ def prompt_scene_state(
     relay_validity = _provenance_validity(record["relay_fingerprint"], current_fingerprint)
     status = derive_prompt_status(final_prompt, source_validity, relay_validity)
 
-    visual_readiness = derive_visual_readiness(project, scene["scene_id"], storage)
+    visual_readiness = (
+        derive_visual_readiness(project, scene["scene_id"], storage)
+        if include_visual_readiness
+        else None
+    )
     return {
         "scene_id": scene["scene_id"],
         "sequence": project["scenes"].index(scene) + 1,
@@ -1015,7 +1025,7 @@ def prompt_scene_state(
         "deterministic_prompt": result["deterministic_prompt"],
         "reference_map": result["reference_map"],
         "visual_readiness": visual_readiness,
-        "ready_for_render_prompt": status == PROMPT_STATUS_CURRENT and visual_readiness["ready"],
+        "ready_for_render_prompt": status == PROMPT_STATUS_CURRENT and isinstance(visual_readiness, dict) and visual_readiness["ready"],
         "warnings": result["warnings"],
     }
 

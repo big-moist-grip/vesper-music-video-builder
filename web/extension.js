@@ -391,6 +391,13 @@ function setCurrentProject(root, project, options = {}) {
     builderState.promptListMessage = "";
     builderState.promptMessage = "";
     builderState.promptMessageState = "ready";
+    builderState.renderPreflight = null;
+    builderState.renderRequirementsCache = null;
+    builderState.renderLoadingMode = "runtime";
+    builderState.renderState = project ? "idle" : "empty";
+    builderState.renderMessage = "";
+    builderState.renderMessageState = "ready";
+    builderState.renderPreparingSceneId = null;
 }
 
 function cancelAutosave(root) {
@@ -1144,6 +1151,45 @@ function visualAssignedReferences(project, storyboardScene) {
     return assigned;
 }
 
+function visualOwnerKey(selector) {
+    return `${selector.entity_type}:${selector.entity_id}`;
+}
+
+function visualRequiredReferences(project, storyboardScene) {
+    const required = [];
+    const seenOwners = new Set();
+    for (const marker of storyboardScene?.required_references || []) {
+        const ownerKey = visualOwnerKey(marker);
+        if (seenOwners.has(ownerKey)) {
+            continue;
+        }
+        seenOwners.add(ownerKey);
+        const entity = marker.entity_type === "character"
+            ? findCharacter(project, marker.entity_id)
+            : findLocation(project, marker.entity_id);
+        const referenceIds = new Set();
+        for (const reference of entity?.references || []) {
+            referenceIds.add(reference.reference_id);
+            required.push({
+                entity_type: marker.entity_type,
+                entity_id: marker.entity_id,
+                reference_id: reference.reference_id,
+            });
+        }
+        if (!entity || !referenceIds.has(marker.reference_id)) {
+            required.push({ ...marker });
+        }
+    }
+    return required;
+}
+
+function visualReferenceLabel(project, selector) {
+    const info = visualReferenceFor(project, selector);
+    return info
+        ? `${info.entity.name} · ${info.reference.original_name}`
+        : `${selector.entity_type} · ${selector.reference_id}`;
+}
+
 function visualDraftFor(sceneId, visualScene) {
     const existing = builderState.visualDrafts[sceneId];
     if (existing) {
@@ -1196,7 +1242,12 @@ function deriveVisualReadinessClient(project, visualScene) {
         const selected = visualScene.reference2video.selected_references;
         const assigned = new Set(visualAssignedReferences(project, storyboardScene).map(visualSelectorKey));
         const selectedKeys = new Set(selected.map(visualSelectorKey));
-        if (selected.length > MAX_REF2VA_STILL_REFERENCES) {
+        const required = visualRequiredReferences(project, storyboardScene);
+        if (required.length > MAX_REF2VA_STILL_REFERENCES) {
+            missing.push(
+                `Storyboard-required references require ${required.length} images, exceeding the Reference-to-Video maximum of ${MAX_REF2VA_STILL_REFERENCES}.`,
+            );
+        } else if (selected.length > MAX_REF2VA_STILL_REFERENCES) {
             missing.push(`Reference-to-Video supports at most ${MAX_REF2VA_STILL_REFERENCES} still references`);
         }
         if (!selected.length) {
@@ -1205,9 +1256,11 @@ function deriveVisualReadinessClient(project, visualScene) {
         if (selected.some((selector) => !assigned.has(visualSelectorKey(selector)))) {
             missing.push("A selected reference is not assigned to this scene");
         }
-        for (const required of storyboardScene?.required_references || []) {
-            if (!selectedKeys.has(visualSelectorKey(required))) {
-                missing.push("A required storyboard reference is not selected");
+        for (const requiredSelector of required) {
+            if (!selectedKeys.has(visualSelectorKey(requiredSelector))) {
+                missing.push(
+                    `Required storyboard reference '${visualReferenceLabel(project, requiredSelector)}' is missing from synchronized Visuals selection.`,
+                );
             }
         }
     }
@@ -1467,6 +1520,9 @@ function renderVisualReferenceBranch(root, body, scene, visualScene, disabled) {
     const assigned = visualAssignedReferences(project, storyboardScene);
     const selected = visualScene.reference2video.selected_references;
     const selectedKeys = new Set(selected.map(visualSelectorKey));
+    const required = visualRequiredReferences(project, storyboardScene);
+    const requiredKeys = required.map(visualSelectorKey);
+    const requiredKeySet = new Set(requiredKeys);
     const branch = document.createElement("div");
     branch.className = "mvb-visual-branch";
 
@@ -1485,7 +1541,7 @@ function renderVisualReferenceBranch(root, body, scene, visualScene, disabled) {
         }
         const option = document.createElement("option");
         option.value = visualSelectorKey(selector);
-        option.textContent = `${info.entity.name} · ${info.reference.original_name}`;
+        option.textContent = `${info.entity.name} · ${info.reference.original_name}${requiredKeySet.has(visualSelectorKey(selector)) ? " · REQUIRED" : ""}`;
         select.append(option);
     }
     const addButton = makeVisualButton(
@@ -1499,10 +1555,12 @@ function renderVisualReferenceBranch(root, body, scene, visualScene, disabled) {
         },
         disabled || selected.length >= MAX_REF2VA_STILL_REFERENCES || !select.options.length,
     );
-    if (selected.length >= MAX_REF2VA_STILL_REFERENCES) {
+    if (required.length > MAX_REF2VA_STILL_REFERENCES || selected.length >= MAX_REF2VA_STILL_REFERENCES) {
         const limit = document.createElement("p");
         limit.className = "mvb-visual-missing";
-        limit.textContent = `Reference-to-Video supports up to ${MAX_REF2VA_STILL_REFERENCES} still references.`;
+        limit.textContent = required.length > MAX_REF2VA_STILL_REFERENCES
+            ? `Storyboard-required references require ${required.length} images, exceeding the Reference-to-Video maximum of ${MAX_REF2VA_STILL_REFERENCES}.`
+            : `Reference-to-Video supports up to ${MAX_REF2VA_STILL_REFERENCES} still references.`;
         chooser.append(limit);
     }
     chooser.append(select, addButton);
@@ -1520,8 +1578,23 @@ function renderVisualReferenceBranch(root, body, scene, visualScene, disabled) {
         const info = visualReferenceFor(project, selector);
         const row = document.createElement("div");
         row.className = "mvb-visual-selected-reference";
+        const isRequired = requiredKeySet.has(visualSelectorKey(selector));
+        if (isRequired) {
+            row.classList.add("mvb-visual-selected-reference-required");
+            row.dataset.required = "true";
+        }
         if (!info) {
-            row.textContent = "Reference is no longer available.";
+            const missingText = document.createElement("span");
+            missingText.className = "mvb-visual-reference-label";
+            missingText.textContent = "Reference is no longer available.";
+            if (isRequired) {
+                const badge = document.createElement("span");
+                badge.className = "mvb-visual-required-badge";
+                badge.textContent = "REQUIRED";
+                badge.setAttribute("aria-label", "Required Storyboard reference");
+                missingText.append(" ", badge);
+            }
+            row.append(missingText);
             selectedList.append(row);
             continue;
         }
@@ -1530,37 +1603,49 @@ function renderVisualReferenceBranch(root, body, scene, visualScene, disabled) {
         image.alt = `${info.entity.name} reference`;
         image.loading = "lazy";
         const text = document.createElement("span");
+        text.className = "mvb-visual-reference-label";
         text.textContent = `${index + 1}. ${info.entity.name} · ${info.reference.original_name}`;
+        if (isRequired) {
+            const badge = document.createElement("span");
+            badge.className = "mvb-visual-required-badge";
+            badge.textContent = "REQUIRED";
+            badge.setAttribute("aria-label", "Required Storyboard reference");
+            text.append(" ", badge);
+        }
         const rowActions = document.createElement("span");
         rowActions.className = "mvb-visual-row-actions";
+        const previousIsRequired = index > 0 && requiredKeySet.has(visualSelectorKey(selected[index - 1]));
+        const nextIsRequired = index < selected.length - 1 && requiredKeySet.has(visualSelectorKey(selected[index + 1]));
+        const upBlockedByRequiredGroup = index <= required.length;
+        const downBlockedByRequiredGroup = index < required.length || nextIsRequired;
         rowActions.append(
             makeVisualButton(
                 "Up",
                 "mvb-button-secondary",
                 () => {
-                    if (index === 0) return;
+                    if (index === 0 || isRequired || upBlockedByRequiredGroup || previousIsRequired) return;
                     const reordered = [...selected];
                     [reordered[index - 1], reordered[index]] = [reordered[index], reordered[index - 1]];
                     void saveReferenceSelection(root, scene.scene_id, reordered);
                 },
-                disabled || index === 0,
+                disabled || index === 0 || isRequired || upBlockedByRequiredGroup || previousIsRequired,
             ),
             makeVisualButton(
                 "Down",
                 "mvb-button-secondary",
                 () => {
-                    if (index === selected.length - 1) return;
+                    if (index === selected.length - 1 || isRequired || downBlockedByRequiredGroup) return;
                     const reordered = [...selected];
                     [reordered[index], reordered[index + 1]] = [reordered[index + 1], reordered[index]];
                     void saveReferenceSelection(root, scene.scene_id, reordered);
                 },
-                disabled || index === selected.length - 1,
+                disabled || index === selected.length - 1 || isRequired || downBlockedByRequiredGroup,
             ),
             makeVisualButton(
                 "Remove",
                 "mvb-button-danger",
                 () => void saveReferenceSelection(root, scene.scene_id, selected.filter((_, itemIndex) => itemIndex !== index)),
-                disabled,
+                disabled || isRequired,
             ),
         );
         row.append(image, text, rowActions);
@@ -1646,7 +1731,7 @@ function renderVisualSceneCard(root, scene, visualScene, index) {
     appendVisualContextField(
         context,
         "Required references",
-        storyboardScene?.required_references.map((selector) => {
+        visualRequiredReferences(builderState.currentProject, storyboardScene).map((selector) => {
             const info = visualReferenceFor(builderState.currentProject, selector);
             return info ? `${info.entity.name} · ${info.reference.original_name}` : "Unknown reference";
         }).join(", "),
@@ -2717,6 +2802,281 @@ async function loadPromptCards(root, silent = false, options = {}) {
     }
 }
 
+function renderPreflightPath(projectId, forceRefresh = false) {
+    const suffix = forceRefresh ? "?force=1" : "";
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/preflight${suffix}`;
+}
+
+function renderScenePreparePath(projectId, sceneId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/scenes/${encodeURIComponent(sceneId)}/prepare`;
+}
+
+function renderDiagnosticText(entry) {
+    return entry && typeof entry.message === "string" ? entry.message : "Render preparation requires attention.";
+}
+
+function renderPromptStateForScene(scene) {
+    const item = promptItemFor(scene.scene_id, scene.generation_method);
+    if (!item) {
+        return {
+            status: scene.prompt_status || "error",
+            ready: Boolean(scene.prompt_ready),
+            diagnostics: [],
+        };
+    }
+    const draft = promptDraftFor(scene.scene_id, scene.generation_method, item);
+    const status = promptDraftStatus(item, draft);
+    return {
+        status,
+        ready: status === "current" && promptDraftReadyForRender(item, draft),
+        diagnostics: status === "unsaved"
+            ? [{ code: "PROMPT_UNSAVED", message: "Prompt has unsaved edits. Save the current Final Prompt before preparation." }]
+            : status === "stale" && scene.prompt_status !== "stale"
+                ? [{ code: "PROMPT_STALE", message: "Prompt is stale. Generate and save a fresh Prompt Director result." }]
+                : [],
+    };
+}
+
+function renderRenderState(root) {
+    if (!isActive(root)) {
+        return;
+    }
+    const section = root.querySelector("[data-mvb-render]");
+    const status = root.querySelector("[data-mvb-render-status]");
+    const list = root.querySelector("[data-mvb-render-scenes]");
+    const empty = root.querySelector("[data-mvb-render-empty]");
+    const refresh = root.querySelector("[data-mvb-render-refresh]");
+    const rescan = root.querySelector("[data-mvb-render-rescan]");
+    if (!section || !status || !list || !empty || !refresh || !rescan) {
+        return;
+    }
+
+    const state = builderState;
+    const preflight = state.renderPreflight;
+    refresh.disabled = !state.currentProject || state.renderState === "loading" || Boolean(state.operation) || state.transitioning || state.closing;
+    rescan.disabled = !state.currentProject || state.renderState === "loading" || Boolean(state.operation) || state.transitioning || state.closing;
+    if (!state.currentProject) {
+        status.textContent = "Open a project to inspect render readiness.";
+        status.dataset.state = "empty";
+        empty.hidden = false;
+        list.replaceChildren();
+        return;
+    }
+    if (state.renderState === "loading") {
+        status.textContent = state.renderLoadingMode === "runtime"
+            ? "Inspecting runtime requirements…"
+            : "Refreshing scene readiness…";
+        status.dataset.state = "working";
+        empty.hidden = true;
+        return;
+    }
+    if (state.renderState === "error") {
+        status.textContent = state.renderMessage || "Render preflight could not be loaded.";
+        status.dataset.state = "error";
+        empty.hidden = true;
+        list.replaceChildren();
+        return;
+    }
+    if (!preflight || !Array.isArray(preflight.scenes)) {
+        status.textContent = "Refresh Preflight to inspect scene readiness.";
+        status.dataset.state = "empty";
+        empty.hidden = false;
+        list.replaceChildren();
+        return;
+    }
+
+    const blockedCount = preflight.scenes.filter((scene) => scene.blockers?.length || !scene.preparation_ready).length;
+    status.textContent = state.renderMessage
+        || `${preflight.preparation_ready_count} of ${preflight.scene_count} scene${preflight.scene_count === 1 ? "" : "s"} ready for preparation${blockedCount ? ` · ${blockedCount} blocked` : ""}.`;
+    status.dataset.state = state.renderMessageState || (blockedCount ? "warning" : "success");
+    empty.hidden = preflight.scenes.length !== 0;
+    const content = root.querySelector(".mvb-content");
+    const contentScrollTop = content?.scrollTop ?? 0;
+    const existingCards = new Map(
+        [...list.children]
+            .filter((child) => child.dataset.mvbRenderCard)
+            .map((child) => [child.dataset.mvbRenderCard, child]),
+    );
+    const activeSceneIds = new Set();
+
+    for (const scene of preflight.scenes) {
+        activeSceneIds.add(scene.scene_id);
+        const prompt = renderPromptStateForScene(scene);
+        const blockers = [...(Array.isArray(scene.blockers) ? scene.blockers : []), ...prompt.diagnostics];
+        const ready = Boolean(scene.preparation_ready) && prompt.ready;
+        const card = existingCards.get(scene.scene_id) || document.createElement("article");
+        card.className = "mvb-render-card";
+        card.dataset.mvbRenderCard = scene.scene_id;
+        card.dataset.state = ready ? "ready" : "blocked";
+
+        const heading = document.createElement("div");
+        heading.className = "mvb-render-card-heading";
+        const title = document.createElement("div");
+        title.className = "mvb-render-card-title";
+        const eyebrow = document.createElement("p");
+        eyebrow.className = "mvb-eyebrow";
+        eyebrow.textContent = `Scene ${scene.sequence}`;
+        const name = document.createElement("h3");
+        name.textContent = scene.scene_id;
+        title.append(eyebrow, name);
+        const stateBadge = document.createElement("span");
+        stateBadge.className = "mvb-render-readiness";
+        stateBadge.dataset.state = ready ? "ready" : "blocked";
+        stateBadge.textContent = ready ? "READY" : "BLOCKED";
+        heading.append(title, stateBadge);
+
+        const facts = document.createElement("div");
+        facts.className = "mvb-render-facts";
+        for (const [label, value] of [
+            ["Duration", `${scene.duration_ms} ms`],
+            ["Method", scene.generation_method === "keyframe_i2v" ? "Keyframe / I2V" : "Reference-to-Video"],
+            ["Visuals", scene.visuals_ready ? "READY" : "BLOCKED"],
+            ["Prompt", prompt.status === "current" ? "CURRENT" : promptStatusLabel(prompt.status)],
+            ["Requirements", scene.requirements_ready ? "READY" : "BLOCKED"],
+            ["Preparation", scene.preparation_status === "current" ? "PREPARED" : scene.preparation_status === "stale" ? "RE-PREPARE" : ready ? "READY" : "BLOCKED"],
+        ]) {
+            const fact = document.createElement("div");
+            fact.className = "mvb-render-fact";
+            const factLabel = document.createElement("span");
+            factLabel.textContent = label;
+            const factValue = document.createElement("strong");
+            factValue.textContent = value;
+            fact.append(factLabel, factValue);
+            facts.append(fact);
+        }
+
+        const detail = document.createElement("p");
+        detail.className = "mvb-render-detail";
+        if (scene.preparation_status === "current") {
+            detail.textContent = "Prepared inputs are current. No H3 job was requested.";
+        } else if (blockers.length) {
+            detail.textContent = renderDiagnosticText(blockers[0]);
+        } else if (scene.preparation_status === "stale") {
+            detail.textContent = "Existing preparation is stale and must be regenerated from current scene inputs.";
+        } else {
+            detail.textContent = "All structural prerequisites are current; prepare inputs to create the dry workflow package.";
+        }
+
+        const actions = document.createElement("div");
+        actions.className = "mvb-render-actions";
+        const prepareButton = document.createElement("button");
+        prepareButton.className = "mvb-button mvb-button-primary mvb-button-small";
+        prepareButton.type = "button";
+        prepareButton.dataset.mvbRenderPrepare = scene.scene_id;
+        prepareButton.textContent = scene.preparation_status === "stale" ? "Re-prepare Render Inputs" : "Prepare Render Inputs";
+        prepareButton.disabled = !ready || state.renderPreparingSceneId === scene.scene_id || Boolean(state.operation) || state.transitioning || state.closing;
+        actions.append(prepareButton);
+        const qualification = document.createElement("span");
+        qualification.className = "mvb-render-qualification";
+        qualification.textContent = "Target H3 qualification deferred";
+        actions.append(qualification);
+
+        const blockersList = document.createElement("ul");
+        blockersList.className = "mvb-render-blockers";
+        blockersList.hidden = blockers.length === 0;
+        for (const blocker of blockers) {
+            const item = document.createElement("li");
+            item.textContent = renderDiagnosticText(blocker);
+            blockersList.append(item);
+        }
+        card.replaceChildren(heading, facts, detail, blockersList, actions);
+        list.append(card);
+    }
+    for (const [sceneId, card] of existingCards) {
+        if (!activeSceneIds.has(sceneId)) {
+            card.remove();
+        }
+    }
+    if (content) {
+        content.scrollTop = contentScrollTop;
+    }
+}
+
+async function loadRenderPreflight(root, silent = false, { forceRefresh = false } = {}) {
+    if (!isActive(root) || !builderState.currentProject) {
+        return false;
+    }
+    if (builderState.renderState === "loading") {
+        return false;
+    }
+    const projectId = builderState.currentProject.project_id;
+    builderState.renderLoadingMode = forceRefresh || !builderState.renderRequirementsCache ? "runtime" : "scene";
+    builderState.renderState = "loading";
+    if (!silent) {
+        builderState.renderMessage = "";
+        builderState.renderMessageState = "ready";
+    }
+    renderRenderState(root);
+    try {
+        const payload = await fetchJson(renderPreflightPath(projectId, forceRefresh), { method: "GET", cache: "no-store" });
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        if (!payload || payload.project_id !== projectId || !Array.isArray(payload.scenes)) {
+            throw new Error("Render preflight response was invalid.");
+        }
+        builderState.renderPreflight = payload;
+        builderState.renderRequirementsCache = payload.requirements_cache || null;
+        builderState.renderLoadingMode = "scene";
+        builderState.renderState = "ready";
+        return true;
+    } catch (error) {
+        if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
+            return false;
+        }
+        console.error("[Music Video Builder] Render preflight failed.", error);
+        builderState.renderState = "error";
+        builderState.renderMessage = error instanceof Error ? error.message : "Render preflight could not be loaded.";
+        builderState.renderMessageState = "error";
+        return false;
+    } finally {
+        if (isActive(root) && builderState.currentProject?.project_id === projectId) {
+            renderRenderState(root);
+        }
+    }
+}
+
+async function prepareRenderScene(root, sceneId) {
+    if (!isActive(root) || !builderState.currentProject || builderState.renderPreparingSceneId) {
+        return;
+    }
+    const scene = builderState.renderPreflight?.scenes?.find((entry) => entry.scene_id === sceneId);
+    const prompt = scene ? renderPromptStateForScene(scene) : null;
+    if (!scene || !scene.preparation_ready || !prompt?.ready) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    builderState.renderPreparingSceneId = sceneId;
+    builderState.renderMessage = "Preparing project-owned scene inputs…";
+    builderState.renderMessageState = "working";
+    renderRenderState(root);
+    try {
+        const result = await fetchJson(renderScenePreparePath(projectId, sceneId), {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        if (result?.status === "prepared") {
+            const timing = result.preparation?.timing;
+            builderState.renderMessage = `Prepared Scene ${result.preparation?.scene_id || sceneId} · ${timing?.target_duration_ms ?? scene.duration_ms} ms · ${timing?.generated_frame_count ?? "—"} frames · workflow validated.`;
+            builderState.renderMessageState = "success";
+        } else {
+            builderState.renderMessage = "Preparation did not complete.";
+            builderState.renderMessageState = "error";
+        }
+        await loadRenderPreflight(root, true);
+    } catch (error) {
+        if (isActive(root)) {
+            builderState.renderMessage = error instanceof Error ? error.message : "Scene preparation could not complete.";
+            builderState.renderMessageState = "error";
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.renderPreparingSceneId = null;
+            renderRenderState(root);
+        }
+    }
+}
+
 async function copyPrompt(root, sceneId, generationMethod) {
     const promptViewport = capturePromptViewport(root, sceneId);
     const item = promptItemFor(sceneId, generationMethod);
@@ -3274,7 +3634,7 @@ function switchView(root, view) {
     if (!isActive(root) || !builderState.currentProject || builderState.operation || builderState.transitioning || builderState.closing) {
         return;
     }
-    if (view !== "setup" && view !== "storyboard" && view !== "visuals" && view !== "prompts") {
+    if (view !== "setup" && view !== "storyboard" && view !== "visuals" && view !== "prompts" && view !== "render") {
         return;
     }
     clearGptLauncherErrors();
@@ -3283,6 +3643,9 @@ function switchView(root, view) {
     renderProjectState(root);
     if (view === "prompts") {
         void loadPromptCards(root);
+    }
+    if (view === "render") {
+        void loadPromptCards(root, true).then(() => loadRenderPreflight(root));
     }
 }
 
@@ -3306,6 +3669,7 @@ function renderProjectState(root, options = {}) {
     const storyboard = root.querySelector("[data-mvb-storyboard]");
     const visuals = root.querySelector("[data-mvb-visuals]");
     const prompts = root.querySelector("[data-mvb-prompts]");
+    const render = root.querySelector("[data-mvb-render]");
     const nameInput = root.querySelector("[data-mvb-project-name]");
     const saveButton = root.querySelector("[data-mvb-save]");
     const projectsButton = root.querySelector("[data-mvb-projects]");
@@ -3325,6 +3689,7 @@ function renderProjectState(root, options = {}) {
         storyboard.hidden = true;
         visuals.hidden = true;
         prompts.hidden = true;
+        render.hidden = true;
         setup.hidden = true;
         sceneReview.hidden = true;
         nameInput.value = "";
@@ -3341,6 +3706,7 @@ function renderProjectState(root, options = {}) {
         storyboard.hidden = state.activeView !== "storyboard";
         visuals.hidden = state.activeView !== "visuals";
         prompts.hidden = state.activeView !== "prompts";
+        render.hidden = state.activeView !== "render";
         setup.hidden = false;
         sceneReview.hidden = false;
         if (nameInput.value !== currentProject.name) {
@@ -3374,11 +3740,13 @@ function renderProjectState(root, options = {}) {
         renderStoryboardState(root);
         renderVisualsState(root, options.visualViewport || null);
         renderPromptState(root, { promptViewport });
+        renderRenderState(root);
     } else {
         renderSceneReview(root);
         renderStoryboardState(root);
         renderVisualsState(root, options.visualViewport || null);
         renderPromptState(root, { promptViewport });
+        renderRenderState(root);
     }
 }
 
@@ -4705,6 +5073,7 @@ function openBuilder() {
                     <button class="mvb-view-button" data-mvb-view="storyboard" type="button" role="tab" aria-selected="false">Storyboard</button>
                     <button class="mvb-view-button" data-mvb-view="visuals" type="button" role="tab" aria-selected="false">Visuals</button>
                     <button class="mvb-view-button" data-mvb-view="prompts" type="button" role="tab" aria-selected="false">Prompts</button>
+                    <button class="mvb-view-button" data-mvb-view="render" type="button" role="tab" aria-selected="false">Render</button>
                 </nav>
 
                 <section class="mvb-landing" data-mvb-landing aria-labelledby="mvb-landing-heading" hidden>
@@ -4841,6 +5210,23 @@ function openBuilder() {
                     <p class="mvb-prompt-intro">Generate, copy, open, paste, and apply each scene request, then review and save its Final Prompt.</p>
                     <p class="mvb-prompt-empty" data-mvb-prompt-empty hidden>Build scenes before preparing Prompts.</p>
                     <div class="mvb-prompt-scenes" data-mvb-prompt-scenes></div>
+                </section>
+
+                <section class="mvb-render" data-mvb-render aria-labelledby="mvb-render-heading" hidden>
+                    <div class="mvb-render-heading">
+                        <div>
+                            <p class="mvb-eyebrow">Render preparation</p>
+                            <h2 id="mvb-render-heading">Scene readiness</h2>
+                        </div>
+                        <div class="mvb-render-heading-actions">
+                            <span class="mvb-render-status" data-mvb-render-status aria-live="polite"></span>
+                            <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-render-refresh type="button">Refresh Preflight</button>
+                            <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-render-rescan type="button">Rescan Runtime</button>
+                        </div>
+                    </div>
+                    <p class="mvb-render-intro">Prepare exact scene audio, current visual inputs, timing, and a validated production workflow. This stage never submits H3 jobs.</p>
+                    <p class="mvb-render-empty" data-mvb-render-empty hidden>Build scenes before preparing Render inputs.</p>
+                    <div class="mvb-render-scenes" data-mvb-render-scenes></div>
                 </section>
 
                 <section class="mvb-storyboard" data-mvb-storyboard aria-labelledby="mvb-storyboard-heading" hidden>
@@ -5133,12 +5519,19 @@ function openBuilder() {
          promptListMessage: "",
          promptDrafts: {},
          promptExpandedScenes: {},
-         promptMessage: "",
-         promptMessageState: "ready",
-         promptRelay: {},
-         promptRelayExpanded: {},
-         gptLaunchInFlight: false,
-         activeView: "setup",
+          promptMessage: "",
+          promptMessageState: "ready",
+          promptRelay: {},
+          promptRelayExpanded: {},
+          gptLaunchInFlight: false,
+          renderPreflight: null,
+          renderRequirementsCache: null,
+          renderLoadingMode: "runtime",
+          renderState: "empty",
+          renderMessage: "",
+          renderMessageState: "ready",
+          renderPreparingSceneId: null,
+          activeView: "setup",
         deleteConfirm: null,
         newProjectBusy: false,
         openingProject: false,
@@ -5187,6 +5580,9 @@ function openBuilder() {
     const confirmClearStoryboardButton = root.querySelector("[data-mvb-confirm-clear-storyboard]");
     const visualBulkMethod = root.querySelector("[data-mvb-visual-bulk-method]");
     const visualBulkApply = root.querySelector("[data-mvb-visual-bulk-apply]");
+    const renderRefreshButton = root.querySelector("[data-mvb-render-refresh]");
+    const renderRescanButton = root.querySelector("[data-mvb-render-rescan]");
+    const renderSceneList = root.querySelector("[data-mvb-render-scenes]");
 
     closeButton.addEventListener("click", () => void closeBuilder(root));
     maximizeButton.addEventListener("click", () => toggleMaximize(root));
@@ -5303,6 +5699,14 @@ function openBuilder() {
         builderState.visualBulkMethod = visualBulkMethod.value;
     });
     visualBulkApply.addEventListener("click", () => void applyVisualMethodToAllScenes(root));
+    renderRefreshButton.addEventListener("click", () => void loadRenderPreflight(root));
+    renderRescanButton.addEventListener("click", () => void loadRenderPreflight(root, false, { forceRefresh: true }));
+    renderSceneList.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-mvb-render-prepare]");
+        if (button) {
+            void prepareRenderScene(root, button.dataset.mvbRenderPrepare);
+        }
+    });
     cancelClearStoryboardButton.addEventListener("click", () => closeStoryboardClearDialog(root));
     confirmClearStoryboardButton.addEventListener("click", () => void clearAppliedStoryboard(root));
     newForm.addEventListener("submit", (event) => {

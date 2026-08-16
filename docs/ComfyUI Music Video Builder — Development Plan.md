@@ -1673,14 +1673,121 @@ same-project saves never render a blank intermediate prompt list.
 
 ## PHASE 8 — Single-scene rendering
 
-Implement:
+### Phase 8A — Render preflight, media preparation, and workflow compilation
 
-- Exact master-audio segment extraction.
-- H3 render-frame calculation.
-- Production workflow/manifest selection from `generation_method`.
-- Keyframe input patching for `keyframe_i2v`.
-- Ordered REF2VA picture input patching for `reference2video`.
-- Source-audio conditioning.
+Phase 8A starts from the accepted Phase 7 checkpoint SHA
+`1a3593c6be52e8f1abb99f90443cc34e36e9e00e`.
+
+This structural round adds the real Render stage and its single authoritative,
+read-only render-preflight contract. Preflight reports project identity,
+requirements, per-scene method and exact master-audio boundaries, prompt
+freshness, Visuals readiness, source-audio readiness, workflow-contract
+readiness, runtime requirements, preparation readiness, stable blockers, and
+warnings. Scene readiness is independent: an incomplete scene does not gate an
+otherwise eligible scene. Phase 7 prompt freshness remains authoritative,
+including `CURRENT`, `NEEDS GPT`, `UNSAVED`, and `STALE` with stale precedence.
+
+Phase 8A prepares project-owned scene audio, accepted keyframe or ordered
+REF2VA references, timing metadata, immutable manifest-compiled workflows, and
+durable preparation fingerprints. The H3 timing contract is 24 fps with the
+approved `5 + 17n` frame grid; exact source-audio duration remains authoritative
+and any generated-duration mismatch is explicit. Preparation is a dry boundary:
+it validates prerequisites and writes local inputs/metadata, but never submits a
+ComfyUI queue, calls `/prompt`, invokes H3, downloads models, or exposes a fake
+render-execution control. The project remains schema v7 and uses the existing
+project-owned `scene_audio`, `renders`, and `export` directories.
+
+Content readiness, workflow readiness, runtime requirements, and target-hardware
+qualification are reported separately. An AMD RX 7900 XT development host may
+support structural preparation without implying RTX 4080 SUPER production
+qualification; target qualification is deferred to the supported runtime gate.
+
+Manual contracts accepted for the current Phase 8A implementation:
+
+- MT-52 — Render Preflight / Scene Readiness — PASS
+- MT-53 — Scene Media Preparation — PASS
+- MT-54 — Production Workflow Dry Compilation — PASS
+- MT-55 — Preparation Invalidation / AMD-Safe Boundary — PASS
+
+### Phase 8A.1 — Required reference synchronization and Visuals guardrails
+
+When a Storyboard is applied, requiredness is derived at the owner/resource
+level from the current required Character and Location owners. Every current
+image under each required owner is automatically synchronized into the
+affected Visuals scene as the authoritative locked baseline. Required images
+retain Storyboard owner order and entity reference order, are visibly
+identified, and cannot be removed or reordered through normal Visuals actions.
+Optional Reference-to-Video references remain supported after the complete
+required group, retain their relative order, and remain subject to the
+existing nine-reference cap.
+Re-apply is non-destructive: references that are no longer required remain
+selected as optional references. The synchronized selections use the existing
+schema-v7 Visuals persistence model and do not make the freshly applied
+Storyboard stale. Keyframe / Image-to-Video continues to use the accepted
+keyframe as the sole H3 Picture 1 / first-frame authority; synchronized
+Storyboard references provide context only and are not additional H3 inputs.
+
+Manual contract:
+
+- MT-56 — Required Storyboard Reference Synchronization — PASS
+
+### Phase 8A.3 — Authoritative required-reference reconciliation
+
+Required Visuals selection is canonical derived state, not a second user decision.
+The authoritative scene reconciler derives the locked required block from the
+current applied Storyboard's first-seen owner order, then expands each required
+owner in its current entity-reference order. It self-heals missing, late,
+misordered, and duplicate selections on Storyboard Apply, project load/reopen,
+Visuals initialization, resource changes, re-apply, and migration without adding
+per-image required schema state. The complete required block always precedes the
+optional block; optional references retain their relative order and remain the
+only references users may add, remove, or reorder within the existing nine-image
+Reference-to-Video limit.
+
+Normal Visuals validation therefore reports integrity failures only: unresolved
+owners, resources, assets, corrupt selectors, an impossible required set, or a
+truthful over-capacity blocker. Ordinary UI actions cannot create missing-required
+selection or required-order errors. Reconciliation is idempotent, leaves an
+already-applied Storyboard current, and only changes downstream Prompt and Render
+preparation freshness when the canonical Visuals mapping actually changes. The
+accepted keyframe remains the sole H3 Picture 1 / first-frame authority for
+Keyframe / Image-to-Video.
+
+Manual contract:
+
+- MT-56 — Required Storyboard Reference Synchronization — PASS
+
+### Phase 8A.4 — Preflight performance and runtime requirements cache
+
+Render preflight separates dynamic scene correctness from stable runtime
+requirements discovery. Prompt freshness, Visuals selection/readiness, source
+file existence, and preparation fingerprints are evaluated on every refresh;
+the authoritative runtime requirements scanner remains fail-closed but its
+successful process-local snapshot is reused while its versioned manifest and
+runtime identity remain unchanged.
+
+Normal refreshes use the warm snapshot. A visible Rescan Runtime action forces
+a fresh discovery pass, process restart clears the cache, and runtime
+manifest/version changes invalidate it. Failed scans are not retained as
+successful cache entries, and identical concurrent scans coalesce so a slow
+runtime inspection does not multiply. File identity hashing is reused only
+when the file size, modification time, and inode signature are unchanged;
+dynamic readiness and preparation correctness are never replaced by a full
+preflight cache. No project schema or persisted cache state is introduced.
+
+The Render UI prevents duplicate refresh requests, distinguishes runtime
+inspection from scene-readiness refresh, reuses stable scene cards, and
+preserves content scroll position.
+
+Manual contract:
+
+- MT-57 — Preflight Performance and Requirements Cache — PENDING
+
+Queue execution, output detection, trimming, and final scene output
+association are explicitly deferred to the next Phase 8 round.
+
+Deferred Phase 8B execution:
+
 - Local queue submission.
 - Progress.
 - failure reporting.

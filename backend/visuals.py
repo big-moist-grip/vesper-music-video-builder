@@ -298,6 +298,215 @@ def _selected_key(selector: dict[str, object]) -> tuple[str, str, str]:
     return selector["entity_type"], selector["entity_id"], selector["reference_id"]
 
 
+def _reference_owner_key(selector: dict[str, object]) -> tuple[str, str]:
+    return selector["entity_type"], selector["entity_id"]
+
+
+def _entity_for_reference_owner(
+    project: dict[str, object],
+    owner_key: tuple[str, str],
+) -> dict[str, object] | None:
+    entity_type, entity_id = owner_key
+    if entity_type == "character":
+        collection = project.get("characters", [])
+        id_field = "character_id"
+    elif entity_type == "location":
+        collection = project.get("locations", [])
+        id_field = "location_id"
+    else:
+        return None
+    return next(
+        (entity for entity in collection if entity.get(id_field) == entity_id),
+        None,
+    )
+
+
+def _reference_display_name(project: dict[str, object], selector: dict[str, object]) -> str:
+    collections = {
+        "character": project.get("characters", []),
+        "location": project.get("locations", []),
+    }
+    entities = collections.get(selector.get("entity_type"), [])
+    entity = next(
+        (candidate for candidate in entities if candidate.get(f"{selector['entity_type']}_id") == selector.get("entity_id")),
+        None,
+    )
+    if entity is not None:
+        reference = _entity_reference(entity, str(selector.get("reference_id")))
+        if reference is not None:
+            return f"{entity['name']} · {reference['original_name']}"
+        return f"{entity['name']} · {selector.get('reference_id', 'unknown')}"
+    return f"{selector.get('entity_type', 'unknown')} · {selector.get('reference_id', 'unknown')}"
+
+
+def _required_owner_order_for_scene(
+    project: dict[str, object],
+    scene_id: str,
+) -> list[tuple[str, str]]:
+    storyboard_scene = _storyboard_scene(project, scene_id)
+    if storyboard_scene is None:
+        return []
+    owners: list[tuple[str, str]] = []
+    seen_owners: set[tuple[str, str]] = set()
+    for selector in storyboard_scene.get("required_references", []):
+        owner_key = _reference_owner_key(selector)
+        if owner_key in seen_owners:
+            continue
+        seen_owners.add(owner_key)
+        owners.append(owner_key)
+    return owners
+
+
+def _required_owner_keys_for_scene(
+    project: dict[str, object],
+    scene_id: str,
+) -> set[tuple[str, str]]:
+    return set(_required_owner_order_for_scene(project, scene_id))
+
+
+def _required_references_for_scene(
+    project: dict[str, object],
+    scene_id: str,
+) -> list[dict[str, object]]:
+    """Return every current reference owned by each required Storyboard owner.
+
+    Storyboard ``required_references`` remains the compact owner/order marker.
+    Requiredness is deliberately derived from that marker plus current entity
+    metadata, so adding a second image to a required Character or Location does
+    not require a second persisted required flag.
+    """
+    owners = _required_owner_order_for_scene(project, scene_id)
+
+    required: list[dict[str, object]] = []
+    for entity_type, entity_id in owners:
+        entity = _entity_for_reference_owner(project, (entity_type, entity_id))
+        if entity is None:
+            continue
+        for reference in entity.get("references", []):
+            required.append(
+                {
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "reference_id": reference["reference_id"],
+                }
+            )
+    return required
+
+
+def reconcile_scene_reference_selection(
+    project: dict[str, object],
+    scene_id: str,
+    selected: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Return the canonical selected-reference sequence for one scene.
+
+    The applied Storyboard supplies required owner order. Current entity
+    metadata supplies every image and its authoritative within-owner order.
+    Existing selections from non-required owners are the only optional state,
+    and their relative order is preserved after the complete required block.
+    """
+    if not isinstance(selected, list):
+        return selected
+    required = _required_references_for_scene(project, scene_id)
+    required_keys = {_selected_key(selector) for selector in required}
+    required_owner_keys = _required_owner_keys_for_scene(project, scene_id)
+    extras: list[dict[str, str]] = []
+    seen = set(required_keys)
+    for selector in selected:
+        if not isinstance(selector, dict):
+            extras.append(selector)
+            continue
+        try:
+            owner_key = _reference_owner_key(selector)
+            key = _selected_key(selector)
+        except (KeyError, TypeError):
+            extras.append(selector)
+            continue
+        if owner_key in required_owner_keys:
+            continue
+        if key not in seen:
+            extras.append(selector)
+            seen.add(key)
+    return [*required, *extras]
+
+
+def reconcile_project_reference_selections(project: dict[str, object]) -> dict[str, object]:
+    """Materialize canonical REF2VA selections for every current scene.
+
+    This is the project-level lifecycle adapter around
+    :func:`reconcile_scene_reference_selection`. It is intentionally pure: load,
+    save, Storyboard Apply, resource mutation, and Visuals projection can all
+    call it without creating a persistence or invalidation loop.
+    """
+
+    visuals = project.get("visuals")
+    if not isinstance(visuals, dict) or not isinstance(visuals.get("scenes"), list):
+        return project
+
+    changed = False
+    updated_scenes: list[dict[str, object]] = []
+    for visual_scene in visuals["scenes"]:
+        if not isinstance(visual_scene, dict):
+            updated_scenes.append(visual_scene)
+            continue
+        reference2video = visual_scene.get("reference2video")
+        selected = (
+            reference2video.get("selected_references", [])
+            if isinstance(reference2video, dict)
+            else None
+        )
+        if not isinstance(selected, list):
+            updated_scenes.append(visual_scene)
+            continue
+
+        reconciled = reconcile_scene_reference_selection(
+            project,
+            str(visual_scene.get("scene_id")),
+            selected,
+        )
+        if reconciled == selected:
+            updated_scenes.append(visual_scene)
+            continue
+        changed = True
+        updated_scenes.append(
+            {
+                **visual_scene,
+                "reference2video": {"selected_references": reconciled},
+            }
+        )
+
+    if not changed:
+        return project
+    return {**project, "visuals": {**visuals, "scenes": updated_scenes}}
+
+
+# Compatibility name retained for the existing Storyboard Apply route. The
+# implementation is the same canonical project reconciliation path used by
+# validation, load/materialization, and Visuals mutations.
+synchronize_storyboard_required_references = reconcile_project_reference_selections
+
+
+def _required_reference_file_is_resolvable(
+    storage: ProjectStorage,
+    project: dict[str, object],
+    selector: dict[str, object],
+) -> bool:
+    from .entities import get_reference_path_for_project
+
+    kind = "characters" if selector["entity_type"] == "character" else "locations"
+    try:
+        get_reference_path_for_project(
+            storage,
+            project,
+            kind,
+            selector["entity_id"],
+            selector["reference_id"],
+        )
+    except (ProjectNotFoundError, ProjectValidationError, OSError, KeyError, StopIteration):
+        return False
+    return True
+
+
 def derive_visual_readiness(
     project: dict[str, object],
     scene_id: object,
@@ -326,7 +535,14 @@ def derive_visual_readiness(
             missing.append("Missing actual image description")
     else:
         selected = visual_scene["reference2video"]["selected_references"]
-        if len(selected) > MAX_REF2VA_STILL_REFERENCES:
+        required = _required_references_for_scene(project, visual_scene["scene_id"])
+        if len(required) > MAX_REF2VA_STILL_REFERENCES:
+            missing.append(
+                "Storyboard-required references require "
+                f"{len(required)} images, exceeding the Reference-to-Video maximum of "
+                f"{MAX_REF2VA_STILL_REFERENCES}."
+            )
+        elif len(selected) > MAX_REF2VA_STILL_REFERENCES:
             missing.append(
                 f"Reference-to-Video supports at most {MAX_REF2VA_STILL_REFERENCES} still references"
             )
@@ -351,9 +567,28 @@ def derive_visual_readiness(
             if any(_selected_key(selector) not in assigned for selector in selected):
                 missing.append("A selected reference is not assigned to this scene")
             selected_keys = {_selected_key(selector) for selector in selected}
-            for required in storyboard_scene["required_references"]:
-                if _selected_key(required) not in selected_keys:
-                    missing.append("A required storyboard reference is not selected")
+            for required_selector in required:
+                required_key = _selected_key(required_selector)
+                if required_key not in selected_keys:
+                    display_name = _reference_display_name(project, required_selector)
+                    missing.append(
+                        f"Required storyboard reference '{display_name}' is missing from synchronized Visuals selection."
+                    )
+
+            for marker in storyboard_scene["required_references"]:
+                entity = _entity_for_reference_owner(project, _reference_owner_key(marker))
+                if entity is None or _entity_reference(entity, marker["reference_id"]) is None:
+                    display_name = _reference_display_name(project, marker)
+                    missing.append(
+                        f"Required storyboard reference '{display_name}' could not be resolved."
+                    )
+            if storage is not None:
+                for required_selector in required:
+                    display_name = _reference_display_name(project, required_selector)
+                    if not _required_reference_file_is_resolvable(storage, project, required_selector):
+                        missing.append(
+                            f"Required storyboard reference '{display_name}' could not be resolved."
+                        )
 
     return {
         "scene_id": scene["scene_id"],
@@ -387,7 +622,7 @@ def build_keyframe_prompt(project: dict[str, object], scene_id: object) -> str:
     assigned_characters = [characters_by_id[character_id] for character_id in (storyboard_scene or {}).get("character_ids", [])]
     location = locations_by_id.get((storyboard_scene or {}).get("location_id"))
     required_reference_names: list[str] = []
-    for selector in (storyboard_scene or {}).get("required_references", []):
+    for selector in _required_references_for_scene(project, canonical_scene_id):
         entity = characters_by_id.get(selector["entity_id"]) or locations_by_id.get(selector["entity_id"])
         if entity is not None:
             reference = _entity_reference(entity, selector["reference_id"])
@@ -548,17 +783,27 @@ def generate_and_save_keyframe_prompt(storage: ProjectStorage, project_id: objec
 def save_reference_selection(storage: ProjectStorage, project_id: object, scene_id: object, payload: object) -> dict[str, object]:
     project = storage.load_project(project_id)
     document = _require_exact_fields(payload, REFERENCE2VIDEO_FIELDS, "Reference-to-Video state")
+    current = _visual_entry(project, scene_id)
+    required = _required_references_for_scene(project, current["scene_id"])
     selected = _validate_selected_references(
         document.get("selected_references"),
         project["characters"],
         project["locations"],
+        allow_over_capacity=len(required) > MAX_REF2VA_STILL_REFERENCES,
     )
-    current = _visual_entry(project, scene_id)
-    updated = {**current, "reference2video": {"selected_references": selected}}
+    reconciled = reconcile_scene_reference_selection(project, current["scene_id"], selected)
+    if len(reconciled) > MAX_REF2VA_STILL_REFERENCES and len(required) <= MAX_REF2VA_STILL_REFERENCES:
+        raise ProjectValidationError(
+            f"Visuals selected_references cannot exceed {MAX_REF2VA_STILL_REFERENCES} still references."
+        )
+    updated = {**current, "reference2video": {"selected_references": reconciled}}
     return storage.save_project(
         project["project_id"],
         _replace_visual_entry(project, current["scene_id"], updated),
         allow_visuals_change=True,
+        allow_visual_over_capacity_scene_ids={current["scene_id"]}
+        if len(reconciled) > MAX_REF2VA_STILL_REFERENCES
+        else None,
     )
 
 
@@ -755,6 +1000,16 @@ def remove_keyframe(storage: ProjectStorage, project_id: object, scene_id: objec
 
 def get_keyframe_path(storage: ProjectStorage, project_id: object, scene_id: object) -> Path:
     project = storage.load_project(project_id)
+    return get_keyframe_path_for_project(storage, project, scene_id)
+
+
+def get_keyframe_path_for_project(
+    storage: ProjectStorage,
+    project: dict[str, object],
+    scene_id: object,
+) -> Path:
+    """Resolve an accepted keyframe using an already loaded project."""
+
     current = _visual_entry(project, scene_id)
     accepted = current["keyframe_i2v"]["accepted_keyframe"]
     if accepted is None:
