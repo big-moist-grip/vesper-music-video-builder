@@ -56,6 +56,11 @@ from .render import (
     build_render_preflight,
     prepare_render_scene,
 )
+from .render_finalize import (
+    RenderFinalizationError,
+    enrich_render_jobs_with_finalization,
+    finalize_render_job,
+)
 from .render_jobs import (
     RenderJobError,
     RenderJobNotFound,
@@ -210,11 +215,19 @@ def register_routes():
         try:
             validate_project_id(project_id)
             result = await asyncio.to_thread(reconcile_project_jobs, PROJECT_STORAGE, project_id)
+            result["jobs"] = await asyncio.to_thread(
+                enrich_render_jobs_with_finalization,
+                PROJECT_STORAGE,
+                project_id,
+                result.get("jobs", []),
+            )
         except ProjectValidationError:
             return api_error("Invalid project ID.", 400)
         except ProjectNotFoundError:
             return api_error("Project was not found.", 404)
         except RenderJobError as error:
+            return render_job_error(error)
+        except RenderFinalizationError as error:
             return render_job_error(error)
         except ProjectPersistenceError:
             LOGGER.exception("Could not load durable render jobs.")
@@ -290,6 +303,32 @@ def register_routes():
             LOGGER.exception("Could not persist retried render job state.")
             return api_error("Render job state could not be persisted.", 500)
         return web.json_response(result, status=202)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/render/jobs/{job_id}/finalize")
+    async def music_video_builder_finalize_render_job(request):
+        project_id = request.match_info["project_id"]
+        job_id = request.match_info["job_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+        payload = await read_json(request)
+        if payload is not None and (not isinstance(payload, dict) or payload):
+            return api_error("Finalization does not accept raw paths, audio paths, or request fields.", 400)
+        try:
+            result = await asyncio.to_thread(finalize_render_job, PROJECT_STORAGE, project_id, job_id)
+        except ProjectValidationError:
+            return api_error("Invalid render job ID.", 400)
+        except (ProjectNotFoundError, RenderJobNotFound):
+            return api_error("Render job was not found.", 404)
+        except RenderJobError as error:
+            return render_job_error(error)
+        except RenderFinalizationError as error:
+            return render_job_error(error)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist finalization state.")
+            return api_error("Finalization state could not be persisted.", 500)
+        return web.json_response(result)
 
     @PromptServer.instance.routes.post("/music-video-builder/gpt/{director}/open")
     async def music_video_builder_open_gpt(request):

@@ -79,36 +79,39 @@ The MVP supports two first-class per-scene H3 visual-conditioning methods:
 
 Generic Text-to-Video is not part of the Music Video Builder MVP.
 
-Target machine:
+Supported development and execution machines:
 
 - Windows.
-- NVIDIA RTX 4080 SUPER 16 GB.
+- AMD Radeon RX 7900 XT — primary development and functional-test machine.
+- NVIDIA RTX 4080 SUPER 16 GB — secondary, faster production/performance machine.
 - 32 GB system RAM.
 - Local ComfyUI.
 - Local MiniMax H3 inference.
 
 No external inference API is required.
 
-### Development host and target qualification host
+### Development host and secondary performance host
 
-The current development host is intentionally:
+The primary development host is:
 
 - AMD Radeon RX 7900 XT.
 
-The target production and final qualification host remains:
+The secondary production/performance host is:
 
 - NVIDIA RTX 4080 SUPER 16 GB.
 - 32 GB system RAM.
 
-The AMD workstation is used to complete Builder development and deterministic
-validation. Resource failures observed on that host do not invalidate the
-selected H3 models, do not justify lowering production quality, and do not
-predict failure on the target NVIDIA host.
+Both GPUs are valid H3 execution platforms. The AMD workstation is the primary
+machine for Builder development, automated testing, and functional H3 testing;
+the RTX workstation is available for faster production runs and performance
+comparison. RTX throughput preference is informational and is not an execution
+or implementation prerequisite.
 
-Do not alter Windows paging, download lower-quality substitutes, promote the
-W4A8 REF2VA candidate to Final, or rerun an expensive H3 generation on the AMD
-host solely to make a development-host qualification pass. Such a diagnostic
-run requires explicit reviewer authorization.
+The same quality-first production workflow and settings apply on both GPUs.
+Actual runtime, model, node, content, workflow, and preparation failures remain
+truthful blockers on either machine. Do not alter Windows paging, download
+lower-quality substitutes, or promote the W4A8 REF2VA candidate to Final to
+work around a runtime failure.
 
 ---
 
@@ -1697,10 +1700,12 @@ ComfyUI queue, calls `/prompt`, invokes H3, downloads models, or exposes a fake
 render-execution control. The project remains schema v7 and uses the existing
 project-owned `scene_audio`, `renders`, and `export` directories.
 
-Content readiness, workflow readiness, runtime requirements, and target-hardware
-qualification are reported separately. An AMD RX 7900 XT development host may
-support structural preparation without implying RTX 4080 SUPER production
-qualification; target qualification is deferred to the supported runtime gate.
+Content readiness, workflow readiness, runtime requirements, and preparation
+freshness are reported separately from an informational multi-GPU execution
+policy. Scene execution eligibility depends only on the real current scene
+dimensions and active-job protections. AMD RX 7900 XT and RTX 4080 SUPER 16 GB
+are both valid H3 execution targets; RTX is preferred only when faster
+throughput is useful.
 
 Manual contracts accepted for the current Phase 8A implementation:
 
@@ -1803,12 +1808,13 @@ last known state across transient polling failures, and never fabricates a
 numeric progress value. Restart recovery treats a missing prompt ID or a
 prompt absent from both queue and history as UNKNOWN rather than success.
 
-The target-hardware gate is checked before any `/prompt` request. The AMD
-development host remains structural-only; target NVIDIA qualification is a
-separate dimension and remains deferred. Queued cancellation uses the owned
-prompt ID for queue deletion. Running cancellation uses the installed global
-engine interrupt API targeted by that prompt ID and is represented with that
-scope explicitly.
+The execution eligibility gate is checked before any `/prompt` request. It
+admits a scene only when content, workflow, runtime requirements, and current
+preparation are ready; GPU vendor is not an admission condition. AMD and RTX
+therefore use the same production workflow and quality settings. Queued
+cancellation uses the owned prompt ID for queue deletion. Running cancellation
+uses the installed global engine interrupt API targeted by that prompt ID and
+is represented with that scope explicitly.
 
 Successful output association is derived only from the prompt-owned ComfyUI
 history entry, the manifest-declared production output node, and the expected
@@ -1818,21 +1824,570 @@ remuxing, authoritative-audio replacement, upscaling, final-duration
 correction, export assembly, and batch lifecycle remain later work.
 
 The Render card exposes compact lifecycle state, guarded cancel/retry actions,
-reconciliation-required status, and raw output association without scroll
-jumps or fake executable controls while target qualification is deferred.
+reconciliation-required status, raw output association, and a non-blocking
+hardware performance note without scroll jumps or fake deferred controls.
 
 Manual contracts for this structural round:
 
-- MT-58 — Render Execution Gate / AMD Safety — PASS
-- MT-59 — ComfyUI Queue Submission Contract — DEFERRED_TARGET_HARDWARE
+- MT-58 — Render Execution Gate / AMD Safety — SUPERSEDED_PRODUCT_DECISION
+- MT-59 — ComfyUI Queue Submission Contract — FAIL / PENDING_RETEST
 - MT-60 — Render Job Lifecycle / Recovery — PASS_STRUCTURAL
 - MT-61 — Failure / Retry / Cancellation — PASS_STRUCTURAL
-- MT-62 — Raw Output Discovery / Association — DEFERRED_TARGET_HARDWARE
+- MT-62 — Raw Output Discovery / Association — BLOCKED_BY_MT59 / PENDING_LIVE_RENDER
+
+### Phase 8C — Raw output finalization, exact timing, and authoritative audio
+
+Phase 8C consumes only a successful Phase 8B raw H3 output. It keeps the raw
+artifact immutable and creates a separate project-owned final scene artifact
+under `renders/<scene>/final/<job_id>.mp4`, with durable finalization metadata
+beside it. Finalization does not mutate the project document, Prompt provenance,
+preparation metadata, or the raw Builder job record.
+
+The installed H3 node contract was audited directly: its `temporal_shape()`
+uses `frame_count / 24` for generated video duration and its
+`align_frame_count()` rounds upward until `frame_count % 17 == 5`. The accepted
+frame planner therefore chooses the smallest valid `5 + 17n` count whose
+nominal generated duration is at least the exact scene duration. The previous
+6679 ms example's 158 frames represented 6583.333 ms and was unsafe; the
+corrected plan is 175 frames representing 7291.666667 ms, followed by a
+precise finalization trim. The planner retains the 24 FPS, minimum 5, step 17,
+and maximum 3600 contract and fails closed when the valid grid cannot cover the
+target.
+
+Raw media is inspected with bounded JSON `ffprobe` calls. A valid raw result
+must contain a 24 FPS video stream with usable dimensions and duration;
+container duration, frame count, time base, codec, and any raw audio streams
+are recorded. Raw audio is never authoritative. A video shortfall fails with
+`RAW_VIDEO_TOO_SHORT` rather than speed modification, interpolation, or freeze
+padding. The explicit timing tolerances are one 24 FPS frame for video and
+container boundaries, one source audio sample for prepared PCM, and two 1024
+sample AAC frames for final encoded-audio priming/padding.
+
+Final scene media is encoded deterministically with installed FFmpeg using
+libx264, medium preset, CRF 18, yuv420p, 24 FPS, AAC-LC at 256 kbps, and no
+filters, scaling, interpolation, normalization, gain, or tempo changes. The
+video is mapped from the raw H3 input and the audio is mapped from the exact
+Phase 8A prepared scene-audio artifact. The candidate is ffprobe-validated
+before atomic promotion; a failed replacement retains any prior valid final
+artifact. Finalization fingerprints include the raw job/output identity,
+preparation fingerprint, exact target duration, authoritative audio identity,
+and encode policy. Finalization states are NOT_AVAILABLE, RAW_READY,
+FINALIZING, FINALIZED, STALE, and FAILED. Re-finalization is idempotent for
+unchanged inputs, while raw, preparation, audio, or policy changes make the
+old final stale.
+
+The Render card distinguishes historical/current RAW H3 OUTPUT from FINAL
+SCENE state. `Finalize Scene` is available for a current successful raw job
+without requiring a different GPU vendor. Synthetic FFmpeg media qualifies the
+post-processing path without running H3.
+
+Manual contracts for this round:
+
+- MT-63 — Post-Processing Eligibility / UI — PASS
+- MT-64 — Exact Scene Finalization / Authoritative Audio — PASS_STRUCTURAL
+- MT-65 — Finalization Invalidation / Idempotence — PASS_STRUCTURAL
+- MT-66 — Frame-Plan Coverage — PASS
+
+MT-59 remains pending retest and MT-62 remains blocked by MT-59 pending live-render evidence. Upscale, Resolve package
+and export, and complete-video assembly remain later work.
+
+### Phase 8C.1 — Multi-GPU execution eligibility and frame-plan UX
+
+The AMD RX 7900 XT is the primary and fully valid development and functional H3
+execution machine. The RTX 4080 SUPER 16 GB is a second fully valid execution
+machine that is expected to provide faster throughput. GPU vendor is never a
+hard Render or queue gate, and no quality downgrade or alternate production
+workflow is selected for AMD. Actual content, workflow, runtime, preparation,
+duplicate-job, stale-input, and ComfyUI runtime failures remain blocking and
+truthful on either platform.
+
+The Render preflight exposes one per-scene `execution_eligibility` decision
+based on content readiness, workflow readiness, runtime requirements, and
+current preparation. The top-level execution policy is informational only.
+Eligible scenes expose `Render Scene` and may reach the existing Phase 8B queue
+adapter. The Render card presents the H3 plan concisely in seconds plus any
+required finalization trim while preserving the exact internal 24 FPS `5 + 17n`
+timing contract and authoritative audio duration.
+
+MT-58 is superseded by this product decision. MT-59 and MT-62 are pending live
+render evidence on the AMD development machine; MT-60 and MT-61 remain
+structurally accepted. MT-63 is PASS, MT-64 and MT-65 are PASS_STRUCTURAL, and
+MT-66 is PASS. The new cross-hardware eligibility contract is:
+
+- MT-67 — Cross-Hardware Render Eligibility — PASS
+
+This round does not run H3, submit a live queue job, begin Phase 8D, or change
+the Phase 8B lifecycle and Phase 8C finalization boundaries.
+
+### Phase 8C.2 — Live ComfyUI submission validation diagnostics
+
+Live ComfyUI prompt validation is authoritative over the Builder's static
+template/manifest contract. The submitted payload was confirmed to be the
+correct API shape, `{ "prompt": <API-format node graph> }`, without a UI
+workflow, manifest, or preparation wrapper. The failed REF2VA package was also
+confirmed to contain API nodes with `class_type` and `inputs`; no production
+model, quality, timing, or graph setting required correction.
+
+The exact live rejection was file materialization. ComfyUI's validation log
+identified LoadAudio node 7 input `audio` and LoadImage nodes 50 through 53
+input `image`. Their submitted values were the deterministic
+`music_video_builder/<project>/<scene>/scene_audio.wav` and
+`picture_01.png` through `picture_04.png` selectors. Installed LoadAudio and
+LoadImage validation resolves those selectors only below ComfyUI's
+authoritative input root. Phase 8A had copied the files into the project-owned
+render workspace but had not staged matching copies below that runtime input
+root, so all five selectors were invalid before queue admission.
+
+Preparation version 3 retains the project-owned artifacts and atomically
+stages audio and visual inputs into the fixed
+`ComfyUI/input/music_video_builder/<project>/<scene>/` namespace. Runtime asset
+size/hash records make missing or changed staging copies stale, requiring
+re-preparation; required assets are never truncated or substituted. The
+existing API workflow selectors become valid without changing the immutable
+Phase 6 templates, manifest mappings, production model choices, or shared AMD
+and RTX quality policy.
+
+Before queue submission, Builder now performs read-only, bounded, short-lived
+cached `/object_info/<node_class>` inspection. It verifies API graph shape,
+registered classes, input names, required inputs, detectable scalar types, and
+current enum/file/model selector values. This inspection never uses `/prompt`
+as a validation surrogate. Non-2xx ComfyUI responses preserve bounded parsed
+`error` and `node_errors` data. HTTP 400 validation rejection is persisted as
+`submission_failed_validation`, with no ComfyUI prompt ID, queue/running state,
+polling, or raw-output lookup. The main UI shows a concise affected
+node/input/value summary and provides a bounded diagnostic disclosure; later
+execution failures remain a distinct category.
+
+Manual contracts after this structural remediation:
+
+- MT-59 — ComfyUI Queue Submission Contract — PENDING_RETEST
+- MT-60 — Render Job Lifecycle / Recovery — PASS_STRUCTURAL
+- MT-61 — Failure / Retry / Cancellation — PASS_STRUCTURAL
+- MT-62 — Raw Output Discovery / Association — BLOCKED_BY_MT59 / PENDING_LIVE_RENDER
+- MT-63 — Post-Processing Eligibility / UI — PASS
+- MT-64 — Exact Scene Finalization / Authoritative Audio — PASS_STRUCTURAL
+- MT-65 — Finalization Invalidation / Idempotence — PASS_STRUCTURAL
+- MT-66 — Frame-Plan Coverage — PASS
+- MT-67 — Cross-Hardware Render Eligibility — PASS
+- MT-68 — ComfyUI Validation Error Diagnostics — PASS_STRUCTURAL
+
+The implementation round performs no live `/prompt` request, H3 execution, or
+Phase 8D work. MT-59 requires one manual re-prepare and Render Scene retry;
+MT-62 remains blocked until that retry yields a successful raw H3 output.
+
+### Phase 8C.3 — Dynamic ComfyUI node-input compatibility
+
+The Phase 8C.2 live validator's flat input-name comparison produced a false
+incompatibility for prepared VHS_VideoCombine node 21. The production node
+selects `format = video/h264-mp4`; the installed VideoHelperSuite runtime
+defines format-dependent widgets through nested metadata on the static
+`format` option rather than as flat `required` or `optional` inputs. For the
+selected production format, the resolved dynamic contract is:
+
+- `pix_fmt`: `yuv420p` or `yuv420p10le`;
+- `crf`: integer from 0 through 100;
+- `save_metadata`: boolean;
+- `trim_to_audio`: boolean.
+
+The prepared production values remain valid: `pix_fmt = yuv420p`, `crf = 16`,
+`save_metadata = false`, and `trim_to_audio = false`. The immutable Phase 6
+workflow, manifest, frame rate, format, and quality settings therefore remain
+unchanged. This is a validator-only remediation and preparation version 3
+remains current; users do not need to re-prepare solely for this fix.
+
+Live compatibility resolution now combines static required, optional, and
+hidden inputs with dynamic widgets resolved from the node's actual selected
+option. The resolver is generic over nested selected-option metadata and is
+computed per node configuration, so two nodes of the same class may expose
+different accepted input sets. The short-lived raw object-info response may
+still be cached per class; selected-option resolution is never cached as one
+global class-wide input set.
+
+Input assessment has three outcomes: `SUPPORTED`, `UNSUPPORTED`, and
+`NOT_DETERMINABLE`. Only a definitive `UNSUPPORTED` result blocks submission.
+Malformed or insufficient dynamic metadata does not turn absence from flat
+object-info keys into a false rejection; ComfyUI `/prompt` remains the final
+authoritative validation boundary. Definitive selected-format mismatches, such
+as an unsupported pixel-format value or a widget belonging only to another
+format, still fail before queue submission with the exact node and input.
+
+MT-59 remains PENDING_RETEST. Refresh Preflight, retain the current preparation,
+and click Render Scene once; a valid graph should now reach `/prompt`, while any
+new ComfyUI validation rejection remains separately actionable. MT-62 remains
+BLOCKED_BY_MT59 until a real H3 job produces discoverable raw output. This
+round performs no live `/prompt` request, queue submission, H3 execution, or
+Phase 8D work.
+
+### Phase 8C.4 — LoadImage input materialization compatibility
+
+Execution-media paths and node-widget selectors are separate contracts. Phase
+8 preparation owns a source-preserving execution copy beneath the active
+ComfyUI input root and compiles an input-root-relative selector into each
+LoadImage node. The active Comfy Desktop root for the reported node-50 failure
+was resolved through the runtime as
+`C:\Users\HighStreet\AppData\Local\Comfy-Desktop\ComfyUI-Shared\input`.
+All four prepared pictures and scene audio existed there beneath the
+deterministic project/scene namespace, and their sizes and SHA-256 identities
+matched preparation metadata exactly.
+
+The installed LoadImage contract is intentionally asymmetric. `INPUT_TYPES()`
+uses non-recursive `os.listdir(input_dir)`, so nested selectors do not appear in
+its root-level image-discovery combo. `load_image()` resolves the submitted
+selector with `folder_paths.get_annotated_filepath()`, while
+`VALIDATE_INPUTS()` accepts it when `exists_annotated_filepath()` succeeds. The
+installed ComfyUI prompt validator skips ordinary combo membership for inputs
+owned by a custom `VALIDATE_INPUTS` argument and then calls that custom
+validator. The observed nested selector was absent from the discovery list but
+returned `True` from the installed LoadImage `VALIDATE_INPUTS`; it is therefore
+runtime-valid and must not be flattened.
+
+Live compatibility now treats an option list carrying explicit upload-widget
+metadata such as `image_upload = true` as an open discovery snapshot rather
+than a definitive closed enum. A submitted value present in the list is
+`SUPPORTED`; a value outside it is `NOT_DETERMINABLE` and reaches ComfyUI's
+authoritative `/prompt` validation. Closed enums, including model selectors,
+remain fail-closed and still produce `UNSUPPORTED` for values outside their
+active options. This removes the node-50 false positive without globally
+weakening enum validation or introducing a LoadImage/node-ID allowlist.
+
+No execution materialization or workflow value changed. Preparation version 3,
+its fingerprint, deterministic nested project/scene selectors, atomic copies,
+path-containment checks, REF2VA Picture order and Subject ownership, and the I2V
+accepted-keyframe Picture 1 contract remain current. Audio retains its existing
+LoadAudio selector contract. A cross-version root-level fallback is therefore
+not activated for this installed runtime; it remains the required policy only
+if a future active LoadImage contract definitively rejects safe existing nested
+selectors.
+
+MT-59 remains PENDING_RETEST. Reload if required, Refresh Preflight, retain the
+current preparation, and click Render Scene once. MT-62 remains BLOCKED_BY_MT59
+until a real H3 job produces discoverable raw output. This round performs no
+live `/prompt` request, queue submission, H3 execution, or Phase 8D work.
 
 Before batch work begins, one real H3 scene must pass in each supported generation method:
 
 - Keyframe / Image-to-Video.
 - Reference-to-Video.
+
+---
+
+### Phase 8C.5 — Live ComfyUI progress telemetry
+
+Render jobs retain the HTTP `/queue` and `/history` contract as the durable
+authority for queued, running, terminal, recovery, cancellation, and output
+states. A single shared Builder-owned local WebSocket session is used only for
+volatile prompt-correlated telemetry. Its generated session ID is submitted as
+the installed ComfyUI top-level `client_id`, and event messages are accepted
+only for prompt IDs owned by Builder jobs. Foreign prompts, malformed frames,
+binary preview data, and prompt-less `status` messages cannot alter a job.
+
+The adapter consumes the installed `execution_start`, `execution_cached`,
+`executing`, `progress`, `progress_state`, `executed`, `execution_error`,
+`execution_interrupted`, and `execution_success` messages. It normalizes only a
+finite node-local `value/max` pair with a positive maximum, clamps the visible
+fraction to 0–100%, and never labels node-local progress as whole-workflow
+completion. The current executing node is mapped to a compact manifest/class
+purpose stage such as Loading inputs, Generating video, Decoding output, or
+Encoding output. A new node clears the previous node's numeric display until a
+new reliable pair arrives, so resets remain truthful RUNNING state.
+
+The active installed runtime evidence was inspected directly: `ComfyUI/main.py`
+sends `progress` with `value`, `max`, `prompt_id`, and `node`;
+`ComfyUI/comfy_execution/progress.py` sends `progress_state` with a prompt ID
+and per-node value/max/state records; `ComfyUI/execution.py` sends the
+execution-start/cache/current-node/executed/error/interrupted/success events;
+and `ComfyUI/server.py` copies the `/prompt` top-level `client_id` into the
+execution session that receives those events. `progress_state` is therefore
+treated as node-local installed-runtime state, not as an aggregate graph
+percentage.
+
+The connection reconnects after transient disconnects and server restarts;
+disconnect is not a failure and retained telemetry resumes when the same owned
+prompt session is available. Success, failure, interruption, and Builder
+cancellation clear the volatile snapshot. Telemetry ticks are not persisted in
+project or job JSON. HTTP reconciliation overlays the latest snapshot in the
+Render response without mutating durable job records, and the UI updates only a
+stable telemetry subtree so narrow cards and scroll position remain steady.
+
+MT-69 — Live Render Progress Telemetry — PENDING. This round adds exact
+installed-event fixtures, prompt isolation, normalized node-local progress,
+stage mapping, reset and terminal handling, reconnect behavior, shared-session
+identity, volatile-overlay, and narrow Render DOM regressions. It does not
+submit another H3 job, execute H3, or begin Phase 8D.
+
+---
+
+### Phase 8C.6 — Job reconciliation and telemetry-deadlock remediation
+
+The durable render lifecycle is reconciled through one HTTP-authoritative path:
+ComfyUI `/queue` establishes queued/running evidence and `/history/{prompt_id}`
+establishes terminal success, failure, or interruption. History terminal results
+take precedence over stale WebSocket observations; a confirmed queue-running or
+queue-pending prompt remains truthful even when history is temporarily absent or
+no telemetry event has arrived. A prompt absent from both queue and history
+becomes `UNKNOWN` / `RECONCILIATION_REQUIRED` only after those durable sources
+actually provide absence, and a history transport failure preserves the last
+durable state for bounded retry.
+
+WebSocket telemetry remains supplementary, prompt-correlated, volatile display
+data. Re-registering an existing prompt does not manufacture an observed
+`RUNNING` snapshot, telemetry freshness prevents stale numeric progress from
+being displayed, and terminal HTTP reconciliation clears live telemetry. The
+frontend keeps one bounded HTTP polling coordinator active for queued, running,
+or unreconciled jobs; it does not wait for WebSocket replay or create a second
+poll loop. Durable job state is never `WAITING_FOR_TELEMETRY`, and the UI no
+longer presents `UNKNOWN` / reconciliation-required beside a telemetry-only
+`RUNNING` panel. Render submission remains disabled for any possible active or
+unreconciled job, while terminal recovery updates the controls without a new
+H3 submission.
+
+Historical ComfyUI success automatically retries the existing raw-output
+association during reconciliation. If output discovery fails, the job remains
+terminal `SUCCEEDED` at the ComfyUI execution layer and records a separate
+`output_discovery` failure; it is never regressed to `RUNNING` or misreported as
+an execution failure. No prompt, queue, H3, preparation, frame-plan, or
+workflow-quality change is made by this remediation.
+
+MT-62 — Existing Render Job Recovery — PENDING. Reload if required, open Render,
+and Refresh Preflight once; recover the existing prompt from queue/history and
+discover its raw H3 output without rerendering if the historical execution
+succeeded. MT-69 — Live Render Progress Telemetry — PENDING_RETEST. This round
+does not submit another H3 job, execute H3, or begin Phase 8D.
+
+---
+
+### Phase 8C.7 — Orphaned-job recovery and deterministic output fallback
+
+The persisted job `9c4e6fad-49b2-41aa-8805-ffce8648d174` for scene
+`002fc648-3024-472e-8753-895dec21c1c5` was inspected without modifying the
+project, job record, prepared workflow, or ComfyUI output. Its durable state was
+`UNKNOWN` with `RECONCILIATION_REQUIRED`, and the installed ComfyUI log recorded
+an explicit cancellation followed by `Processing interrupted` for prompt
+`267dcce2-b1fe-4109-a2ad-23d84de8e755`. The queue and prompt-history endpoints
+were unavailable during inspection (`127.0.0.1:8188` refused both requests),
+and no output matched the persisted project/scene namespace. A Comfy Desktop
+restart snapshot exists, but the installed runtime exposes no reliable
+per-process or per-instance identity; recovery therefore relies on durable
+queue/history/output evidence and does not invent a `comfy_instance_id`.
+
+`RECONCILIATION_REQUIRED` is now transient. A reachable queue with no prompt,
+an absent history entry, and no recoverable deterministic output must be
+confirmed twice before the job becomes terminal `ORPHANED`. Queue or history
+transport failures do not count as absence. An orphaned job is retained as an
+immutable historical record, is no longer active, and may be retried without a
+user delete action or permanent UI deadlock.
+
+Before declaring a prompt lost, reconciliation scans only the job-owned
+deterministic output prefix. It accepts exactly one direct supported-video
+candidate, rejects traversal/symlink/outside-root paths, rejects ambiguity,
+and validates stable non-empty media through the existing ffprobe adapter.
+Successful fallback records the output as history-independent and
+`deterministic_job_output_prefix`; unresolved, ambiguous, corrupt, or partial
+media fails closed and eventually produces the truthful orphaned blocker.
+
+New submissions use a deep execution copy of the prepared workflow and append
+the Builder `job_id` to the manifest-owned output prefix. The prepared workflow
+file, preparation fingerprint, frame plan, prompt provenance, and quality
+settings remain unchanged. Retries therefore receive distinct prompt and
+output namespaces while the old job and any old raw output remain preserved.
+The Render UI labels the terminal state `ORPHANED`, explains that the previous
+ComfyUI job is unavailable, re-enables Render Scene when current inputs are
+ready, and exposes Retry. The top badge says `INPUTS READY` to distinguish
+input readiness from queue state.
+
+MT-62 — Existing Render Job Recovery — PENDING pending live queue/history and
+raw-output evidence. MT-69 — Live Render Progress Telemetry — PENDING_RETEST.
+MT-70 — Orphaned Job Recovery / Output Fallback — PASS. This round adds no
+H3 execution, no second automatic H3 submission, no queue lifecycle expansion,
+and no Phase 8D work.
+
+---
+
+### Phase 8C.8 — Live progress repair and Renders UI cleanup
+
+The real telemetry failure was at the first transport boundary, before prompt
+correlation or frontend delivery. The active ComfyUI Python environment has
+`websockets 16.1.1` and `websockets.sync.client.connect`, but does not have the
+`websocket-client` package imported by the Builder's former default factory.
+The adapter caught that `ModuleNotFoundError` in an unlogged reconnect loop, so
+the WebSocket remained disconnected, no installed ComfyUI event entered the
+Builder, the volatile snapshot remained unobserved, and the frontend hid its
+telemetry panel. Read-only inspection found the local API unavailable and the
+installed ComfyUI log recorded the then-current prompt starting and later being
+cancelled; no Builder WebSocket existed from which that job's live event traffic
+could be recovered. The job was not interrupted or mutated by this round.
+
+Installed ComfyUI source confirms that `/ws?clientId=<id>` owns the socket
+session, `/prompt` copies the top-level `client_id` into execution `extra_data`,
+and execution/progress events are directed to that same client identity. The
+Builder already generated one non-caller-controlled ID for both paths, but its
+worker waited for an owned `prompt_id` before connecting while ownership was not
+known until `/prompt` returned. Future submissions now request and briefly wait
+for the shared `websockets.sync` session before POSTing with the same ID. A
+connection failure is logged and never gates HTTP submission; queue/history
+remain the durable lifecycle authority and the UI presents truthful
+indeterminate activity when numeric telemetry is unavailable.
+
+The installed event wrappers retained by the adapter are `execution_start`,
+`execution_cached`, `executing`, node-local `progress` (`value`, `max`,
+`prompt_id`, `node`), `progress_state` (`prompt_id`, `nodes`), `executed`,
+`execution_error`, `execution_interrupted`, `execution_success`, and the
+uncorrelated `status` wrapper. Owned prompt IDs are required before an event can
+update the latest in-memory snapshot. Active Render/job responses now include
+the snapshot even before the first event, with `available`, connection state,
+friendly current stage, numeric value/max/percent when present, and update time.
+No progress tick is written to project or job persistence. Structured logs keep
+the WebSocket URL, client ID, prompt ID, Builder job and scene IDs, event and node
+identity, connection/reconnect failures, submission result, and compatibility
+diagnostics outside the product UI.
+
+The user-facing stage is named **Renders**. Redundant Render Preparation and
+Scene readiness headings, the explanatory intro, scene UUID title, persistent
+submission-acceptance banner, numerical-progress debug sentence, repeated RTX
+commentary, filesystem output paths, and primary-card node/input diagnostics
+have been removed. Product state tiles and concise actionable errors remain.
+Runtime rescan is retained as a direct control beside Refresh Preflight. Render
+and preparation actions are disabled while a job is active, and Cancel remains
+available under the existing capability contract.
+
+Every active job has a compact antique-gold activity region. Without a current
+authoritative value/max pair it is indeterminate and claims no percentage. With
+installed ComfyUI node-local progress it becomes determinate and labels the
+number as friendly stage progress, such as `Generating video · 42%`. Stage
+changes clear the prior number, terminal states remove activity, reduced-motion
+preferences suppress animation, and telemetry-only polls update the existing
+DOM subtree without replacing cards or changing scroll position.
+
+MT-69 — Live Render Progress Telemetry — PENDING_RETEST on the next real H3
+submission loaded after this repair; the previous job cannot gain telemetry
+retrospectively. MT-71 — Renders UI Production Cleanup — PENDING. MT-62 remains
+PENDING until a successful current or subsequent job produces and associates
+raw H3 output. This round submits no H3 work and does not begin Phase 8D.
+
+### Phase 8C.9 — Renders header, status, and progress-component remediation
+
+The Renders workspace uses one responsive header row: the visible **Renders**
+title at the left, a concise `ready · not ready · active` aggregate toward the
+right, and direct **Refresh Preflight** and **Rescan Runtime** controls. Ordinary
+scene incompleteness is neutral informational state; red remains reserved for
+actual failures and actionable errors. The Advanced disclosure, redundant
+active prose, and `STAGE PROGRESS` label are absent.
+
+The previous indeterminate presentation assigned its bar a literal 32% width.
+That width could look like a frozen determinate value, and its reduced-motion
+fallback made the false partial fill static. The corrected component has two
+mutually exclusive modes. Indeterminate mode uses a full neutral host with a
+moving antique-gold segment and no number; reduced-motion uses a non-positional
+opacity pulse. Determinate mode is selected only for a current authoritative
+ComfyUI `value/max` pair with `max > 0`, and displays that exact stage-local
+percentage. It never infers whole-render completion.
+
+Every RUNNING job therefore retains visible truthful activity. Numeric-to-
+nonnumeric stage changes, stale or unavailable telemetry, and telemetry loss
+clear the old inline width and percentage and return in place to indeterminate
+activity. Terminal states clear the progress region. Narrow telemetry refreshes
+continue to update the existing component without replacing the scene card.
+
+For retryable terminal jobs the UI exposes the existing **Retry** action only;
+that route creates a new job with historical retry linkage, while hiding the
+semantically duplicate normal Render Scene action. Backend job history and
+orphan recovery are unchanged.
+
+MT-69 — Live Render Progress Telemetry — PENDING_RETEST. MT-71 — Renders UI
+Production Cleanup — PENDING_RETEST. MT-62 remains PENDING. This round submits
+no H3 work and does not begin Phase 8D.
+
+### Phase 8C.10 — Renders title and internal-identifier cleanup
+
+The Renders workspace retains the accepted single responsive header, neutral
+aggregate summary, and direct Refresh Preflight and Rescan Runtime controls.
+Its sole **Renders** heading now has an explicit page-title hierarchy above scene
+labels, status text, and fact-tile headings while remaining within the existing
+application type scale.
+
+Normal Renders presentation is scene-numbered and product-facing. Scene, job,
+prompt, preparation, and fingerprint identifiers remain available to backend
+records, reconciliation, route bindings, structured logs, and relay evidence,
+but are not rendered as card or header copy. Actionable card errors retain their
+Scene N context without exposing those implementation identifiers.
+
+Successful Prepare Render Inputs no longer leaves a persistent technical banner
+containing a scene UUID, duplicated timing/frame details, or `workflow
+validated` prose. The refreshed scene card's **Preparation: PREPARED** tile is
+the durable success authority alongside its existing Duration and H3 Plan tiles.
+Preparation and execution failures remain visible and actionable.
+
+MT-69 — Live Render Progress Telemetry — PASS from real RUNNING H3 evidence; the
+accepted indeterminate/determinate component and narrow update architecture are
+unchanged. MT-71 — Renders UI Production Cleanup — PENDING_RETEST. MT-62 —
+Existing Render Job Recovery — PENDING_LIVE_COMPLETION and does not require a
+new long AMD render solely for this UI remediation. This round submits no H3
+work and does not begin Phase 8D.
+
+### Phase 8C final acceptance
+
+Phase 8C completes structural, automated, and practical manual acceptance. The
+accepted scope retains the corrected covering H3 temporal plan
+(`minimax_h3_24fps_5_plus_17n_covering_v2`: 24 FPS, valid frame counts
+`5 + 17n`, smallest valid count whose generated coverage is at or above the
+authoritative target scene duration; 6679 ms plans to 175 frames, nominal
+7291.666… ms, trim ≈ 613 ms), raw H3 output as immutable execution output
+distinct from the post-processed final scene MP4, authoritative Phase 8A
+prepared scene audio (AAC 256 kbps, no processing) over H3-generated audio,
+ffprobe validation with one-video-frame / one-source-sample / two-AAC-frame
+tolerances, fail-closed short raw coverage, deterministic high-quality encode
+(libx264, medium, CRF 18, yuv420p, 24 FPS), and atomic final candidate
+promotion preserving the previous valid final after a failed replacement.
+
+Runtime compatibility validation resolves live node contracts against the
+installed runtime with SUPPORTED / UNSUPPORTED / NOT_DETERMINABLE semantics;
+only definitive incompatibility blocks pre-submit, and ComfyUI `/prompt`
+remains the final authoritative validation. VHS_VideoCombine format-dependent
+widgets resolve against the selected format's dynamic contract, and LoadImage
+`VALIDATE_INPUTS` accepts the installed nested input-root-relative selector for
+existing files. The AMD Radeon RX 7900 XT development machine and the RTX 4080
+SUPER 16 GB production machine are both valid H3 execution platforms with one
+shared quality-first workflow and no GPU-vendor execution gate. Submission uses
+the API-format workflow through the top-level `prompt` key against
+`/prompt`, `/queue`, `/history/{prompt_id}`, and `/interrupt`, with bounded
+structured HTTP 400 diagnostics in the UI and full detail in logs.
+
+HTTP queue/history remains the durable job lifecycle authority; WebSocket
+telemetry (installed `websockets.sync` client, shared connection, client/session
+and prompt_id correlation, real value/max only, friendly stage labels, HTTP
+reconciliation fallback) is supplementary and never gates job release.
+Confirmed historical jobs absent from queue/history resolve through transient
+RECONCILIATION_REQUIRED to safe terminal orphan semantics, and raw-output
+recovery uses only deterministic job/workflow-owned output evidence validated
+by path safety, ffprobe, supported video, unique association, and completeness;
+ambiguity fails closed. The Renders workspace is the production-facing UI:
+neutral aggregate summary, Refresh Preflight and Rescan Runtime controls,
+scene-numbered cards with the accepted fact tiles, truthful
+indeterminate/determinate stage progress, and no internal identifiers or debug
+prose.
+
+Final manual test statuses:
+
+- MT-58 — Render Execution Gate / AMD Safety — SUPERSEDED_PRODUCT_DECISION
+- MT-59 — ComfyUI Queue Submission Contract — PASS
+- MT-60 — Render Job Lifecycle / Recovery — PASS_STRUCTURAL
+- MT-61 — Failure / Retry / Cancellation — PASS_STRUCTURAL
+- MT-62 — Raw Output Discovery / Association — PENDING_LIVE_COMPLETION
+- MT-63 — Post-Processing Eligibility / UI — PASS
+- MT-64 — Exact Scene Finalization / Authoritative Audio — PASS_STRUCTURAL
+- MT-65 — Finalization Invalidation / Idempotence — PASS_STRUCTURAL
+- MT-66 — Frame-Plan Coverage — PASS
+- MT-67 — Cross-Hardware Render Eligibility — PASS
+- MT-68 — ComfyUI Validation Error Diagnostics — PASS_STRUCTURAL
+- MT-69 — Live Render Progress Telemetry — PASS
+- MT-70 — Orphaned Job Recovery / Output Fallback — PASS
+- MT-71 — Renders UI Production Cleanup — PASS
+
+MT-62 remains intentionally open: it requires a naturally completed real H3
+render to validate automatic raw-output association end-to-end, and is carried
+forward without forcing an extended AMD render solely for this evidence. When a
+real production render completes naturally, perform the MT-62 live validation.
+Phase 8D is not started.
 
 ---
 

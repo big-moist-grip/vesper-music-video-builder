@@ -13,7 +13,7 @@ import hashlib
 import json
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import threading
@@ -65,15 +65,18 @@ from .workflows import (
 LOGGER = logging.getLogger(__name__)
 
 RENDER_RESPONSE_VERSION = 1
-PREPARATION_VERSION = 1
+PREPARATION_VERSION = 3
 H3_FPS = 24
 H3_MINIMUM_FRAMES = 5
 H3_FRAME_STEP = 17
 H3_MAX_FRAMES = 3600
-H3_TIMING_CONTRACT_ID = "minimax_h3_24fps_5_plus_17n_v1"
-TARGET_HARDWARE_STATUS = "DEFERRED_TARGET_NVIDIA"
-TARGET_HARDWARE_MESSAGE = (
-    "RTX 4080 SUPER H3 qualification is deferred; Phase 8A performs structural preparation only."
+H3_TIMING_CONTRACT_ID = "minimax_h3_24fps_5_plus_17n_covering_v2"
+EXECUTION_POLICY_STATUS = "SUPPORTED_MULTI_GPU"
+EXECUTION_POLICY_MESSAGE = (
+    "H3 execution is supported on AMD Radeon RX 7900 XT and NVIDIA RTX 4080 SUPER 16 GB."
+)
+EXECUTION_POLICY_PERFORMANCE_PREFERENCE = (
+    "RTX 4080 SUPER is expected to render faster; it is not required for execution."
 )
 PREPARATION_FILENAME = "preparation.json"
 WORKFLOW_FILENAME = "workflow.json"
@@ -87,6 +90,34 @@ _FILE_IDENTITY_CACHE: dict[str, tuple[int, int, int, str]] = {}
 
 def _diagnostic(code: str, message: str, layer: str) -> dict[str, str]:
     return {"code": code, "message": message, "layer": layer}
+
+
+def build_execution_eligibility(scene: Mapping[str, object]) -> dict[str, object]:
+    """Return the single admission decision for a prepared scene.
+
+    GPU vendor and target-host preference are deliberately not inputs to this
+    decision.  Both supported development and production GPUs may execute the
+    same quality-first workflow when the scene's real prerequisites are ready.
+    """
+
+    dimensions = (
+        ("content_ready", "CONTENT_NOT_READY", "Content and prompt inputs are not ready."),
+        ("workflow_ready", "WORKFLOW_NOT_READY", "The production workflow contract is not ready."),
+        ("runtime_requirements_ready", "RUNTIME_REQUIREMENTS_NOT_READY", "Runtime requirements are not ready."),
+        ("preparation_current", "PREPARATION_NOT_CURRENT", "Current render preparation is required before execution."),
+    )
+    blockers: list[dict[str, str]] = []
+    for field, code, message in dimensions:
+        if scene.get(field) is not True:
+            blockers.append(_diagnostic(code, message, "execution"))
+    eligible = not blockers
+    return {
+        "eligible": eligible,
+        "allowed": eligible,
+        "status": "READY" if eligible else "BLOCKED",
+        "message": "H3 execution is ready." if eligible else "Render execution is blocked by current scene readiness.",
+        "blockers": blockers,
+    }
 
 
 class RenderError(Exception):
@@ -240,7 +271,8 @@ def build_h3_timing_plan(
         raise TimingContractError("TIMING_CONTRACT_UNSUPPORTED", "The installed H3 frame limit is invalid.")
 
     requested_frame_count = exact_duration_ms * fps / 1000
-    block_count = max(0, round((requested_frame_count - minimum_frames) / frame_step))
+    required_numerator = exact_duration_ms * fps - minimum_frames * 1000
+    block_count = max(0, (required_numerator + frame_step * 1000 - 1) // (frame_step * 1000))
     generated_frame_count = block_count * frame_step + minimum_frames
     if generated_frame_count > max_frames:
         raise TimingContractError("TIMING_FRAME_LIMIT", "The exact scene duration exceeds the installed H3 frame limit.")
@@ -258,7 +290,11 @@ def build_h3_timing_plan(
         "requested_frame_count": requested_frame_count,
         "generated_frame_count": generated_frame_count,
         "generated_duration_ms": round(generated_duration_ms, 6),
+        "duration_formula": "generated_frame_count / h3_fps",
+        "coverage_policy": "smallest_valid_frame_count_with_generated_duration_at_or_above_target",
+        "coverage_satisfied": generated_frame_count * 1000 >= exact_duration_ms * fps,
         "trim_required": generated_frame_count * 1000 != exact_duration_ms * fps,
+        "trim_duration_ms": round(max(0, generated_duration_ms - exact_duration_ms), 6),
     }
 
 
@@ -561,6 +597,64 @@ def _queue_input_name(project_id: str, scene_id: str, filename: str) -> str:
     return f"music_video_builder/{project_id}/{scene_id}/{filename}"
 
 
+def _resolve_comfyui_input_directory(input_directory: Path | str | None = None) -> Path:
+    """Resolve the one input namespace accepted by installed LoadImage/LoadAudio nodes."""
+
+    if input_directory is None:
+        try:
+            import folder_paths  # type: ignore
+
+            input_directory = folder_paths.get_input_directory()
+        except (ImportError, AttributeError, OSError, TypeError) as error:
+            raise MediaPreparationError(
+                "COMFYUI_INPUT_ROOT_UNAVAILABLE",
+                "The active ComfyUI input directory could not be resolved.",
+            ) from error
+    try:
+        root = Path(input_directory)
+        if root.is_symlink() or not root.is_dir():
+            raise OSError("ComfyUI input root is unavailable or unsafe.")
+        return root.resolve(strict=True)
+    except (OSError, TypeError, ValueError) as error:
+        raise MediaPreparationError(
+            "COMFYUI_INPUT_ROOT_UNAVAILABLE",
+            "The active ComfyUI input directory could not be resolved safely.",
+        ) from error
+
+
+def _runtime_input_path(
+    input_root: Path,
+    selector: object,
+    project_id: str,
+    scene_id: str,
+) -> Path:
+    if not isinstance(selector, str) or not selector:
+        raise MediaPreparationError("COMFYUI_INPUT_PATH_UNSAFE", "A ComfyUI input selector is invalid.")
+    relative = PurePosixPath(selector)
+    expected_prefix = ("music_video_builder", project_id, scene_id)
+    if (
+        relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or tuple(relative.parts[:3]) != expected_prefix
+        or len(relative.parts) != 4
+    ):
+        raise MediaPreparationError(
+            "COMFYUI_INPUT_PATH_UNSAFE",
+            "A prepared ComfyUI input selector is outside the Builder-owned namespace.",
+        )
+    candidate = input_root.joinpath(*relative.parts)
+    try:
+        resolved_parent = candidate.parent.resolve(strict=False)
+    except OSError as error:
+        raise MediaPreparationError("COMFYUI_INPUT_PATH_UNSAFE", "A ComfyUI input path could not be resolved safely.") from error
+    if resolved_parent != input_root and input_root not in resolved_parent.parents:
+        raise MediaPreparationError(
+            "COMFYUI_INPUT_PATH_UNSAFE",
+            "A prepared ComfyUI input selector escapes the active input directory.",
+        )
+    return candidate
+
+
 def _resolve_visual_sources(
     project: dict[str, object],
     scene_id: str,
@@ -705,7 +799,38 @@ def _read_preparation_metadata(root: Path, scene_id: str) -> dict[str, object] |
     return document if isinstance(document, dict) else None
 
 
-def _preparation_artifacts_current(root: Path, metadata: Mapping[str, object]) -> bool:
+def _runtime_inputs_current(
+    metadata: Mapping[str, object],
+    input_directory: Path | str | None = None,
+) -> bool:
+    runtime_inputs = metadata.get("runtime_inputs")
+    if not isinstance(runtime_inputs, Mapping) or not isinstance(runtime_inputs.get("assets"), list):
+        return False
+    project_id = metadata.get("project_id")
+    scene_id = metadata.get("scene_id")
+    if not isinstance(project_id, str) or not isinstance(scene_id, str):
+        return False
+    try:
+        input_root = _resolve_comfyui_input_directory(input_directory)
+        for asset in runtime_inputs["assets"]:
+            if not isinstance(asset, Mapping):
+                return False
+            path = _runtime_input_path(input_root, asset.get("selector"), project_id, scene_id)
+            if path.is_symlink() or not path.is_file():
+                return False
+            size, digest = _cached_file_identity(path)
+            if size != asset.get("size") or digest != asset.get("sha256"):
+                return False
+    except (OSError, RenderPreparationError, ValueError):
+        return False
+    return True
+
+
+def _preparation_artifacts_current(
+    root: Path,
+    metadata: Mapping[str, object],
+    comfyui_input_directory: Path | str | None = None,
+) -> bool:
     workflow = metadata.get("workflow")
     source_audio = metadata.get("source_audio")
     if not isinstance(workflow, Mapping) or not isinstance(source_audio, Mapping):
@@ -717,10 +842,15 @@ def _preparation_artifacts_current(root: Path, metadata: Mapping[str, object]) -
     if _artifact_path(root, source_audio.get("render_relative_path")) is None:
         return False
     visual_inputs = metadata.get("visual_inputs")
-    return isinstance(visual_inputs, list) and all(
+    project_artifacts_current = isinstance(visual_inputs, list) and all(
         isinstance(item, Mapping) and _artifact_path(root, item.get("prepared_relative_path")) is not None
         for item in visual_inputs
     )
+    if not project_artifacts_current:
+        return False
+    if metadata.get("preparation_version") == PREPARATION_VERSION:
+        return _runtime_inputs_current(metadata, comfyui_input_directory)
+    return True
 
 
 def _scene_preflight(
@@ -731,6 +861,7 @@ def _scene_preflight(
     workflow_contract_report: object,
     prompt_drafts: Mapping[object, object] | None,
     root: Path,
+    comfyui_input_directory: Path | str | None,
 ) -> dict[str, object]:
     scene_id = scene["scene_id"]
     visual_scene = _find_visual_scene(project, scene_id)
@@ -772,7 +903,6 @@ def _scene_preflight(
     content_ready = prompt_ready and visuals_ready and source_ready
     workflow_dimension_ready = workflow_ready
     runtime_requirements_ready = requirements_ready
-    warnings.append(_diagnostic("TARGET_HARDWARE_DEFERRED", TARGET_HARDWARE_MESSAGE, "target_hardware"))
 
     timing_plan: dict[str, object] | None = None
     visual_inputs: list[dict[str, object]] = []
@@ -802,7 +932,11 @@ def _scene_preflight(
     metadata = _read_preparation_metadata(root, scene_id)
     if metadata is None:
         preparation_status = "not_prepared"
-    elif candidate_fingerprint and metadata.get("preparation_fingerprint") == candidate_fingerprint and _preparation_artifacts_current(root, metadata):
+    elif (
+        candidate_fingerprint
+        and metadata.get("preparation_fingerprint") == candidate_fingerprint
+        and _preparation_artifacts_current(root, metadata, comfyui_input_directory)
+    ):
         preparation_status = "current"
     else:
         preparation_status = "stale"
@@ -814,7 +948,7 @@ def _scene_preflight(
     )
     # A stale or absent package is exactly what the Prepare action is allowed to
     # repair; it is not a content blocker for a new preparation.
-    return {
+    result = {
         "scene_id": scene_id,
         "sequence": project["scenes"].index(scene) + 1,
         "timeline_start_ms": scene["timeline_start_ms"],
@@ -834,7 +968,6 @@ def _scene_preflight(
         "content_ready": content_ready,
         "workflow_ready": workflow_dimension_ready,
         "runtime_requirements_ready": runtime_requirements_ready,
-        "target_hardware_qualified": False,
         "preparation_ready": preparation_ready,
         "preparation_status": preparation_status,
         "preparation_current": preparation_status == "current",
@@ -843,6 +976,8 @@ def _scene_preflight(
         "blockers": blockers,
         "warnings": warnings,
     }
+    result["execution_eligibility"] = build_execution_eligibility(result)
+    return result
 
 
 def build_render_preflight(
@@ -853,6 +988,7 @@ def build_render_preflight(
     requirements_snapshot: RequirementsSnapshot | None = None,
     force_requirements_refresh: bool = False,
     prompt_drafts: Mapping[object, object] | None = None,
+    comfyui_input_directory: Path | str | None = None,
 ) -> dict[str, object]:
     """Build the one read-only machine result for all current scenes."""
 
@@ -888,6 +1024,7 @@ def build_render_preflight(
             workflow_contract_report,
             prompt_drafts,
             root,
+            comfyui_input_directory,
         )
         for scene in project.get("scenes", [])
     ]
@@ -906,9 +1043,16 @@ def build_render_preflight(
         "content_ready": content_ready,
         "workflow_ready": workflow_ready,
         "runtime_requirements_ready": runtime_requirements_ready,
-        "target_hardware_qualified": False,
-        "target_hardware_status": TARGET_HARDWARE_STATUS,
-        "target_hardware_message": TARGET_HARDWARE_MESSAGE,
+        "execution_policy": {
+            "status": EXECUTION_POLICY_STATUS,
+            "message": EXECUTION_POLICY_MESSAGE,
+            "platforms": [
+                "AMD Radeon RX 7900 XT",
+                "NVIDIA RTX 4080 SUPER 16 GB",
+            ],
+            "performance_preference": EXECUTION_POLICY_PERFORMANCE_PREFERENCE,
+            "quality_policy": "The same production workflow and quality settings apply on both supported GPUs.",
+        },
         "scene_count": len(scenes),
         "preparation_ready_count": preparation_ready_count,
         "blocked_scene_count": sum(1 for scene in scenes if scene["blockers"]),
@@ -1257,6 +1401,54 @@ def _copy_asset_atomic(source_path: Path, destination_path: Path, project_root: 
             LOGGER.warning("Could not clean temporary visual-input file.")
 
 
+def _copy_runtime_input_atomic(
+    source_path: Path,
+    selector: str,
+    *,
+    project_root: Path,
+    input_root: Path,
+    project_id: str,
+    scene_id: str,
+) -> Path:
+    """Atomically stage one project asset in the fixed ComfyUI input namespace."""
+
+    source = _owned_path(source_path, project_root, must_exist=True)
+    destination = _runtime_input_path(input_root, selector, project_id, scene_id)
+    current = input_root
+    temporary_path: Path | None = None
+    try:
+        for part in PurePosixPath(selector).parts[:-1]:
+            current = current / part
+            if current.exists():
+                if current.is_symlink() or not current.is_dir():
+                    raise OSError("Runtime input parent is unsafe.")
+            else:
+                current.mkdir()
+        if destination.exists() and (destination.is_symlink() or not destination.is_file()):
+            raise OSError("Runtime input destination is unsafe.")
+        temporary_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        with source.open("rb") as source_handle, temporary_path.open("xb") as destination_handle:
+            shutil.copyfileobj(source_handle, destination_handle, 1024 * 1024)
+            destination_handle.flush()
+            if hasattr(os, "fsync"):
+                os.fsync(destination_handle.fileno())
+        os.replace(temporary_path, destination)
+        return destination
+    except (OSError, ValueError) as error:
+        raise MediaPreparationError(
+            "COMFYUI_INPUT_MATERIALIZATION_FAILED",
+            "A prepared media input could not be staged in ComfyUI's Builder-owned input namespace.",
+        ) from error
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                LOGGER.warning("Could not clean temporary ComfyUI input file.")
+
+
 def _preparation_response(
     metadata: dict[str, object],
     *,
@@ -1285,13 +1477,19 @@ def prepare_render_scene(
     *,
     requirements_report: object | None = None,
     media_adapter: MediaToolAdapter | None = None,
+    comfyui_input_directory: Path | str | None = None,
 ) -> dict[str, object]:
     """Prepare one eligible scene and stop before queue submission."""
 
     canonical_project_id, root = _root_path(storage, project_id)
     canonical_scene_id = validate_entity_id(scene_id, "Scene ID")
     project = storage.load_project(canonical_project_id)
-    preflight = build_render_preflight(project, storage, requirements_report=requirements_report)
+    preflight = build_render_preflight(
+        project,
+        storage,
+        requirements_report=requirements_report,
+        comfyui_input_directory=comfyui_input_directory,
+    )
     preflight_scene = next((scene for scene in preflight["scenes"] if scene["scene_id"] == canonical_scene_id), None)
     if not isinstance(preflight_scene, dict):
         raise ProjectNotFoundError("The requested scene was not found.")
@@ -1325,12 +1523,13 @@ def prepare_render_scene(
     except (PromptCompilationError, ProjectNotFoundError, ProjectValidationError, KeyError, StopIteration) as error:
         raise RenderPreparationError("PREPARATION_INPUTS_INVALID", "Current scene inputs could not be resolved safely.") from error
 
+    runtime_input_root = _resolve_comfyui_input_directory(comfyui_input_directory)
     metadata_path = _preparation_metadata_path(root, canonical_scene_id)
     existing = _read_preparation_metadata(root, canonical_scene_id)
     if (
         isinstance(existing, dict)
         and existing.get("preparation_fingerprint") == preparation_fingerprint
-        and _preparation_artifacts_current(root, existing)
+        and _preparation_artifacts_current(root, existing, runtime_input_root)
     ):
         return _preparation_response(existing, reused=True, preflight_scene=preflight_scene)
 
@@ -1352,11 +1551,43 @@ def prepare_render_scene(
         end_ms=scene["timeline_end_ms"],
     )
     _copy_asset_atomic(scene_audio_path, render_audio_path, root)
+    audio_queue_name = _queue_input_name(canonical_project_id, canonical_scene_id, SCENE_AUDIO_FILENAME)
+    runtime_audio_path = _copy_runtime_input_atomic(
+        render_audio_path,
+        audio_queue_name,
+        project_root=root,
+        input_root=runtime_input_root,
+        project_id=canonical_project_id,
+        scene_id=canonical_scene_id,
+    )
+    runtime_assets: list[dict[str, object]] = []
+    runtime_audio_size, runtime_audio_digest = _cached_file_identity(runtime_audio_path)
+    runtime_assets.append({
+        "kind": "audio",
+        "selector": audio_queue_name,
+        "size": runtime_audio_size,
+        "sha256": runtime_audio_digest,
+    })
 
     prepared_visual_inputs: list[dict[str, object]] = []
     for visual_input in visual_inputs:
         target = inputs_directory / str(visual_input["target_filename"])
         _copy_asset_atomic(visual_input["source_path"], target, root)
+        runtime_visual_path = _copy_runtime_input_atomic(
+            target,
+            str(visual_input["queue_name"]),
+            project_root=root,
+            input_root=runtime_input_root,
+            project_id=canonical_project_id,
+            scene_id=canonical_scene_id,
+        )
+        runtime_visual_size, runtime_visual_digest = _cached_file_identity(runtime_visual_path)
+        runtime_assets.append({
+            "kind": "visual",
+            "selector": visual_input["queue_name"],
+            "size": runtime_visual_size,
+            "sha256": runtime_visual_digest,
+        })
         prepared_visual_inputs.append({
             key: value
             for key, value in visual_input.items()
@@ -1369,7 +1600,7 @@ def prepare_render_scene(
         final_prompt=prompt_state["saved_final_prompt"],
         timing_plan=timing_plan,
         visual_inputs=visual_inputs,
-        scene_audio_name=_queue_input_name(canonical_project_id, canonical_scene_id, SCENE_AUDIO_FILENAME),
+        scene_audio_name=audio_queue_name,
     )
     workflow_path = render_directory / WORKFLOW_FILENAME
     workflow_relative_path = _relative_path(workflow_path, root)
@@ -1387,9 +1618,13 @@ def prepare_render_scene(
             "prepared_duration_ms": prepared_duration_ms,
             "prepared_relative_path": _relative_path(scene_audio_path, root),
             "render_relative_path": _relative_path(render_audio_path, root),
-            "queue_name": _queue_input_name(canonical_project_id, canonical_scene_id, SCENE_AUDIO_FILENAME),
+            "queue_name": audio_queue_name,
         },
         "visual_inputs": prepared_visual_inputs,
+        "runtime_inputs": {
+            "namespace": f"music_video_builder/{canonical_project_id}/{canonical_scene_id}",
+            "assets": runtime_assets,
+        },
         "timing": timing_plan,
         "workflow": {
             **workflow_identity,

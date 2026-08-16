@@ -43,10 +43,25 @@ class FakeComfyClient:
         self.pending = []
         self.running = []
         self.history = {}
-        self.calls = {"submit": 0, "queue": 0, "history": 0, "delete": 0, "interrupt": 0}
+        self.calls = {"submit": 0, "queue": 0, "history": 0, "delete": 0, "interrupt": 0, "object_info": 0}
         self.prompt_ids = list(prompt_ids or [])
         self.queue_error = None
         self.history_error = None
+
+    def get_object_info(self, class_type):
+        self.calls["object_info"] += 1
+        if class_type == "LoadImage":
+            return {"input": {"required": {"image": [["keyframe.png"]]}}}
+        if class_type == "VHS_VideoCombine":
+            return {
+                "input": {
+                    "required": {
+                        "filename_prefix": ["STRING", {}],
+                        "format": [["video/h264-mp4"], {}],
+                    }
+                }
+            }
+        raise ComfyUIClientError("LIVE_NODE_CLASS_MISSING", f"Missing node class {class_type}.")
 
     def submit_prompt(self, workflow):
         self.calls["submit"] += 1
@@ -112,7 +127,11 @@ class Phase8BTestCase(unittest.TestCase):
             }],
         }
         self.package = {
-            "workflow": {"1": {"class_type": "LoadImage", "inputs": {"image": "keyframe.png"}}},
+            "workflow": {
+                "1": {"class_type": "LoadImage", "inputs": {"image": "keyframe.png"}},
+                "20": {"class_type": "VHS_VideoCombine", "inputs": {"filename_prefix": f"music_video_builder/{self.project_id}/{self.scene_id}/render", "format": "video/h264-mp4"}},
+                "21": {"class_type": "VHS_VideoCombine", "inputs": {"filename_prefix": f"music_video_builder/{self.project_id}/{self.scene_id}/render", "format": "video/h264-mp4"}},
+            },
             "generation_method": "keyframe_i2v",
             "preparation_fingerprint": "f" * 64,
             "output_node_id": "20",
@@ -124,8 +143,8 @@ class Phase8BTestCase(unittest.TestCase):
     def _qualified_gate(self):
         return TargetHardwareGate(lambda: TargetHardwareQualification(
             True,
-            "QUALIFIED_TARGET_NVIDIA",
-            "Target hardware is qualified.",
+            "SUPPORTED_MULTI_GPU",
+            "Both supported H3 execution platforms are valid.",
             "test-fixture",
         ))
 
@@ -156,7 +175,7 @@ class Phase8BTestCase(unittest.TestCase):
         workflow = {"1": {"class_type": "LoadImage", "inputs": {"image": "prepared.png"}}}
         client.submit_prompt(workflow)
         client.get_queue()
-        self.assertEqual(calls[0], ("POST", "/prompt", {"prompt": workflow}))
+        self.assertEqual(calls[0], ("POST", "/prompt", {"prompt": workflow, "client_id": client.telemetry.client_id}))
         self.assertEqual(calls[1][1], "/queue")
         self.assertNotIn("workflow", calls[0][2])
 
@@ -168,12 +187,27 @@ class Phase8BTestCase(unittest.TestCase):
         with self.assertRaises(ComfyUIClientError):
             ComfyUIClient(base_url="http://127.0.0.1:8188", timeout_seconds=0)
 
-    def test_target_hardware_gate_blocks_before_prompt(self):
-        with self.assertRaises(RenderExecutionDeferred) as context:
-            self._submit(gate=TargetHardwareGate())
-        self.assertEqual(context.exception.code, "TARGET_HARDWARE_DEFERRED")
-        self.assertEqual(self.client.calls["submit"], 0)
-        self.assertEqual(JobStore(self.storage).list_scene(self.project_id, self.scene_id), [])
+    def test_default_multi_gpu_policy_allows_ready_scene_to_reach_queue_adapter(self):
+        result = self._submit(gate=TargetHardwareGate())
+        self.assertEqual(result["state"], QUEUED)
+        self.assertEqual(self.client.calls["submit"], 1)
+        self.assertTrue(result["execution_gate"]["allowed"])
+        self.assertTrue(result["execution_gate"]["target_hardware"]["qualified"])
+
+    def test_hardware_preference_never_blocks_ready_scene(self):
+        preference_only = TargetHardwareGate(lambda: TargetHardwareQualification(
+            False,
+            "PERFORMANCE_PREFERENCE_ONLY",
+            "RTX is preferred for throughput but is not required.",
+            "test-preference-only",
+        ))
+        inspection = preference_only.inspect(self.preflight["scenes"][0])
+        self.assertTrue(inspection["allowed"])
+        self.assertTrue(inspection["execution_eligibility"]["eligible"])
+        self.assertFalse(inspection["target_hardware"]["qualified"])
+        result = self._submit(gate=preference_only)
+        self.assertEqual(result["state"], QUEUED)
+        self.assertEqual(self.client.calls["submit"], 1)
 
     def test_readiness_gate_blocks_before_prompt_when_preparation_is_stale(self):
         blocked = dict(self.preflight)
@@ -187,7 +221,8 @@ class Phase8BTestCase(unittest.TestCase):
         gate = TargetHardwareGate()
         inspection = gate.inspect(scene)
         self.assertFalse(inspection["allowed"])
-        self.assertFalse(inspection["target_hardware"]["qualified"])
+        self.assertTrue(inspection["target_hardware"]["qualified"])
+        self.assertFalse(inspection["execution_eligibility"]["eligible"])
         self.assertEqual(inspection["blockers"][0]["code"], "CONTENT_NOT_READY")
 
     def test_package_fingerprint_mismatch_is_rejected_before_prompt(self):
@@ -220,7 +255,12 @@ class Phase8BTestCase(unittest.TestCase):
         self.assertTrue(result["job_id"])
         self.assertTrue(result["comfy_prompt_id"])
         self.assertEqual(self.client.calls["submit"], 1)
-        self.assertEqual(self.client.submitted[0], self.package["workflow"])
+        self.assertEqual(set(self.client.submitted[0]), set(self.package["workflow"]))
+        self.assertEqual(self.client.submitted[0]["1"], self.package["workflow"]["1"])
+        self.assertNotEqual(
+            self.client.submitted[0]["20"]["inputs"]["filename_prefix"],
+            self.package["workflow"]["20"]["inputs"]["filename_prefix"],
+        )
         self.assertEqual(result["production_output"]["node_id"], "20")
 
     def test_one_active_job_prevents_duplicate_scene_submission(self):
@@ -364,7 +404,7 @@ class Phase8BTestCase(unittest.TestCase):
 
     def test_success_requires_prompt_owned_known_output_node_and_persists_raw_output(self):
         submitted = self._submit()
-        relative = f"music_video_builder/{self.project_id}/{self.scene_id}/render_00001_.mp4"
+        relative = f"{submitted['production_output']['filename_prefix']}_00001_.mp4"
         output_root, _target = self._write_output(relative)
         self.client.pending.remove(submitted["comfy_prompt_id"])
         self.client.history[submitted["comfy_prompt_id"]] = self._success_history(submitted["comfy_prompt_id"], relative=relative)
@@ -377,7 +417,7 @@ class Phase8BTestCase(unittest.TestCase):
 
     def test_historical_raw_output_is_retained_when_current_preparation_changes(self):
         submitted = self._submit()
-        relative = f"music_video_builder/{self.project_id}/{self.scene_id}/render_00001_.mp4"
+        relative = f"{submitted['production_output']['filename_prefix']}_00001_.mp4"
         output_root, _target = self._write_output(relative)
         self.client.pending.remove(submitted["comfy_prompt_id"])
         self.client.history[submitted["comfy_prompt_id"]] = self._success_history(submitted["comfy_prompt_id"], relative=relative)
@@ -415,8 +455,10 @@ class Phase8BTestCase(unittest.TestCase):
         }
         result = reconcile_project_jobs(self.storage, self.project_id, client=self.client, output_root=Path(self.temp_directory.name))
         job = result["jobs"][0]
-        self.assertEqual(job["state"], FAILED)
-        self.assertEqual(job["failure"]["code"], "OUTPUT_NODE_MISSING")
+        self.assertEqual(job["state"], SUCCEEDED)
+        self.assertIsNone(job["failure"])
+        self.assertEqual(job["output_discovery"]["state"], "FAILED")
+        self.assertEqual(job["output_discovery"]["failure"]["code"], "OUTPUT_NODE_MISSING")
 
     def test_queued_cancel_uses_owned_prompt_id_and_reconciles_cancelled(self):
         submitted = self._submit()
@@ -512,7 +554,8 @@ class Phase8BTestCase(unittest.TestCase):
         result = self._submit()
         self.assertEqual(result["generation_method"], "keyframe_i2v")
         self.assertEqual(result["production_output"]["raw_h3_only"], True)
-        self.assertEqual(list(self.client.submitted[0]), ["1"])
+        self.assertEqual(self.client.calls["submit"], 1)
+        self.assertEqual(set(self.client.submitted[0]), {"1", "20", "21"})
 
     def test_reference2video_job_identity_preserves_canonical_output_node(self):
         package = dict(self.package, generation_method="reference2video", output_node_id="21")
@@ -538,8 +581,11 @@ class Phase8BTestCase(unittest.TestCase):
         self.assertIn("/retry", routes)
         self.assertIn("renderJobsPath", extension)
         self.assertIn("data-mvb-render-cancel", extension)
-        self.assertIn("Numerical progress is not inferred", extension)
-        self.assertIn("Render deferred", extension)
+        self.assertIn("renderTelemetryPresentation", extension)
+        self.assertIn("Render Scene", extension)
+        self.assertNotIn("Render deferred", extension)
+        self.assertIn("execution_eligibility", extension)
+        self.assertIn('<h2 class="mvb-render-page-title" id="mvb-render-heading">Renders</h2>', extension)
 
     def test_phase8a_dry_boundary_remains_separate_from_queue_adapter(self):
         root = Path(__file__).parents[1]
@@ -552,9 +598,10 @@ class Phase8BTestCase(unittest.TestCase):
 
     def test_no_quality_override_or_amd_downgrade_is_in_execution_module(self):
         source = (Path(__file__).parents[1] / "backend" / "render_jobs.py").read_text(encoding="utf-8")
-        self.assertNotIn("Radeon", source)
         self.assertNotIn("quality_settings", source)
-        self.assertIn("DEFERRED_TARGET_NVIDIA", source)
+        self.assertNotIn("DEFERRED_TARGET_NVIDIA", source)
+        self.assertIn("SUPPORTED_MULTI_GPU", source)
+        self.assertIn("build_execution_eligibility", source)
 
     def test_job_store_rejects_wrong_project_ownership(self):
         result = self._submit()

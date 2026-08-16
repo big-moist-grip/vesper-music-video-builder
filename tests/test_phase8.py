@@ -42,6 +42,8 @@ class Phase8TestCase(unittest.TestCase):
         self.temp_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_directory.cleanup)
         self.storage = ProjectStorage(Path(self.temp_directory.name) / "projects")
+        self.comfyui_input_directory = Path(self.temp_directory.name) / "comfyui-input"
+        self.comfyui_input_directory.mkdir()
 
     @staticmethod
     def _reference(original_name):
@@ -250,7 +252,8 @@ class Phase8TestCase(unittest.TestCase):
         self.assertIn('data-mvb-view="render"', extension)
         self.assertIn("data-mvb-render-refresh", extension)
         self.assertIn("Prepare Render Inputs", extension)
-        self.assertNotIn("Render Scene", extension)
+        self.assertIn("Render Scene", extension)
+        self.assertNotIn("Render deferred", extension)
         self.assertIn("/music-video-builder/projects/{project_id}/render/preflight", routes)
         self.assertIn("/music-video-builder/projects/{project_id}/render/scenes/{scene_id}/prepare", routes)
 
@@ -264,14 +267,15 @@ class Phase8TestCase(unittest.TestCase):
         for field in (
             "scene_id", "generation_method", "duration_ms", "prompt_status", "prompt_ready",
             "visuals_ready", "source_audio_ready", "workflow_contract_ready", "requirements_ready",
-            "preparation_ready", "blockers", "warnings",
+            "preparation_ready", "execution_eligibility", "blockers", "warnings",
         ):
             self.assertIn(field, scene)
         self.assertTrue(scene["content_ready"])
         self.assertTrue(scene["workflow_ready"])
         self.assertTrue(scene["runtime_requirements_ready"])
-        self.assertFalse(scene["target_hardware_qualified"])
-        self.assertTrue(any(item["code"] == "TARGET_HARDWARE_DEFERRED" for item in scene["warnings"]))
+        self.assertFalse(scene["execution_eligibility"]["eligible"])
+        self.assertIn("PREPARATION_NOT_CURRENT", {item["code"] for item in scene["execution_eligibility"]["blockers"]})
+        self.assertFalse(any(item["layer"] == "target_hardware" for item in scene["warnings"]))
 
     def test_prompt_status_current_needs_gpt_unsaved_and_stale_are_distinct_blockers(self):
         project = self._project()
@@ -342,7 +346,8 @@ class Phase8TestCase(unittest.TestCase):
         self.assertFalse(scene["runtime_requirements_ready"])
         self.assertFalse(scene["preparation_ready"])
         self.assertIn("REQUIREMENTS_MISSING", {item["code"] for item in scene["blockers"]})
-        self.assertFalse(scene["target_hardware_qualified"])
+        self.assertFalse(scene["execution_eligibility"]["eligible"])
+        self.assertIn("RUNTIME_REQUIREMENTS_NOT_READY", {item["code"] for item in scene["execution_eligibility"]["blockers"]})
 
     def test_one_incomplete_scene_does_not_gate_unrelated_scene(self):
         project = self._project(scene_count=2)
@@ -363,8 +368,9 @@ class Phase8TestCase(unittest.TestCase):
         self.assertEqual(plan["target_duration_ms"], 4_000)
         self.assertEqual(plan["authoritative_audio_duration_ms"], 4_000)
         self.assertEqual(plan["generated_frame_count"] % H3_FRAME_STEP, 5 % H3_FRAME_STEP)
-        self.assertEqual(plan["generated_frame_count"], 90)
-        self.assertEqual(plan["generated_duration_ms"], 3750.0)
+        self.assertEqual(plan["generated_frame_count"], 107)
+        self.assertEqual(plan["generated_duration_ms"], 4458.333333)
+        self.assertTrue(plan["coverage_satisfied"])
         self.assertTrue(plan["trim_required"])
 
     def test_h3_timing_plan_handles_short_edge_and_fails_closed(self):
@@ -440,6 +446,7 @@ class Phase8TestCase(unittest.TestCase):
             scene_id,
             requirements_report=self._requirements(),
             media_adapter=adapter,
+            comfyui_input_directory=self.comfyui_input_directory,
         )
         self.assertEqual(result["status"], "prepared")
         self.assertFalse(result["queue_submitted"])
@@ -459,6 +466,7 @@ class Phase8TestCase(unittest.TestCase):
             scene_id,
             requirements_report=self._requirements(),
             media_adapter=adapter,
+            comfyui_input_directory=self.comfyui_input_directory,
         )
         self.assertTrue(repeated["reused"])
         self.assertEqual(len(calls), 1)
@@ -473,6 +481,7 @@ class Phase8TestCase(unittest.TestCase):
             scene_id,
             requirements_report=self._requirements(),
             media_adapter=adapter,
+            comfyui_input_directory=self.comfyui_input_directory,
         )
         root = self.storage.project_directory(project["project_id"])
         workflow = json.loads((root / "renders" / scene_id / "workflow.json").read_text())
@@ -482,6 +491,60 @@ class Phase8TestCase(unittest.TestCase):
         self.assertNotIn("ref_images.ref_image_2", workflow["8"]["inputs"])
         self.assertEqual(result["preparation"]["visual_inputs"][0]["picture_number"], 1)
         self.assertEqual(result["preparation"]["visual_inputs"][1]["picture_number"], 2)
+
+    def test_preparation_materializes_file_selectors_in_authoritative_comfyui_input_root(self):
+        project = self._project(method="reference2video")
+        scene_id = project["scenes"][0]["scene_id"]
+        adapter, _calls = self._fake_media_adapter()
+
+        result = prepare_render_scene(
+            self.storage,
+            project["project_id"],
+            scene_id,
+            requirements_report=self._requirements(),
+            media_adapter=adapter,
+            comfyui_input_directory=self.comfyui_input_directory,
+        )
+
+        runtime_inputs = result["preparation"]["runtime_inputs"]
+        self.assertEqual(result["preparation"]["preparation_version"], 3)
+        self.assertEqual(len(runtime_inputs["assets"]), 3)
+        for asset in runtime_inputs["assets"]:
+            staged = self.comfyui_input_directory.joinpath(*asset["selector"].split("/"))
+            self.assertTrue(staged.is_file(), asset["selector"])
+            self.assertEqual(staged.stat().st_size, asset["size"])
+
+        workflow = json.loads(
+            (self.storage.project_directory(project["project_id"]) / "renders" / scene_id / "workflow.json").read_text()
+        )
+        self.assertTrue(self.comfyui_input_directory.joinpath(*workflow["7"]["inputs"]["audio"].split("/")).is_file())
+        self.assertTrue(self.comfyui_input_directory.joinpath(*workflow["50"]["inputs"]["image"].split("/")).is_file())
+        self.assertTrue(self.comfyui_input_directory.joinpath(*workflow["51"]["inputs"]["image"].split("/")).is_file())
+
+    def test_missing_comfyui_runtime_input_invalidates_preparation_without_touching_project_assets(self):
+        project = self._project(method="keyframe_i2v")
+        scene_id = project["scenes"][0]["scene_id"]
+        adapter, _calls = self._fake_media_adapter()
+        result = prepare_render_scene(
+            self.storage,
+            project["project_id"],
+            scene_id,
+            requirements_report=self._requirements(),
+            media_adapter=adapter,
+            comfyui_input_directory=self.comfyui_input_directory,
+        )
+        selector = result["preparation"]["runtime_inputs"]["assets"][0]["selector"]
+        self.comfyui_input_directory.joinpath(*selector.split("/")).unlink()
+
+        preflight = build_render_preflight(
+            project,
+            self.storage,
+            requirements_report=self._requirements(),
+            comfyui_input_directory=self.comfyui_input_directory,
+        )["scenes"][0]
+        self.assertEqual(preflight["preparation_status"], "stale")
+        project_audio = self.storage.project_directory(project["project_id"]) / result["preparation"]["source_audio"]["render_relative_path"]
+        self.assertTrue(project_audio.is_file())
 
     def test_template_is_not_mutated_by_compilation(self):
         project = self._project()
@@ -519,6 +582,7 @@ class Phase8TestCase(unittest.TestCase):
                 project["scenes"][0]["scene_id"],
                 requirements_report=self._requirements(),
                 media_adapter=adapter,
+                comfyui_input_directory=self.comfyui_input_directory,
             )
         self.assertIn("PROMPT_STALE", {item["code"] for item in context.exception.preflight["blockers"]})
         self.assertEqual(calls, [])
@@ -589,6 +653,7 @@ class Phase8TestCase(unittest.TestCase):
             project["scenes"][0]["scene_id"],
             requirements_report=self._requirements(),
             media_adapter=adapter,
+            comfyui_input_directory=self.comfyui_input_directory,
         )
         self.assertEqual(self.storage.load_project(project["project_id"])["schema_version"], 7)
         metadata = result["preparation"]

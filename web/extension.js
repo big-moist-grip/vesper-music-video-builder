@@ -408,6 +408,7 @@ function setCurrentProject(root, project, options = {}) {
     builderState.renderJobsLoading = false;
     builderState.renderSubmittingSceneId = null;
     builderState.renderJobActionId = null;
+    builderState.renderFinalizingJobId = null;
 }
 
 function cancelAutosave(root) {
@@ -2837,6 +2838,10 @@ function renderJobRetryPath(projectId, jobId) {
     return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/jobs/${encodeURIComponent(jobId)}/retry`;
 }
 
+function renderJobFinalizePath(projectId, jobId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/jobs/${encodeURIComponent(jobId)}/finalize`;
+}
+
 function renderJobLabel(state) {
     return {
         READY_TO_SUBMIT: "READY TO SUBMIT",
@@ -2849,11 +2854,34 @@ function renderJobLabel(state) {
         CANCELLED: "CANCELLED",
         INTERRUPTED: "INTERRUPTED",
         UNKNOWN: "RECONCILIATION REQUIRED",
+        ORPHANED: "ORPHANED",
     }[state] || "NOT QUEUED";
 }
 
 function renderJobIsActive(job) {
     return ["READY_TO_SUBMIT", "SUBMITTING", "QUEUED", "RUNNING", "CANCEL_REQUESTED", "UNKNOWN"].includes(job?.state);
+}
+
+function renderFinalizationLabel(state) {
+    return {
+        NOT_AVAILABLE: "NOT AVAILABLE",
+        RAW_READY: "RAW READY",
+        FINALIZING: "FINALIZING",
+        FINALIZED: "READY",
+        STALE: "STALE",
+        FAILED: "FAILED",
+    }[state] || "NOT AVAILABLE";
+}
+
+function renderFinalizationState(job) {
+    return job?.finalization?.state || "NOT_AVAILABLE";
+}
+
+function renderFinalizationEligible(job) {
+    const state = renderFinalizationState(job);
+    return job?.state === "SUCCEEDED"
+        && job?.finalization?.eligible === true
+        && ["RAW_READY", "STALE", "FAILED"].includes(state);
 }
 
 function clearRenderJobPoll() {
@@ -2881,7 +2909,157 @@ function scheduleRenderJobPoll(root) {
 }
 
 function renderDiagnosticText(entry) {
-    return entry && typeof entry.message === "string" ? entry.message : "Render preparation requires attention.";
+    return entry && typeof entry.message === "string" ? entry.message : "Render inputs require attention.";
+}
+
+function renderJobShellKey(scene, prompt, job, state) {
+    const durableJob = job ? {
+        ...job,
+        progress: null,
+        telemetry: null,
+        updated_at: null,
+        last_reconciled_at: null,
+        last_poll_error: null,
+    } : null;
+    return JSON.stringify({
+        scene,
+        prompt,
+        job: durableJob,
+        preparing: state.renderPreparingSceneId,
+        submitting: state.renderSubmittingSceneId,
+        action: state.renderJobActionId,
+        finalizing: state.renderFinalizingJobId,
+        operation: state.operation,
+        transitioning: state.transitioning,
+        closing: state.closing,
+    });
+}
+
+function finiteTelemetryNumber(value) {
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function renderTelemetryPresentation(job) {
+    const active = Boolean(job && renderJobIsActive(job) && job.state !== "UNKNOWN");
+    const progress = job?.progress;
+    const telemetry = job?.telemetry;
+    const telemetryCurrent = telemetry?.telemetry_stale !== true;
+    const progressValue = finiteTelemetryNumber(progress?.raw_value)
+        ?? finiteTelemetryNumber(telemetry?.progress_value);
+    const progressMax = finiteTelemetryNumber(progress?.raw_max)
+        ?? finiteTelemetryNumber(telemetry?.progress_max);
+    const determinate = Boolean(
+        active
+        && job?.state === "RUNNING"
+        && telemetryCurrent
+        && progress?.kind === "telemetry"
+        && progressValue !== null
+        && progressMax !== null
+        && progressMax > 0,
+    );
+    const percent = determinate
+        ? Math.round(Math.max(0, Math.min(1, progressValue / progressMax)) * 100)
+        : null;
+    const stageLabel = telemetryCurrent && typeof progress?.stage === "string" && progress.stage
+        ? progress.stage
+        : telemetryCurrent && typeof telemetry?.current_stage === "string" && telemetry.current_stage
+            ? telemetry.current_stage
+            : telemetryCurrent && typeof telemetry?.stage === "string" && telemetry.stage
+                ? telemetry.stage
+                : job?.state === "QUEUED"
+                    ? "Queued"
+                    : "Rendering";
+    return {
+        active,
+        mode: percent === null ? "indeterminate" : "determinate",
+        percent,
+        stageLabel,
+    };
+}
+
+function updateRenderJobTelemetry(card, job) {
+    const panel = card?.querySelector("[data-mvb-render-telemetry]");
+    if (!panel) {
+        return;
+    }
+    const status = panel.querySelector("[data-mvb-render-telemetry-status]");
+    const stage = panel.querySelector("[data-mvb-render-telemetry-stage]");
+    const bar = panel.querySelector("[data-mvb-render-telemetry-bar]");
+    const track = panel.querySelector("[data-mvb-render-telemetry-track]");
+    const { active, mode, percent, stageLabel } = renderTelemetryPresentation(job);
+    panel.hidden = !active;
+    panel.dataset.state = active ? mode : "idle";
+    if (!active) {
+        if (status) {
+            status.textContent = "";
+        }
+        if (stage) {
+            stage.textContent = "";
+        }
+        if (track) {
+            track.dataset.mode = "idle";
+            track.classList.remove("mvb-render-telemetry-track-indeterminate", "mvb-render-telemetry-track-determinate");
+            track.removeAttribute("aria-valuenow");
+            track.removeAttribute("aria-valuetext");
+        }
+        if (bar) {
+            bar.style.removeProperty("width");
+        }
+        return;
+    }
+    if (status) {
+        status.textContent = renderJobLabel(job?.state);
+    }
+    if (stage) {
+        stage.textContent = percent === null ? stageLabel : `${stageLabel} · ${percent}%`;
+    }
+    if (bar) {
+        if (percent !== null) {
+            bar.style.width = `${percent}%`;
+        } else {
+            bar.style.removeProperty("width");
+        }
+    }
+    if (track) {
+        track.dataset.mode = mode;
+        track.classList.toggle("mvb-render-telemetry-track-indeterminate", mode === "indeterminate");
+        track.classList.toggle("mvb-render-telemetry-track-determinate", mode === "determinate");
+        if (percent !== null) {
+            track.setAttribute("aria-valuenow", String(percent));
+            track.setAttribute("aria-valuetext", `${stageLabel}, ${percent}% stage progress`);
+        } else {
+            track.removeAttribute("aria-valuenow");
+            track.setAttribute("aria-valuetext", `${stageLabel}, in progress`);
+        }
+    }
+}
+
+function createRenderJobTelemetry() {
+    const panel = document.createElement("div");
+    panel.className = "mvb-render-telemetry";
+    panel.dataset.mvbRenderTelemetry = "true";
+    const heading = document.createElement("div");
+    heading.className = "mvb-render-telemetry-heading";
+    const status = document.createElement("strong");
+    status.dataset.mvbRenderTelemetryStatus = "true";
+    heading.append(status);
+    const stage = document.createElement("span");
+    stage.className = "mvb-render-telemetry-stage";
+    stage.dataset.mvbRenderTelemetryStage = "true";
+    const track = document.createElement("div");
+    track.className = "mvb-render-telemetry-track";
+    track.dataset.mvbRenderTelemetryTrack = "true";
+    track.setAttribute("role", "progressbar");
+    track.setAttribute("aria-label", "Current render stage progress");
+    track.setAttribute("aria-valuemin", "0");
+    track.setAttribute("aria-valuemax", "100");
+    const bar = document.createElement("div");
+    bar.className = "mvb-render-telemetry-bar";
+    bar.dataset.mvbRenderTelemetryBar = "true";
+    bar.setAttribute("aria-hidden", "true");
+    track.append(bar);
+    panel.append(heading, stage, track);
+    return panel;
 }
 
 function renderPromptStateForScene(scene) {
@@ -2934,7 +3112,7 @@ function renderRenderState(root) {
     if (state.renderState === "loading") {
         status.textContent = state.renderLoadingMode === "runtime"
             ? "Inspecting runtime requirements…"
-            : "Refreshing scene readiness…";
+            : "Refreshing renders…";
         status.dataset.state = "working";
         empty.hidden = true;
         return;
@@ -2947,19 +3125,23 @@ function renderRenderState(root) {
         return;
     }
     if (!preflight || !Array.isArray(preflight.scenes)) {
-        status.textContent = "Refresh Preflight to inspect scene readiness.";
+        status.textContent = "Refresh Preflight to inspect scenes.";
         status.dataset.state = "empty";
         empty.hidden = false;
         list.replaceChildren();
         return;
     }
 
-    const blockedCount = preflight.scenes.filter((scene) => scene.blockers?.length || !scene.preparation_ready).length;
+    const notReadyCount = Math.max(0, preflight.scene_count - preflight.preparation_ready_count);
     const activeJobCount = Object.values(state.renderJobs || {}).filter(renderJobIsActive).length;
     status.textContent = state.renderMessage
         || state.renderJobsMessage
-        || `${preflight.preparation_ready_count} of ${preflight.scene_count} scene${preflight.scene_count === 1 ? "" : "s"} ready for preparation${blockedCount ? ` · ${blockedCount} blocked` : ""}${activeJobCount ? ` · ${activeJobCount} job${activeJobCount === 1 ? "" : "s"} active` : ""}.`;
-    status.dataset.state = state.renderMessageState || (state.renderJobsMessage ? "warning" : blockedCount ? "warning" : "success");
+        || `${preflight.preparation_ready_count} ready · ${notReadyCount} not ready${activeJobCount ? ` · ${activeJobCount} active` : ""}`;
+    status.dataset.state = state.renderMessage
+        ? (state.renderMessageState || "neutral")
+        : state.renderJobsMessage
+            ? "warning"
+            : "neutral";
     empty.hidden = preflight.scenes.length !== 0;
     const content = root.querySelector(".mvb-content");
     const contentScrollTop = content?.scrollTop ?? 0;
@@ -2979,37 +3161,56 @@ function renderRenderState(root) {
             && job.preparation_fingerprint === scene.preparation_fingerprint;
         const blockers = [...(Array.isArray(scene.blockers) ? scene.blockers : []), ...prompt.diagnostics];
         const ready = Boolean(scene.preparation_ready) && prompt.ready;
+        const executionEligible = scene.execution_eligibility?.eligible === true;
+        const timingPlan = scene.timing_plan;
+        const timingLabel = timingPlan && Number.isInteger(timingPlan.generated_frame_count)
+            && Number.isFinite(Number(timingPlan.generated_duration_ms))
+            ? `${timingPlan.generated_frame_count} frames · ${(Number(timingPlan.generated_duration_ms) / 1000).toFixed(3)} s`
+            : "NOT PLANNED";
+        const trimLabel = timingPlan && Number.isFinite(Number(timingPlan.trim_duration_ms))
+            ? timingPlan.trim_required === true
+                ? `Required · ${Math.round(Number(timingPlan.trim_duration_ms))} ms`
+                : "None"
+            : "NOT PLANNED";
         const card = existingCards.get(scene.scene_id) || document.createElement("article");
+        const shellKey = renderJobShellKey(scene, prompt, job, state);
+        if (card.dataset.mvbRenderShellKey === shellKey && card.querySelector("[data-mvb-render-telemetry]")) {
+            updateRenderJobTelemetry(card, job);
+            list.append(card);
+            continue;
+        }
         card.className = "mvb-render-card";
         card.dataset.mvbRenderCard = scene.scene_id;
+        card.dataset.mvbRenderShellKey = shellKey;
         card.dataset.state = ready ? "ready" : "blocked";
 
         const heading = document.createElement("div");
         heading.className = "mvb-render-card-heading";
         const title = document.createElement("div");
         title.className = "mvb-render-card-title";
-        const eyebrow = document.createElement("p");
-        eyebrow.className = "mvb-eyebrow";
-        eyebrow.textContent = `Scene ${scene.sequence}`;
         const name = document.createElement("h3");
-        name.textContent = scene.scene_id;
-        title.append(eyebrow, name);
+        name.textContent = `Scene ${scene.sequence}`;
+        title.append(name);
         const stateBadge = document.createElement("span");
         stateBadge.className = "mvb-render-readiness";
-        stateBadge.dataset.state = ready ? "ready" : "blocked";
-        stateBadge.textContent = ready ? "READY" : "BLOCKED";
+        stateBadge.dataset.state = job && renderJobIsActive(job) ? "active" : ready ? "ready" : "blocked";
+        stateBadge.textContent = job && renderJobIsActive(job) ? renderJobLabel(job.state) : ready ? "INPUTS READY" : "BLOCKED";
         heading.append(title, stateBadge);
 
         const facts = document.createElement("div");
         facts.className = "mvb-render-facts";
         for (const [label, value] of [
             ["Duration", `${scene.duration_ms} ms`],
+            ["H3 plan", timingLabel],
+            ["Trim", trimLabel],
             ["Method", scene.generation_method === "keyframe_i2v" ? "Keyframe / I2V" : "Reference-to-Video"],
             ["Visuals", scene.visuals_ready ? "READY" : "BLOCKED"],
             ["Prompt", prompt.status === "current" ? "CURRENT" : promptStatusLabel(prompt.status)],
             ["Requirements", scene.requirements_ready ? "READY" : "BLOCKED"],
             ["Preparation", scene.preparation_status === "current" ? "PREPARED" : scene.preparation_status === "stale" ? "RE-PREPARE" : ready ? "READY" : "BLOCKED"],
             ["Render job", job ? `${renderJobLabel(job.state)}${job.state === "SUCCEEDED" && !jobCurrent ? " · HISTORICAL" : ""}` : "NOT QUEUED"],
+            ["Raw H3", job?.output?.raw_h3_output && job.state === "SUCCEEDED" ? (jobCurrent ? "CURRENT" : "HISTORICAL") : "NOT AVAILABLE"],
+            ["Final scene", renderFinalizationLabel(renderFinalizationState(job))],
         ]) {
             const fact = document.createElement("div");
             fact.className = "mvb-render-fact";
@@ -3023,29 +3224,51 @@ function renderRenderState(root) {
 
         const detail = document.createElement("p");
         detail.className = "mvb-render-detail";
-        if (job?.state === "SUCCEEDED") {
+        const finalizationState = renderFinalizationState(job);
+        if (job?.state === "SUCCEEDED" && finalizationState === "FINALIZED") {
+            detail.textContent = "Final scene ready.";
+        } else if (job?.state === "SUCCEEDED" && finalizationState === "FINALIZING") {
+            detail.textContent = "Finalizing the raw H3 output with authoritative scene audio…";
+        } else if (job?.state === "SUCCEEDED" && finalizationState === "FAILED") {
+            detail.textContent = job.finalization?.failure?.message || "Final scene finalization failed; retry is available if inputs remain current.";
+        } else if (job?.state === "SUCCEEDED" && finalizationState === "STALE") {
+            detail.textContent = "Historical raw render retained; final scene output is stale for current scene inputs.";
+        } else if (job?.state === "SUCCEEDED" && finalizationState === "RAW_READY") {
+            detail.textContent = "Raw H3 output ready for finalization.";
+        } else if (job?.state === "SUCCEEDED" && job.output_discovery?.state === "FAILED") {
+            detail.textContent = job.output_discovery.failure?.message
+                ? `ComfyUI reported success, but raw H3 output discovery failed: ${job.output_discovery.failure.message}`
+                : "ComfyUI reported success, but raw H3 output discovery failed.";
+        } else if (job?.state === "SUCCEEDED") {
             detail.textContent = job.output?.relative_path && jobCurrent
-                ? `Raw H3 output discovered · ${job.output.relative_path}`
+                ? "Raw H3 output ready."
                 : job.output?.relative_path
-                    ? `Historical raw H3 output retained · ${job.output.relative_path}`
-                : "ComfyUI reported success, but no output association is available.";
+                    ? "Historical raw H3 output retained."
+                    : "ComfyUI reported success, but no output association is available.";
         } else if (job?.state === "FAILED") {
             detail.textContent = job.failure?.message || "The render job failed.";
         } else if (job?.state === "UNKNOWN") {
-            detail.textContent = "ComfyUI no longer reports this prompt; reconcile before retrying.";
+            detail.textContent = job.failure?.message || "Checking ComfyUI queue/history; reconcile this existing prompt before retrying.";
+        } else if (job?.state === "ORPHANED") {
+            detail.textContent = "Previous render is unavailable and can be retried.";
         } else if (job && renderJobIsActive(job)) {
-            detail.textContent = job.state === "CANCEL_REQUESTED"
-                ? "Cancellation has been requested; waiting for ComfyUI reconciliation."
-                : `ComfyUI job ${renderJobLabel(job.state).toLowerCase()}. Numerical progress is not inferred.`;
-        } else if (scene.preparation_status === "current") {
-            detail.textContent = "Prepared inputs are current. Target H3 qualification remains deferred.";
+            if (job.state === "CANCEL_REQUESTED") {
+                detail.textContent = "Cancellation requested.";
+            } else {
+                detail.hidden = true;
+            }
         } else if (blockers.length) {
             detail.textContent = renderDiagnosticText(blockers[0]);
+        } else if (scene.preparation_status === "current") {
+            detail.textContent = executionEligible
+                ? "Prepared inputs are current and ready to render."
+                : "Prepared inputs are current, but a runtime execution requirement is not ready.";
         } else if (scene.preparation_status === "stale") {
             detail.textContent = "Existing preparation is stale and must be regenerated from current scene inputs.";
         } else {
             detail.textContent = "All structural prerequisites are current; prepare inputs to create the dry workflow package.";
         }
+        const telemetryPanel = createRenderJobTelemetry();
 
         const actions = document.createElement("div");
         actions.className = "mvb-render-actions";
@@ -3054,25 +3277,27 @@ function renderRenderState(root) {
         prepareButton.type = "button";
         prepareButton.dataset.mvbRenderPrepare = scene.scene_id;
         prepareButton.textContent = scene.preparation_status === "stale" ? "Re-prepare Render Inputs" : "Prepare Render Inputs";
-        prepareButton.disabled = !ready || state.renderPreparingSceneId === scene.scene_id || Boolean(state.operation) || state.transitioning || state.closing;
+        prepareButton.disabled = !ready || Boolean(job && renderJobIsActive(job)) || state.renderPreparingSceneId === scene.scene_id || Boolean(state.operation) || state.transitioning || state.closing;
         actions.append(prepareButton);
         const renderButton = document.createElement("button");
         renderButton.className = "mvb-button mvb-button-primary mvb-button-small";
         renderButton.type = "button";
         renderButton.dataset.mvbRenderSubmit = scene.scene_id;
-        renderButton.textContent = preflight.target_hardware_qualified === true ? ["Render", "Scene"].join(" ") : "Render deferred";
-        renderButton.disabled = preflight.target_hardware_qualified !== true
-            || scene.preparation_status !== "current"
+        renderButton.textContent = "Render Scene";
+        renderButton.disabled = !executionEligible
             || !ready
             || Boolean(job && renderJobIsActive(job))
             || state.renderSubmittingSceneId === scene.scene_id
             || Boolean(state.operation)
             || state.transitioning
             || state.closing;
-        renderButton.title = preflight.target_hardware_qualified === true
+        renderButton.title = executionEligible
             ? "Submit the current project-owned preparation package to local ComfyUI."
-            : "Target H3 qualification is deferred; no executable Render action is available on this host.";
-        actions.append(renderButton);
+            : (scene.execution_eligibility?.blockers?.[0]?.message || "Current scene execution requirements are not ready.");
+        const retryableJob = Boolean(job && ["FAILED", "CANCELLED", "INTERRUPTED", "ORPHANED"].includes(job.state));
+        if (!retryableJob) {
+            actions.append(renderButton);
+        }
         if (job && renderJobIsActive(job) && job.state !== "UNKNOWN") {
             const cancelButton = document.createElement("button");
             cancelButton.className = "mvb-button mvb-button-secondary mvb-button-small";
@@ -3082,22 +3307,27 @@ function renderRenderState(root) {
             cancelButton.disabled = job.state === "CANCEL_REQUESTED" || state.renderJobActionId === job.job_id || Boolean(state.operation) || state.transitioning || state.closing;
             actions.append(cancelButton);
         }
-        if (job && ["FAILED", "CANCELLED", "INTERRUPTED"].includes(job.state)) {
+        if (retryableJob) {
             const retryButton = document.createElement("button");
             retryButton.className = "mvb-button mvb-button-secondary mvb-button-small";
             retryButton.type = "button";
             retryButton.dataset.mvbRenderRetry = job.job_id;
-            retryButton.textContent = preflight.target_hardware_qualified === true ? "Retry" : "Retry deferred";
-            retryButton.disabled = preflight.target_hardware_qualified !== true || state.renderJobActionId === job.job_id || Boolean(state.operation) || state.transitioning || state.closing;
+            retryButton.textContent = "Retry";
+            retryButton.disabled = !executionEligible || state.renderJobActionId === job.job_id || Boolean(state.operation) || state.transitioning || state.closing;
             actions.append(retryButton);
         }
-        const qualification = document.createElement("span");
-        qualification.className = "mvb-render-qualification";
-        qualification.textContent = preflight.target_hardware_qualified === true
-            ? "Target H3 qualified"
-            : "Target H3 qualification deferred";
-        actions.append(qualification);
-
+        if (renderFinalizationEligible(job)) {
+            const finalizeButton = document.createElement("button");
+            finalizeButton.className = "mvb-button mvb-button-secondary mvb-button-small";
+            finalizeButton.type = "button";
+            finalizeButton.dataset.mvbRenderFinalize = job.job_id;
+            finalizeButton.textContent = finalizationState === "FAILED" ? "Retry Finalization" : "Finalize Scene";
+            finalizeButton.disabled = state.renderFinalizingJobId === job.job_id
+                || Boolean(state.operation)
+                || state.transitioning
+                || state.closing;
+            actions.append(finalizeButton);
+        }
         const blockersList = document.createElement("ul");
         blockersList.className = "mvb-render-blockers";
         blockersList.hidden = blockers.length === 0;
@@ -3106,7 +3336,15 @@ function renderRenderState(root) {
             item.textContent = renderDiagnosticText(blocker);
             blockersList.append(item);
         }
-        card.replaceChildren(heading, facts, detail, blockersList, actions);
+        card.replaceChildren(
+            heading,
+            facts,
+            detail,
+            telemetryPanel,
+            blockersList,
+            actions,
+        );
+        updateRenderJobTelemetry(card, job);
         list.append(card);
     }
     for (const [sceneId, card] of existingCards) {
@@ -3146,9 +3384,10 @@ async function loadRenderJobs(root, silent = false) {
         builderState.renderJobsMessage = Array.isArray(payload.warnings) && payload.warnings.length
             ? payload.warnings[0].message || "ComfyUI status is temporarily unavailable."
             : "";
-        builderState.renderJobsPollDelay = Object.values(builderState.renderJobs).some(renderJobIsActive)
-            ? Math.min((builderState.renderJobsPollDelay || 1000) * 2, 8000)
-            : 1000;
+        // The backend owns one shared WebSocket telemetry session. Keep the
+        // durable HTTP reconciliation cadence bounded while live volatile
+        // observations are overlaid without rebuilding the card shell.
+        builderState.renderJobsPollDelay = 1000;
         return true;
     } catch (error) {
         if (!isActive(root) || builderState.currentProject?.project_id !== projectId) {
@@ -3172,12 +3411,12 @@ async function submitRenderScene(root, sceneId) {
         return;
     }
     const scene = builderState.renderPreflight?.scenes?.find((entry) => entry.scene_id === sceneId);
-    if (!scene || builderState.renderPreflight?.target_hardware_qualified !== true || scene.preparation_status !== "current") {
+    if (!scene || scene.execution_eligibility?.eligible !== true || scene.preparation_status !== "current") {
         return;
     }
     const projectId = builderState.currentProject.project_id;
     builderState.renderSubmittingSceneId = sceneId;
-    builderState.renderMessage = "Submitting the current prepared package to local ComfyUI…";
+    builderState.renderMessage = "Starting render…";
     builderState.renderMessageState = "working";
     renderRenderState(root);
     try {
@@ -3185,13 +3424,14 @@ async function submitRenderScene(root, sceneId) {
             method: "POST",
             body: JSON.stringify({}),
         });
-        builderState.renderMessage = `Scene ${sceneId} was accepted by local ComfyUI.`;
-        builderState.renderMessageState = "success";
+        builderState.renderMessage = "";
+        builderState.renderMessageState = "";
         await loadRenderJobs(root, true);
     } catch (error) {
         if (isActive(root)) {
             builderState.renderMessage = error instanceof Error ? error.message : "Render submission could not complete.";
             builderState.renderMessageState = "error";
+            await loadRenderJobs(root, true);
         }
     } finally {
         if (isActive(root)) {
@@ -3242,10 +3482,41 @@ async function retryRenderSceneJob(root, jobId) {
         if (isActive(root)) {
             builderState.renderMessage = error instanceof Error ? error.message : "Render retry could not complete.";
             builderState.renderMessageState = "error";
+            await loadRenderJobs(root, true);
         }
     } finally {
         if (isActive(root)) {
             builderState.renderJobActionId = null;
+            renderRenderState(root);
+        }
+    }
+}
+
+async function finalizeRenderScene(root, jobId) {
+    if (!isActive(root) || !builderState.currentProject || builderState.renderFinalizingJobId) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    builderState.renderFinalizingJobId = jobId;
+    builderState.renderMessage = "Finalizing the current raw H3 output…";
+    builderState.renderMessageState = "working";
+    renderRenderState(root);
+    try {
+        await fetchJson(renderJobFinalizePath(projectId, jobId), {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        builderState.renderMessage = "Final scene output validated.";
+        builderState.renderMessageState = "success";
+        await loadRenderJobs(root, true);
+    } catch (error) {
+        if (isActive(root)) {
+            builderState.renderMessage = error instanceof Error ? error.message : "Final scene finalization could not complete.";
+            builderState.renderMessageState = "error";
+        }
+    } finally {
+        if (isActive(root)) {
+            builderState.renderFinalizingJobId = null;
             renderRenderState(root);
         }
     }
@@ -3316,9 +3587,11 @@ async function prepareRenderScene(root, sceneId) {
             body: JSON.stringify({}),
         });
         if (result?.status === "prepared") {
-            const timing = result.preparation?.timing;
-            builderState.renderMessage = `Prepared Scene ${result.preparation?.scene_id || sceneId} · ${timing?.target_duration_ms ?? scene.duration_ms} ms · ${timing?.generated_frame_count ?? "—"} frames · workflow validated.`;
-            builderState.renderMessageState = "success";
+            // The refreshed scene card is the durable success surface: its
+            // Preparation tile becomes PREPARED without exposing internal IDs
+            // or repeating timing and workflow details in the page header.
+            builderState.renderMessage = "";
+            builderState.renderMessageState = "ready";
         } else {
             builderState.renderMessage = "Preparation did not complete.";
             builderState.renderMessageState = "error";
@@ -5333,7 +5606,7 @@ function openBuilder() {
                     <button class="mvb-view-button" data-mvb-view="storyboard" type="button" role="tab" aria-selected="false">Storyboard</button>
                     <button class="mvb-view-button" data-mvb-view="visuals" type="button" role="tab" aria-selected="false">Visuals</button>
                     <button class="mvb-view-button" data-mvb-view="prompts" type="button" role="tab" aria-selected="false">Prompts</button>
-                    <button class="mvb-view-button" data-mvb-view="render" type="button" role="tab" aria-selected="false">Render</button>
+                    <button class="mvb-view-button" data-mvb-view="render" type="button" role="tab" aria-selected="false">Renders</button>
                 </nav>
 
                 <section class="mvb-landing" data-mvb-landing aria-labelledby="mvb-landing-heading" hidden>
@@ -5473,18 +5746,12 @@ function openBuilder() {
                 </section>
 
                 <section class="mvb-render" data-mvb-render aria-labelledby="mvb-render-heading" hidden>
-                    <div class="mvb-render-heading">
-                        <div>
-                            <p class="mvb-eyebrow">Render preparation</p>
-                            <h2 id="mvb-render-heading">Scene readiness</h2>
-                        </div>
-                        <div class="mvb-render-heading-actions">
-                            <span class="mvb-render-status" data-mvb-render-status aria-live="polite"></span>
-                            <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-render-refresh type="button">Refresh Preflight</button>
-                            <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-render-rescan type="button">Rescan Runtime</button>
-                        </div>
-                    </div>
-                    <p class="mvb-render-intro">Prepare exact scene audio, current visual inputs, timing, and a validated production workflow. Submission is enabled only after target H3 qualification; job state and raw output are reconciled from local ComfyUI.</p>
+                    <header class="mvb-render-heading">
+                        <h2 class="mvb-render-page-title" id="mvb-render-heading">Renders</h2>
+                        <span class="mvb-render-status" data-mvb-render-status aria-live="polite"></span>
+                        <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-render-refresh type="button">Refresh Preflight</button>
+                        <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-render-rescan type="button">Rescan Runtime</button>
+                    </header>
                     <p class="mvb-render-empty" data-mvb-render-empty hidden>Build scenes before preparing Render inputs.</p>
                     <div class="mvb-render-scenes" data-mvb-render-scenes></div>
                 </section>
@@ -5799,6 +6066,7 @@ function openBuilder() {
            renderJobsLoading: false,
            renderSubmittingSceneId: null,
            renderJobActionId: null,
+           renderFinalizingJobId: null,
            activeView: "setup",
         deleteConfirm: null,
         newProjectBusy: false,
@@ -5988,6 +6256,11 @@ function openBuilder() {
         const retryButton = event.target.closest("[data-mvb-render-retry]");
         if (retryButton) {
             void retryRenderSceneJob(root, retryButton.dataset.mvbRenderRetry);
+            return;
+        }
+        const finalizeButton = event.target.closest("[data-mvb-render-finalize]");
+        if (finalizeButton) {
+            void finalizeRenderScene(root, finalizeButton.dataset.mvbRenderFinalize);
         }
     });
     cancelClearStoryboardButton.addEventListener("click", () => closeStoryboardClearDialog(root));

@@ -235,13 +235,15 @@ class Phase8A4RequirementsCacheTestCase(unittest.TestCase):
         self.assertIn("force_requirements_refresh", routes)
         self.assertIn("get_requirements_snapshot", routes)
 
-    def test_render_boundary_remains_no_queue_no_h3_and_target_qualification_deferred(self):
+    def test_render_boundary_remains_no_queue_no_h3_and_eligibility_is_explicit(self):
         render_source = (ROOT / "backend" / "render.py").read_text(encoding="utf-8")
         extension = (ROOT / "web" / "extension.js").read_text(encoding="utf-8")
         self.assertNotIn("queue_prompt", render_source)
         self.assertNotIn("PromptServer", render_source)
         self.assertIn('"queue_submitted": False', render_source)
-        self.assertIn("Target H3 qualification deferred", extension)
+        self.assertIn("execution_eligibility", render_source)
+        self.assertNotIn("Target H3 qualification deferred", extension)
+        self.assertNotIn("Render deferred", extension)
 
     def test_snapshot_metadata_exposes_cache_provenance_and_duration(self):
         snapshot = get_requirements_snapshot(
@@ -367,7 +369,7 @@ class Phase8A4RequirementsCacheTestCase(unittest.TestCase):
         extension = (ROOT / "web" / "extension.js").read_text(encoding="utf-8")
 
         self.assertIn("Inspecting runtime requirements…", extension)
-        self.assertIn("Refreshing scene readiness…", extension)
+        self.assertIn("Refreshing renders…", extension)
         self.assertIn('renderLoadingMode = forceRefresh || !builderState.renderRequirementsCache ? "runtime" : "scene"', extension)
 
     def test_frontend_warm_refresh_reconciles_existing_scene_cards_in_place(self):
@@ -375,7 +377,11 @@ class Phase8A4RequirementsCacheTestCase(unittest.TestCase):
 
         self.assertIn("const existingCards = new Map", extension)
         self.assertIn("card.dataset.mvbRenderCard", extension)
-        self.assertIn("card.replaceChildren(heading, facts, detail, blockersList, actions)", extension)
+        self.assertIn("card.replaceChildren(", extension)
+        self.assertIn("telemetryPanel,", extension)
+        self.assertNotIn("submissionDiagnostics", extension)
+        self.assertIn("blockersList,", extension)
+        self.assertIn("actions,", extension)
 
     def test_frontend_preserves_render_content_scroll_position(self):
         extension = (ROOT / "web" / "extension.js").read_text(encoding="utf-8")
@@ -391,13 +397,17 @@ class Phase8A4RequirementsCacheTestCase(unittest.TestCase):
         self.assertNotIn("queue_prompt", render_source)
         self.assertNotIn("PromptServer", render_source)
 
-    def test_target_hardware_qualification_remains_deferred_in_runtime_surface(self):
+    def test_multi_gpu_execution_policy_is_informational_in_runtime_surface(self):
         extension = (ROOT / "web" / "extension.js").read_text(encoding="utf-8")
         render_source = (ROOT / "backend" / "render.py").read_text(encoding="utf-8")
 
-        self.assertIn("Target H3 qualification deferred", extension)
-        self.assertIn("DEFERRED_TARGET_NVIDIA", render_source)
-        self.assertIn("TARGET_HARDWARE_STATUS", render_source)
+        self.assertIn("execution_eligibility", extension)
+        self.assertNotIn("performance_preference", extension)
+        self.assertIn("SUPPORTED_MULTI_GPU", render_source)
+        self.assertIn("AMD Radeon RX 7900 XT", render_source)
+        self.assertIn("NVIDIA RTX 4080 SUPER 16 GB", render_source)
+        self.assertNotIn("DEFERRED_TARGET_NVIDIA", render_source)
+        self.assertNotIn("TARGET_HARDWARE_STATUS", render_source)
 
     def test_workflow_contract_validation_remains_explicit_and_fail_closed(self):
         render_source = (ROOT / "backend" / "render.py").read_text(encoding="utf-8")
