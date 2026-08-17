@@ -62,7 +62,31 @@ from .render_jobs import (
     RenderJobError,
     RenderJobSubmissionError,
     reconcile_project_jobs,
+    sanitize_user_facing_message,
     submit_render_job,
+)
+from .render_production import (
+    POSTPROCESS_ACTIVE_STATES,
+    POSTPROCESS_CANCELLED,
+    POSTPROCESS_FAILED,
+    POSTPROCESS_METHOD_NONE,
+    POSTPROCESS_SUCCEEDED,
+    PRODUCTION_CURRENT,
+    PostprocessJobConflict,
+    PostprocessJobNotFound,
+    PostprocessJobStore,
+    ProductionMethodUnavailable,
+    ProductionNotReady,
+    RenderProductionError,
+    finalize_postprocess_job,
+    materialize_final_scene_for_postprocess,
+    production_method_availability,
+    reconcile_postprocess_job,
+    resolve_project_production_method,
+    submit_postprocess_job,
+    summarize_production_scene,
+    validate_production_method,
+    validate_production_settings,
 )
 
 
@@ -75,8 +99,7 @@ BATCH_FILENAME_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$"
 )
 
-# Batch-level state machine.  The backend is the only authority that infers or
-# transitions batch state; the frontend presents it.
+# Top-level batch lifecycle states (truthful and deterministic)
 BATCH_RUNNING = "RUNNING"
 BATCH_PAUSE_REQUESTED = "PAUSE_REQUESTED"
 BATCH_PAUSED = "PAUSED"
@@ -94,9 +117,14 @@ BATCH_STATES = frozenset({
     BATCH_COMPLETED_WITH_ISSUES,
     BATCH_ENDED,
 })
-EXECUTING_BATCH_STATES = frozenset({BATCH_RUNNING, BATCH_PAUSE_REQUESTED})
 OPEN_BATCH_STATES = frozenset({
     BATCH_RUNNING,
+    BATCH_PAUSE_REQUESTED,
+    BATCH_PAUSED,
+    BATCH_PAUSED_RECOVERY,
+})
+EXECUTING_BATCH_STATES = frozenset({BATCH_RUNNING, BATCH_PAUSE_REQUESTED})
+PAUSED_BATCH_STATES = frozenset({
     BATCH_PAUSE_REQUESTED,
     BATCH_PAUSED,
     BATCH_PAUSED_RECOVERY,
@@ -104,8 +132,10 @@ OPEN_BATCH_STATES = frozenset({
 TERMINAL_BATCH_STATES = frozenset({BATCH_COMPLETED, BATCH_COMPLETED_WITH_ISSUES, BATCH_ENDED})
 
 # Authoritative planner actions: the minimum work each scene needs to reach a
-# current final scene output.
+# current production scene output.
 ACTION_ALREADY_COMPLETE = "ALREADY_COMPLETE"
+ACTION_POSTPROCESS_ONLY = "POSTPROCESS_ONLY"
+ACTION_FINALIZE_AND_POSTPROCESS = "FINALIZE_AND_POSTPROCESS"
 ACTION_FINALIZE_RAW = "FINALIZE_RAW"
 ACTION_RENDER_PREPARED = "RENDER_PREPARED"
 ACTION_PREPARE_AND_RENDER = "PREPARE_AND_RENDER"
@@ -113,22 +143,32 @@ ACTION_BLOCKED = "BLOCKED"
 
 BATCH_ACTIONS = frozenset({
     ACTION_ALREADY_COMPLETE,
+    ACTION_POSTPROCESS_ONLY,
+    ACTION_FINALIZE_AND_POSTPROCESS,
     ACTION_FINALIZE_RAW,
     ACTION_RENDER_PREPARED,
     ACTION_PREPARE_AND_RENDER,
     ACTION_BLOCKED,
 })
-ELIGIBLE_BATCH_ACTIONS = frozenset({ACTION_FINALIZE_RAW, ACTION_RENDER_PREPARED, ACTION_PREPARE_AND_RENDER})
+ELIGIBLE_BATCH_ACTIONS = frozenset({
+    ACTION_POSTPROCESS_ONLY,
+    ACTION_FINALIZE_AND_POSTPROCESS,
+    ACTION_FINALIZE_RAW,
+    ACTION_RENDER_PREPARED,
+    ACTION_PREPARE_AND_RENDER,
+})
 
 # Per-item runtime dispositions.
 ITEM_PENDING = "PENDING"
 ITEM_PREPARING = "PREPARING"
 ITEM_RENDERING = "RENDERING"
 ITEM_FINALIZING = "FINALIZING"
+ITEM_POSTPROCESSING = "POSTPROCESSING"
 ITEM_COMPLETE = "COMPLETE"
 ITEM_ALREADY_COMPLETE = "ALREADY_COMPLETE"
 ITEM_FAILED = "FAILED"
 ITEM_FINALIZATION_FAILED = "FINALIZATION_FAILED"
+ITEM_POSTPROCESS_FAILED = "POSTPROCESS_FAILED"
 ITEM_STALE_AFTER_RENDER = "STALE_AFTER_RENDER"
 ITEM_CANCELLED = "CANCELLED"
 ITEM_SKIPPED = "SKIPPED"
@@ -138,31 +178,46 @@ ITEM_DISPOSITIONS = frozenset({
     ITEM_PREPARING,
     ITEM_RENDERING,
     ITEM_FINALIZING,
+    ITEM_POSTPROCESSING,
     ITEM_COMPLETE,
     ITEM_ALREADY_COMPLETE,
     ITEM_FAILED,
     ITEM_FINALIZATION_FAILED,
+    ITEM_POSTPROCESS_FAILED,
     ITEM_STALE_AFTER_RENDER,
     ITEM_CANCELLED,
     ITEM_SKIPPED,
 })
-ACTIVE_ITEM_DISPOSITIONS = frozenset({ITEM_PREPARING, ITEM_RENDERING, ITEM_FINALIZING})
+ACTIVE_ITEM_DISPOSITIONS = frozenset({ITEM_PREPARING, ITEM_RENDERING, ITEM_FINALIZING, ITEM_POSTPROCESSING})
 # "Processed" is deterministic: any item that reached a stable disposition.
 STABLE_ITEM_DISPOSITIONS = frozenset({
     ITEM_COMPLETE,
     ITEM_ALREADY_COMPLETE,
     ITEM_FAILED,
     ITEM_FINALIZATION_FAILED,
+    ITEM_POSTPROCESS_FAILED,
     ITEM_STALE_AFTER_RENDER,
     ITEM_CANCELLED,
     ITEM_SKIPPED,
 })
 COMPLETE_ITEM_DISPOSITIONS = frozenset({ITEM_COMPLETE, ITEM_ALREADY_COMPLETE})
-FAILED_ITEM_DISPOSITIONS = frozenset({ITEM_FAILED, ITEM_FINALIZATION_FAILED, ITEM_STALE_AFTER_RENDER})
-ISSUE_ITEM_DISPOSITIONS = frozenset({ITEM_FAILED, ITEM_FINALIZATION_FAILED, ITEM_STALE_AFTER_RENDER, ITEM_CANCELLED})
+FAILED_ITEM_DISPOSITIONS = frozenset({
+    ITEM_FAILED,
+    ITEM_FINALIZATION_FAILED,
+    ITEM_POSTPROCESS_FAILED,
+    ITEM_STALE_AFTER_RENDER,
+})
+ISSUE_ITEM_DISPOSITIONS = frozenset({
+    ITEM_FAILED,
+    ITEM_FINALIZATION_FAILED,
+    ITEM_POSTPROCESS_FAILED,
+    ITEM_STALE_AFTER_RENDER,
+    ITEM_CANCELLED,
+})
 RETRYABLE_ITEM_DISPOSITIONS = frozenset({
     ITEM_FAILED,
     ITEM_FINALIZATION_FAILED,
+    ITEM_POSTPROCESS_FAILED,
     ITEM_STALE_AFTER_RENDER,
     ITEM_CANCELLED,
 })
@@ -280,6 +335,10 @@ def _validate_batch_record(record: Mapping[str, object], *, project_id: str | No
     result["items"] = normalized_items
     result["batch_id"] = canonical_batch_id
     result["project_id"] = canonical_project_id
+    if "production_profile" in result and isinstance(result["production_profile"], Mapping):
+        result["production_profile"] = validate_production_settings(result["production_profile"])
+    else:
+        result["production_profile"] = {"upscale_method": "none"}
     return result
 
 
@@ -325,6 +384,29 @@ def _active_pointer_path(storage: ProjectStorage, project_id: str) -> Path:
     if path.is_symlink():
         raise RenderBatchError("BATCH_PATH_UNSAFE", "The batch active pointer is a symlink.")
     return path
+
+
+def sanitize_batch_record_for_presentation(record: Mapping[str, object]) -> dict[str, object]:
+    batch = deepcopy(dict(record))
+    items = batch.get("items")
+    if isinstance(items, list):
+        sanitized_items = []
+        for it in items:
+            if isinstance(it, Mapping):
+                it_copy = deepcopy(dict(it))
+                fail = it_copy.get("failure")
+                if isinstance(fail, Mapping) and "message" in fail:
+                    fail_copy = deepcopy(dict(fail))
+                    fail_copy["message"] = sanitize_user_facing_message(fail_copy.get("message"), fallback="Batch item failed.")
+                    it_copy["failure"] = fail_copy
+                sanitized_items.append(it_copy)
+        batch["items"] = sanitized_items
+    attention = batch.get("attention")
+    if isinstance(attention, Mapping) and "message" in attention:
+        att_copy = deepcopy(dict(attention))
+        att_copy["message"] = sanitize_user_facing_message(att_copy.get("message"), fallback="Batch paused.")
+        batch["attention"] = att_copy
+    return batch
 
 
 class BatchStore:
@@ -394,7 +476,8 @@ class BatchStore:
         document = _read_batch_json(path)
         if not isinstance(document, Mapping):
             raise RenderBatchError("BATCH_RECORD_INVALID", "The durable batch record could not be read.")
-        return _validate_batch_record(document, project_id=canonical_project_id)
+        validated = _validate_batch_record(document, project_id=canonical_project_id)
+        return sanitize_batch_record_for_presentation(validated)
 
     def load_active(self, project_id: object) -> dict[str, object] | None:
         canonical_project_id = validate_project_id(project_id)
@@ -425,7 +508,8 @@ class BatchStore:
                 LOGGER.warning("Skipping an unreadable durable batch record: %s", path.name)
                 continue
             try:
-                records.append(_validate_batch_record(document, project_id=canonical_project_id))
+                validated = _validate_batch_record(document, project_id=canonical_project_id)
+                records.append(sanitize_batch_record_for_presentation(validated))
             except (RenderBatchError, ProjectValidationError):
                 LOGGER.warning("Skipping an unreadable durable batch record: %s", path.name)
         return sorted(records, key=lambda item: str(item.get("created_at", "")))
@@ -437,6 +521,7 @@ def new_batch_record(
     mode: str,
     items: list[dict[str, object]],
     origin_batch_id: str | None = None,
+    production_profile: Mapping[str, object] | None = None,
     now: str | None = None,
 ) -> dict[str, object]:
     timestamp = now or _timestamp()
@@ -446,6 +531,7 @@ def new_batch_record(
         "project_id": validate_project_id(project_id),
         "mode": mode,
         "state": BATCH_RUNNING,
+        "production_profile": dict(production_profile or {"upscale_method": "none"}),
         "attention": None,
         "pause_requested": False,
         "created_at": timestamp,
@@ -519,6 +605,7 @@ def public_batch_record(record: Mapping[str, object] | None) -> dict[str, object
         if not isinstance(item, Mapping):
             continue
         failure = item.get("failure")
+        msg = failure.get("message") if isinstance(failure, Mapping) else None
         items.append({
             "scene_id": item.get("scene_id"),
             "sequence": item.get("sequence"),
@@ -527,14 +614,20 @@ def public_batch_record(record: Mapping[str, object] | None) -> dict[str, object
             "reason_code": item.get("reason_code"),
             "failure": {
                 "code": failure.get("code"),
-                "message": failure.get("message"),
+                "message": sanitize_user_facing_message(msg, fallback="Batch item failed.") if msg else None,
             } if isinstance(failure, Mapping) else None,
         })
     current = batch_current_item(record)
+    attention = batch_attention(record.get("attention"))
+    if isinstance(attention, Mapping) and "message" in attention:
+        att_copy = dict(attention)
+        att_copy["message"] = sanitize_user_facing_message(att_copy.get("message"), fallback="Batch paused.")
+        attention = att_copy
     result = {
         "state": record.get("state"),
         "mode": record.get("mode"),
-        "attention": batch_attention(record.get("attention")),
+        "production_profile": record.get("production_profile") or {"upscale_method": "none"},
+        "attention": attention,
         "pause_requested": record.get("pause_requested") is True,
         "created_at": record.get("created_at"),
         "started_at": record.get("started_at"),
@@ -618,6 +711,7 @@ def plan_batch(
     preflight: Mapping[str, object],
     jobs: list[Mapping[str, object]],
     raw_output_root: Path | None = None,
+    hardware_supported: bool | None = None,
 ) -> dict[str, object]:
     """One authoritative planning pass for all requested scenes.
 
@@ -627,6 +721,21 @@ def plan_batch(
 
     canonical_project_id = validate_project_id(project_id)
     project = storage.load_project(canonical_project_id)
+    upscale_method = resolve_project_production_method(project)
+    if upscale_method != POSTPROCESS_METHOD_NONE:
+        availability = production_method_availability(upscale_method, hardware_supported=hardware_supported)
+        if availability.get("state") == "UNAVAILABLE":
+            raise RenderBatchError(
+                "PRODUCTION_METHOD_UNAVAILABLE",
+                "Selected upscaler is unavailable on this runtime.",
+                details=availability,
+            )
+        if availability.get("state") == "UNQUALIFIED":
+            raise RenderBatchError(
+                "UPSCALER_UNQUALIFIED",
+                "Upscaler requires qualification before batch production.",
+                details=availability,
+            )
     scenes = project.get("scenes") if isinstance(project.get("scenes"), list) else []
     scene_entries = [
         scene
@@ -688,6 +797,24 @@ def plan_batch(
                 jobs_by_scene.get(scene_id, []),
                 finalization_by_job_id=finalization_by_job_id,
             )
+            if upscale_method != POSTPROCESS_METHOD_NONE:
+                if action == ACTION_ALREADY_COMPLETE:
+                    summary = summarize_production_scene(
+                        storage,
+                        canonical_project_id,
+                        scene_id,
+                        method=upscale_method,
+                        preflight=preflight,
+                        raw_output_root=raw_output_root,
+                    )
+                    if summary.get("state") == PRODUCTION_CURRENT:
+                        action = ACTION_ALREADY_COMPLETE
+                        reason = None
+                    else:
+                        action = ACTION_POSTPROCESS_ONLY
+                        reason = None
+                elif action == ACTION_FINALIZE_RAW:
+                    action = ACTION_FINALIZE_AND_POSTPROCESS
         planned.append({
             "scene_id": scene_id,
             "sequence": index + 1,
@@ -703,7 +830,8 @@ def plan_batch(
             for entry in planned
             if entry["action"] in {ACTION_RENDER_PREPARED, ACTION_PREPARE_AND_RENDER}
         ),
-        "finalize_only": sum(1 for entry in planned if entry["action"] == ACTION_FINALIZE_RAW),
+        "finalize_only": sum(1 for entry in planned if entry["action"] in {ACTION_FINALIZE_RAW, ACTION_FINALIZE_AND_POSTPROCESS}),
+        "postprocess_only": sum(1 for entry in planned if entry["action"] == ACTION_POSTPROCESS_ONLY),
         "already_complete": sum(1 for entry in planned if entry["action"] == ACTION_ALREADY_COMPLETE),
         "blocked": sum(1 for entry in planned if entry["action"] == ACTION_BLOCKED),
     }
@@ -865,13 +993,25 @@ class BatchRunner:
         project = self.storage.load_project(self.project_id)
         return dict(self.preflight_builder(project, self.storage))
 
-    def _systemic_runtime_check(self, preflight: Mapping[str, object], *, needs_finalization: bool) -> tuple[str, str] | None:
+    def _systemic_runtime_check(
+        self,
+        preflight: Mapping[str, object],
+        *,
+        needs_finalization: bool,
+        upscale_method: str = "none",
+    ) -> tuple[str, str] | None:
         if preflight.get("workflow_ready") is not True:
             return ("WORKFLOW_CONTRACT_INVALID", "Batch paused: the production workflow contract is not ready.")
         if preflight.get("runtime_requirements_ready") is not True:
             return ("RUNTIME_REQUIREMENTS_CHANGED", "Batch paused: runtime requirements changed.")
         if needs_finalization and find_ffmpeg() is None:
             return ("MEDIA_TOOL_MISSING", "Batch paused: FFmpeg is not available for finalization.")
+        if upscale_method != POSTPROCESS_METHOD_NONE:
+            avail = production_method_availability(upscale_method)
+            if avail.get("state") == "UNAVAILABLE":
+                return ("PRODUCTION_METHOD_UNAVAILABLE", "Batch paused: the selected production upscaler is unavailable on this runtime.")
+            if avail.get("state") == "UNQUALIFIED":
+                return ("UPSCALER_UNQUALIFIED", "Batch paused: the selected upscaler requires qualification before batch production.")
         return None
 
     def _pause_for_attention(self, record: dict[str, object], code: str, message: str) -> dict[str, object]:
@@ -894,6 +1034,22 @@ class BatchRunner:
             if isinstance(entry, Mapping) and entry.get("scene_id") == scene_id:
                 return entry
         return None
+
+    def _reconcile_scene(self, scene_id: str) -> dict[str, list[dict[str, object]]]:
+        try:
+            reconciled = reconcile_project_jobs(
+                self.storage,
+                self.project_id,
+                client=self._comfy(),
+                output_root=self.raw_output_root,
+            )
+            jobs = [
+                j for j in reconciled.get("jobs", [])
+                if isinstance(j, Mapping) and j.get("scene_id") == scene_id
+            ]
+            return {"jobs": jobs}
+        except (RenderJobError, ProjectPersistenceError):
+            return {"jobs": []}
 
     # -- tick: one bounded orchestration step -------------------------------
 
@@ -981,6 +1137,8 @@ class BatchRunner:
             disposition = resume_item.get("disposition")
             record["current_index"] = resume_index
             record = store.save(record)
+            if disposition == ITEM_POSTPROCESSING:
+                return self._advance_postprocessing_item(record, resume_index)
             if disposition == ITEM_FINALIZING:
                 return self._finalize_item(record, resume_index, jobs=None, preflight=None)
             if disposition == ITEM_RENDERING:
@@ -1023,24 +1181,56 @@ class BatchRunner:
             preflight = self._current_preflight()
         except (ProjectPersistenceError, ProjectNotFoundError, OSError):
             return self._pause_for_attention(record, "STORAGE_UNAVAILABLE", "Batch paused: project state could not be read.")
+        method = record.get("production_profile", {}).get("upscale_method", "none")
         systemic = self._systemic_runtime_check(
             preflight,
-            needs_finalization=item.get("action") in {ACTION_FINALIZE_RAW, ACTION_RENDER_PREPARED, ACTION_PREPARE_AND_RENDER},
+            needs_finalization=item.get("action") in {ACTION_FINALIZE_RAW, ACTION_RENDER_PREPARED, ACTION_PREPARE_AND_RENDER, ACTION_FINALIZE_AND_POSTPROCESS},
+            upscale_method=method,
         )
         if systemic is not None:
             return self._pause_for_attention(record, systemic[0], systemic[1])
 
         scene_preflight = self._scene_preflight_entry(preflight, scene_id)
-        jobs = JobStore(self.storage).list_scene(self.project_id, scene_id)
+        if not isinstance(scene_preflight, Mapping):
+            item["disposition"] = ITEM_SKIPPED
+            item["reason_code"] = "SCENE_PREFLIGHT_MISSING"
+            item["updated_at"] = _timestamp()
+            items[next_index] = item
+            record["items"] = items
+            saved = store.save(record)
+            return self.tick() if saved["state"] in EXECUTING_BATCH_STATES else saved
+
+        reconciled = self._reconcile_scene(scene_id)
+        jobs = reconciled["jobs"]
+        finalization_map = self._finalization_map_for_scene(jobs, preflight)
         action, reason = plan_scene_action(
-            scene_preflight or {},
+            scene_preflight,
             jobs,
-            finalization_by_job_id=None if scene_preflight is None else self._finalization_map_for_scene(jobs, preflight),
+            finalization_by_job_id=finalization_map,
         )
+        method = record.get("production_profile", {}).get("upscale_method", "none")
+        if method != POSTPROCESS_METHOD_NONE:
+            if action == ACTION_ALREADY_COMPLETE:
+                summary = summarize_production_scene(
+                    self.storage,
+                    self.project_id,
+                    scene_id,
+                    method=method,
+                    preflight=preflight,
+                    raw_output_root=self.raw_output_root,
+                )
+                if summary.get("state") == PRODUCTION_CURRENT:
+                    action = ACTION_ALREADY_COMPLETE
+                    reason = None
+                else:
+                    action = ACTION_POSTPROCESS_ONLY
+                    reason = None
+            elif action == ACTION_FINALIZE_RAW:
+                action = ACTION_FINALIZE_AND_POSTPROCESS
 
         if action == ACTION_BLOCKED:
             item["disposition"] = ITEM_SKIPPED
-            item["reason_code"] = reason or "NOT_READY"
+            item["reason_code"] = reason or "BLOCKED"
             item["updated_at"] = _timestamp()
             items[next_index] = item
             record["items"] = items
@@ -1064,7 +1254,9 @@ class BatchRunner:
 
         record["current_index"] = next_index
         record = store.save(record)
-        if action == ACTION_FINALIZE_RAW:
+        if action == ACTION_POSTPROCESS_ONLY:
+            return self._postprocess_item(record, next_index, preflight=preflight)
+        if action in {ACTION_FINALIZE_RAW, ACTION_FINALIZE_AND_POSTPROCESS}:
             return self._finalize_item(record, next_index, jobs=jobs, preflight=preflight)
         if action == ACTION_PREPARE_AND_RENDER:
             return self._prepare_item(record, next_index, preflight=preflight)
@@ -1168,6 +1360,8 @@ class BatchRunner:
     def _advance_active_item(self, record: dict[str, object], index: int) -> dict[str, object]:
         item = dict(record["items"][index])
         disposition = item.get("disposition")
+        if disposition == ITEM_POSTPROCESSING:
+            return self._advance_postprocessing_item(record, index)
         if disposition == ITEM_FINALIZING:
             return self._finalize_item(record, index, jobs=None, preflight=None)
         if disposition == ITEM_PREPARING:
@@ -1317,15 +1511,187 @@ class BatchRunner:
             return self._fail_item(record, index, error.code, error.message, disposition=ITEM_FINALIZATION_FAILED)
         except (ProjectPersistenceError, OSError):
             return self._pause_for_attention(record, "STORAGE_UNAVAILABLE", "Batch paused: finalization state could not be persisted.")
+
+        method = record.get("production_profile", {}).get("upscale_method", "none")
+        if method == POSTPROCESS_METHOD_NONE:
+            item = dict(record["items"][index])
+            item["disposition"] = ITEM_COMPLETE
+            item["reason_code"] = None
+            item["updated_at"] = _timestamp()
+            record["items"][index] = item
+            record["current_index"] = None
+            LOGGER.info("Batch scene complete project_id=%s scene_id=%s", self.project_id, scene_id)
+            saved = store.save(record)
+            return self._continue_or_finish(saved)
+        return self._postprocess_item(record, index, preflight=preflight)
+
+    def _postprocess_item(
+        self,
+        record: dict[str, object],
+        index: int,
+        *,
+        preflight: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        store = self._store()
         item = dict(record["items"][index])
-        item["disposition"] = ITEM_COMPLETE
-        item["reason_code"] = None
+        scene_id = str(item["scene_id"])
+        method = record.get("production_profile", {}).get("upscale_method", "none")
+        if method == POSTPROCESS_METHOD_NONE:
+            item["disposition"] = ITEM_COMPLETE
+            item["reason_code"] = None
+            item["updated_at"] = _timestamp()
+            record["items"][index] = item
+            record["current_index"] = None
+            saved = store.save(record)
+            return self._continue_or_finish(saved)
+
+        avail = production_method_availability(method)
+        if avail.get("state") == "UNAVAILABLE":
+            return self._pause_for_attention(
+                record,
+                "PRODUCTION_METHOD_UNAVAILABLE",
+                "Batch paused: the selected production upscaler is unavailable on this runtime.",
+            )
+        if avail.get("state") == "UNQUALIFIED":
+            return self._pause_for_attention(
+                record,
+                "UPSCALER_UNQUALIFIED",
+                "Batch paused: the selected upscaler requires qualification before batch production.",
+            )
+
+        try:
+            selector, staged_path = materialize_final_scene_for_postprocess(
+                self.storage,
+                self.project_id,
+                scene_id,
+                raw_output_root=self.raw_output_root,
+                preflight=preflight,
+            )
+            output_prefix = f"mvb_{self.project_id}_{scene_id}_{uuid.uuid4().hex[:8]}"
+            job = submit_postprocess_job(
+                self.storage,
+                self.project_id,
+                scene_id,
+                method=method,
+                client=self._comfy(),
+                final_scene_selector=selector,
+                output_prefix=output_prefix,
+                raw_output_root=self.raw_output_root,
+                preflight=preflight,
+            )
+        except ProductionMethodUnavailable:
+            return self._pause_for_attention(
+                record,
+                "PRODUCTION_METHOD_UNAVAILABLE",
+                "Batch paused: the selected production upscaler is unavailable on this runtime.",
+            )
+        except PostprocessJobConflict:
+            return self._fail_item(
+                record,
+                index,
+                "POSTPROCESS_JOB_ACTIVE",
+                "This scene already has an active post-process job.",
+                disposition=ITEM_POSTPROCESS_FAILED,
+            )
+        except ProductionNotReady as error:
+            return self._fail_item(record, index, error.code, error.message, disposition=ITEM_POSTPROCESS_FAILED)
+        except RenderProductionError as error:
+            return self._fail_item(record, index, error.code, error.message, disposition=ITEM_POSTPROCESS_FAILED)
+        except Exception as error:
+            return self._fail_item(
+                record,
+                index,
+                "POSTPROCESS_SUBMISSION_FAILED",
+                str(error),
+                disposition=ITEM_POSTPROCESS_FAILED,
+            )
+
+        item = dict(record["items"][index])
+        item["disposition"] = ITEM_POSTPROCESSING
+        item["postprocess_job_id"] = str(job.get("postprocess_job_id"))
         item["updated_at"] = _timestamp()
         record["items"][index] = item
-        record["current_index"] = None
-        LOGGER.info("Batch scene complete project_id=%s scene_id=%s", self.project_id, scene_id)
-        saved = store.save(record)
-        return self._continue_or_finish(saved)
+        record["current_index"] = index
+        LOGGER.info(
+            "Batch postprocessing scene project_id=%s scene_id=%s method=%s postprocess_job_id=%s",
+            self.project_id,
+            scene_id,
+            method,
+            job.get("postprocess_job_id"),
+        )
+        return store.save(record)
+
+    def _advance_postprocessing_item(self, record: dict[str, object], index: int) -> dict[str, object]:
+        item = dict(record["items"][index])
+        scene_id = str(item["scene_id"])
+        job_id = item.get("postprocess_job_id")
+        try:
+            refreshed = reconcile_postprocess_job(
+                self.storage,
+                self.project_id,
+                scene_id,
+                job_id,
+                client=self._comfy(),
+                output_root=self.raw_output_root,
+            )
+        except Exception:
+            self._reconcile_failures += 1
+            if self._reconcile_failures >= RECONCILIATION_FAILURE_PAUSE_THRESHOLD:
+                return self._pause_for_attention(record, "COMFYUI_UNAVAILABLE", "Batch paused: ComfyUI is unavailable.")
+            record = self._store().load_active(self.project_id) or record
+            record["current_index"] = index
+            return record
+
+        state = refreshed.get("state")
+        if state in POSTPROCESS_ACTIVE_STATES:
+            record = self._store().load_active(self.project_id) or record
+            record["current_index"] = index
+            return record
+
+        self._reconcile_failures = 0
+        if state == POSTPROCESS_SUCCEEDED:
+            try:
+                promoted = finalize_postprocess_job(
+                    self.storage,
+                    self.project_id,
+                    scene_id,
+                    job_id,
+                    media_adapter=self.media_adapter,
+                    preflight=self._current_preflight(),
+                    raw_output_root=self.raw_output_root,
+                )
+            except RenderProductionError as error:
+                return self._fail_item(record, index, error.code, error.message, disposition=ITEM_POSTPROCESS_FAILED)
+            except Exception as error:
+                return self._fail_item(
+                    record,
+                    index,
+                    "POSTPROCESS_FINALIZATION_FAILED",
+                    str(error),
+                    disposition=ITEM_POSTPROCESS_FAILED,
+                )
+
+            item = dict(record["items"][index])
+            item["disposition"] = ITEM_COMPLETE
+            item["reason_code"] = None
+            item["updated_at"] = _timestamp()
+            record["items"][index] = item
+            record["current_index"] = None
+            LOGGER.info("Batch scene production complete project_id=%s scene_id=%s", self.project_id, scene_id)
+            saved = self._store().save(record)
+            return self._continue_or_finish(saved)
+
+        if state == POSTPROCESS_CANCELLED:
+            return self._cancel_item(record, index, refreshed)
+
+        failure = refreshed.get("failure") if isinstance(refreshed.get("failure"), Mapping) else {}
+        return self._fail_item(
+            record,
+            index,
+            failure.get("code") or "POSTPROCESS_FAILED",
+            failure.get("message") or "Post-processing failed.",
+            disposition=ITEM_POSTPROCESS_FAILED,
+        )
 
     def _cancel_item(self, record: dict[str, object], index: int, job: Mapping[str, object]) -> dict[str, object]:
         item = dict(record["items"][index])
@@ -1460,6 +1826,26 @@ def ensure_batch_recovery(storage: ProjectStorage, project_id: object, **seams: 
                 recovered_job.get("job_id"),
             )
             return record
+        if current is not None and isinstance(current.get("postprocess_job_id"), str):
+            try:
+                pjob = PostprocessJobStore(storage).load(canonical_project_id, current["scene_id"], current["postprocess_job_id"])
+                if pjob.get("state") in POSTPROCESS_ACTIVE_STATES:
+                    record["recovered"] = {
+                        "postprocess_job_id": pjob.get("postprocess_job_id"),
+                        "scene_id": current.get("scene_id"),
+                        "at": _timestamp(),
+                    }
+                    record = store.save(record)
+                    runner._post_recovery_hold = True
+                    runner.start_thread()
+                    LOGGER.info(
+                        "Batch recovered active postprocess job after restart project_id=%s job_id=%s",
+                        canonical_project_id,
+                        pjob.get("postprocess_job_id"),
+                    )
+                    return record
+            except Exception:
+                pass
         items = record.get("items")
         if isinstance(items, list):
             for index, item in enumerate(items):
@@ -1491,6 +1877,33 @@ def ensure_batch_recovery(storage: ProjectStorage, project_id: object, **seams: 
                         updated["failure"] = {
                             "code": failure.get("code") or "COMFYUI_EXECUTION_FAILED",
                             "message": failure.get("message") or "The batch render failed.",
+                            "at": _timestamp(),
+                        }
+                    updated["updated_at"] = _timestamp()
+                    items[index] = updated
+                elif disposition == ITEM_POSTPROCESSING:
+                    updated = dict(item)
+                    job_id = updated.get("postprocess_job_id")
+                    pjob = None
+                    if isinstance(job_id, str) and job_id:
+                        try:
+                            pjob = PostprocessJobStore(storage).load(canonical_project_id, updated["scene_id"], job_id)
+                        except Exception:
+                            pjob = None
+                    if pjob is None:
+                        updated["disposition"] = ITEM_PENDING
+                        updated["reason_code"] = "BATCH_RESTARTED"
+                    elif pjob.get("state") == POSTPROCESS_SUCCEEDED:
+                        updated["disposition"] = ITEM_POSTPROCESSING
+                    elif pjob.get("state") == POSTPROCESS_CANCELLED:
+                        updated["disposition"] = ITEM_CANCELLED
+                        updated["reason_code"] = "USER_CANCELLED"
+                    else:
+                        failure = pjob.get("failure") if isinstance(pjob.get("failure"), Mapping) else {}
+                        updated["disposition"] = ITEM_POSTPROCESS_FAILED
+                        updated["failure"] = {
+                            "code": failure.get("code") or "POSTPROCESS_FAILED",
+                            "message": failure.get("message") or "Post-processing failed before restart.",
                             "at": _timestamp(),
                         }
                     updated["updated_at"] = _timestamp()
@@ -1531,6 +1944,7 @@ def preview_batch(
     client: object | None = None,
     preflight_builder: Callable[..., Mapping[str, object]] = build_render_preflight,
     raw_output_root: Path | None = None,
+    hardware_supported: bool | None = None,
 ) -> dict[str, object]:
     canonical_project_id = validate_project_id(project_id)
     ensure_batch_recovery(storage, canonical_project_id, client=client, preflight_builder=preflight_builder, raw_output_root=raw_output_root)
@@ -1544,6 +1958,7 @@ def preview_batch(
         preflight=preflight,
         jobs=reconciled["jobs"],
         raw_output_root=raw_output_root,
+        hardware_supported=hardware_supported,
     )
     store = BatchStore(storage)
     active_batch = store.load_active(canonical_project_id)
@@ -1561,6 +1976,7 @@ def start_batch(
     package_loader: Callable | None = None,
     compatibility_validator: Callable | None = None,
     hardware_gate: object | None = None,
+    hardware_supported: bool | None = None,
     media_adapter: object | None = None,
     raw_output_root: Path | None = None,
     finalizer: Callable[..., Mapping[str, object]] = finalize_render_job,
@@ -1614,6 +2030,7 @@ def start_batch(
             preflight=preflight,
             jobs=reconciled["jobs"],
             raw_output_root=raw_output_root,
+            hardware_supported=hardware_supported,
         )
         eligible_entries = [entry for entry in plan["scenes"] if entry["action"] in ELIGIBLE_BATCH_ACTIONS]
         if not eligible_entries:
@@ -1635,11 +2052,14 @@ def start_batch(
             }
             for entry in eligible_entries
         ]
+        upscale_method = resolve_project_production_method(project)
+        production_profile = {"upscale_method": upscale_method}
         record = new_batch_record(
             canonical_project_id,
             mode="selected" if scene_ids is not None else "all_ready",
             items=items,
             origin_batch_id=origin_batch_id,
+            production_profile=production_profile,
         )
         record = store.save(record)
         LOGGER.info(
@@ -1765,6 +2185,21 @@ def resume_batch(
             raise RenderBatchConflict("WORKFLOW_CONTRACT_INVALID", "Batch cannot resume: the production workflow contract is not ready.")
         if preflight.get("runtime_requirements_ready") is not True:
             raise RenderBatchConflict("RUNTIME_REQUIREMENTS_CHANGED", "Batch cannot resume: runtime requirements changed.")
+        upscale_method = record.get("production_profile", {}).get("upscale_method", "none")
+        if upscale_method != POSTPROCESS_METHOD_NONE:
+            avail = production_method_availability(upscale_method)
+            if avail.get("state") == "UNAVAILABLE":
+                raise RenderBatchConflict(
+                    "PRODUCTION_METHOD_UNAVAILABLE",
+                    "Batch cannot resume: the selected production upscaler is unavailable on this runtime.",
+                    details=avail,
+                )
+            if avail.get("state") == "UNQUALIFIED":
+                raise RenderBatchConflict(
+                    "UPSCALER_UNQUALIFIED",
+                    "Batch cannot resume: the selected upscaler requires qualification before batch production.",
+                    details=avail,
+                )
         has_work = any(
             isinstance(item, Mapping)
             and (item.get("disposition") == ITEM_PENDING or item.get("disposition") in ACTIVE_ITEM_DISPOSITIONS)
@@ -1900,11 +2335,18 @@ def retry_failed_batch(
         )
 
 
-def manual_action_blocker(storage: ProjectStorage, project_id: object) -> str | None:
-    """Truthful gate for manual per-scene production actions during a batch."""
+def manual_action_blocker(storage: ProjectStorage, project_id: object, *, check_upscaler: bool = False) -> str | None:
+    """Truthful gate for manual per-scene production actions during a batch or unavailable upscaler."""
 
     canonical_project_id = validate_project_id(project_id)
     record = BatchStore(storage).load_active(canonical_project_id)
     if record is not None and record["state"] in EXECUTING_BATCH_STATES:
         return "A batch render is active. Pause or end the batch before rendering scenes manually."
+    if check_upscaler:
+        project = storage.load_project(canonical_project_id)
+        method = resolve_project_production_method(project)
+        if method != POSTPROCESS_METHOD_NONE:
+            avail = production_method_availability(method)
+            if avail.get("state") == "UNAVAILABLE":
+                return "The selected production upscaler is unavailable on this runtime."
     return None

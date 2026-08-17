@@ -2847,6 +2847,26 @@ function renderJobFinalizePath(projectId, jobId) {
     return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/jobs/${encodeURIComponent(jobId)}/finalize`;
 }
 
+function productionStatusPath(projectId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/production/status`;
+}
+
+function productionSetMethodPath(projectId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/production/upscale-method`;
+}
+
+function scenePostprocessStartPath(projectId, sceneId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/render/postprocess/start`;
+}
+
+function scenePostprocessCancelPath(projectId, sceneId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/render/postprocess/cancel`;
+}
+
+function scenePostprocessRetryPath(projectId, sceneId) {
+    return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/render/postprocess/retry`;
+}
+
 function renderBatchPath(projectId) {
     return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/batch`;
 }
@@ -2875,7 +2895,7 @@ function renderBatchRetryFailedPath(projectId) {
     return `${PROJECTS_PATH}/${encodeURIComponent(projectId)}/render/batch/retry-failed`;
 }
 
-const BATCH_ELIGIBLE_ACTIONS = ["FINALIZE_RAW", "RENDER_PREPARED", "PREPARE_AND_RENDER"];
+const BATCH_ELIGIBLE_ACTIONS = ["POSTPROCESS_ONLY", "FINALIZE_AND_POSTPROCESS", "FINALIZE_RAW", "RENDER_PREPARED", "PREPARE_AND_RENDER"];
 
 function batchIsExecuting(batch) {
     return Boolean(batch) && ["RUNNING", "PAUSE_REQUESTED"].includes(batch.state);
@@ -2930,6 +2950,41 @@ function renderFinalizationEligible(job) {
         && ["RAW_READY", "STALE", "FAILED"].includes(state);
 }
 
+function renderProductionSceneLabel(scene, job, state) {
+    const upscaleMethod = state.currentProject?.production?.upscale_method || "none";
+    const finalizationState = renderFinalizationState(job);
+    const jobCurrent = Boolean(job)
+        && scene.preparation_status === "current"
+        && job.preparation_fingerprint === scene.preparation_fingerprint;
+    const finalReady = job?.state === "SUCCEEDED" && finalizationState === "FINALIZED" && jobCurrent;
+
+    if (upscaleMethod === "none") {
+        return finalReady ? "READY" : "NOT READY";
+    }
+
+    const prodCap = state.renderProductionStatus?.capabilities?.[upscaleMethod];
+    const prodSummary = state.renderProductionStatus?.scenes?.find((s) => s.scene_id === scene.scene_id);
+    const pjob = state.postprocessJobs?.[scene.scene_id] || prodSummary?.active_job || prodSummary?.last_job;
+    if (pjob) {
+        if (["SUBMITTING", "SUBMITTED", "ACTIVE"].includes(pjob.state)) {
+            return "UPSCALE ACTIVE";
+        }
+        if (pjob.state === "SUCCEEDED" && prodSummary?.status === "ready") {
+            return "READY";
+        }
+        if (pjob.state === "FAILED") {
+            return "FAILED";
+        }
+    }
+    if (prodSummary?.status === "ready") {
+        return "READY";
+    }
+    if (prodCap?.state === "UNAVAILABLE") {
+        return "UNAVAILABLE";
+    }
+    return finalReady ? "NEEDS UPSCALE" : "NOT READY";
+}
+
 function clearRenderJobPoll() {
     if (!builderState || builderState.renderJobsPollTimer === null) {
         return;
@@ -2955,7 +3010,20 @@ function scheduleRenderJobPoll(root) {
 }
 
 function renderDiagnosticText(entry) {
-    return entry && typeof entry.message === "string" ? entry.message : "Render inputs require attention.";
+    const raw = entry && typeof entry.message === "string" ? entry.message.trim() : "";
+    if (!raw || (raw.startsWith("{") && raw.endsWith("}")) || raw.startsWith("[") || raw.includes("Traceback")) {
+        return "Render inputs require attention.";
+    }
+    if (raw.includes("status_str")
+        || raw.includes("node_type")
+        || raw.includes("executed")
+        || /['"]?\w*id['"]?\s*:\s*['"]?[a-f0-9-]{8,}['"]?/i.test(raw)
+        || /['"]node[_\s]?id['"]\s*:/i.test(raw)
+        || /['"]nodes['"]\s*:\s*\[/i.test(raw)
+        || /['"]timestamp['"]\s*:/i.test(raw)) {
+        return "Render inputs require attention.";
+    }
+    return raw;
 }
 
 function renderJobShellKey(scene, prompt, job, state) {
@@ -3146,6 +3214,8 @@ function renderRenderState(root) {
     const rescan = root.querySelector("[data-mvb-render-rescan]");
     const batchAllButton = root.querySelector("[data-mvb-batch-all]");
     const batchSelectButton = root.querySelector("[data-mvb-batch-select]");
+    const upscaleSelect = root.querySelector("[data-mvb-render-upscale-select]");
+    const upscaleNote = root.querySelector("[data-mvb-render-upscale-note]");
     if (!section || !status || !list || !empty || !refresh || !rescan) {
         return;
     }
@@ -3154,6 +3224,33 @@ function renderRenderState(root) {
     const preflight = state.renderPreflight;
     const batchExecuting = batchIsExecuting(state.renderBatch);
     const selectionActive = Boolean(state.renderBatchSelection);
+    const upscaleMethod = state.currentProject?.production?.upscale_method || "none";
+    if (upscaleSelect) {
+        upscaleSelect.value = upscaleMethod;
+        upscaleSelect.disabled = !state.currentProject
+            || state.renderState === "loading"
+            || Boolean(state.operation)
+            || state.transitioning
+            || state.closing
+            || batchExecuting
+            || state.renderBatchBusy;
+    }
+    const prodCap = state.renderProductionStatus?.capabilities?.[upscaleMethod];
+    if (upscaleNote) {
+        if (upscaleMethod === "none") {
+            upscaleNote.textContent = "";
+            upscaleNote.removeAttribute("data-state");
+        } else if (prodCap?.state === "UNAVAILABLE") {
+            upscaleNote.textContent = upscaleMethod === "rtx_vsr_fast" ? "RTX VSR unavailable on this runtime" : "SeedVR2 unavailable on this runtime";
+            upscaleNote.dataset.state = "error";
+        } else if (prodCap?.state === "UNQUALIFIED") {
+            upscaleNote.textContent = "Qualification pending";
+            upscaleNote.dataset.state = "warning";
+        } else {
+            upscaleNote.textContent = "";
+            upscaleNote.removeAttribute("data-state");
+        }
+    }
     refresh.disabled = !state.currentProject || state.renderState === "loading" || Boolean(state.operation) || state.transitioning || state.closing;
     rescan.disabled = !state.currentProject || state.renderState === "loading" || Boolean(state.operation) || state.transitioning || state.closing;
     if (batchAllButton) {
@@ -3165,6 +3262,7 @@ function renderRenderState(root) {
             || batchExecuting
             || selectionActive
             || state.renderBatchBusy;
+        batchAllButton.removeAttribute("title");
     }
     if (batchSelectButton) {
         batchSelectButton.disabled = !state.currentProject
@@ -3175,6 +3273,7 @@ function renderRenderState(root) {
             || batchExecuting
             || selectionActive
             || state.renderBatchBusy;
+        batchSelectButton.removeAttribute("title");
     }
     if (!state.currentProject) {
         status.textContent = "Open a project to inspect render readiness.";
@@ -3297,6 +3396,7 @@ function renderRenderState(root) {
             ["Render job", job ? `${renderJobLabel(job.state)}${job.state === "SUCCEEDED" && !jobCurrent ? " · HISTORICAL" : ""}` : "NOT QUEUED"],
             ["Raw H3", job?.output?.raw_h3_output && job.state === "SUCCEEDED" ? (jobCurrent ? "CURRENT" : "HISTORICAL") : "NOT AVAILABLE"],
             ["Final scene", renderFinalizationLabel(renderFinalizationState(job))],
+            ["Production scene", renderProductionSceneLabel(scene, job, state)],
         ]) {
             const fact = document.createElement("div");
             fact.className = "mvb-render-fact";
@@ -3311,7 +3411,16 @@ function renderRenderState(root) {
         const detail = document.createElement("p");
         detail.className = "mvb-render-detail";
         const finalizationState = renderFinalizationState(job);
-        if (job?.state === "SUCCEEDED" && finalizationState === "FINALIZED") {
+        const prodSummary = state.renderProductionStatus?.scenes?.find((s) => s.scene_id === scene.scene_id);
+        const pjob = state.postprocessJobs?.[scene.scene_id] || prodSummary?.active_job || prodSummary?.last_job;
+        if (pjob && ["SUBMITTING", "SUBMITTED", "ACTIVE"].includes(pjob.state)) {
+            const pStage = pjob.progress?.stage || pjob.telemetry?.stage || pjob.telemetry?.current_stage || "Upscaling video…";
+            detail.textContent = pStage;
+            detail.hidden = false;
+        } else if (pjob?.state === "FAILED" && upscaleMethod !== "none") {
+            detail.textContent = pjob.failure?.message || "Production upscale failed; retry is available.";
+            detail.hidden = false;
+        } else if (job?.state === "SUCCEEDED" && finalizationState === "FINALIZED") {
             detail.textContent = "Final scene ready.";
         } else if (job?.state === "SUCCEEDED" && finalizationState === "FINALIZING") {
             detail.textContent = "Finalizing the raw H3 output with authoritative scene audio…";
@@ -3365,6 +3474,7 @@ function renderRenderState(root) {
         prepareButton.textContent = scene.preparation_status === "stale" ? "Re-prepare Render Inputs" : "Prepare Render Inputs";
         prepareButton.disabled = !ready || Boolean(job && renderJobIsActive(job)) || state.renderPreparingSceneId === scene.scene_id || Boolean(state.operation) || state.transitioning || state.closing || batchExecuting;
         actions.append(prepareButton);
+        const upscaleUnavailable = upscaleMethod !== "none" && prodCap?.state === "UNAVAILABLE";
         const renderButton = document.createElement("button");
         renderButton.className = "mvb-button mvb-button-primary mvb-button-small";
         renderButton.type = "button";
@@ -3417,6 +3527,37 @@ function renderRenderState(root) {
                 || state.closing
                 || batchExecuting;
             actions.append(finalizeButton);
+        }
+        if (upscaleMethod !== "none" && finalizationState === "FINALIZED" && jobCurrent) {
+            const pjobActive = Boolean(pjob && ["SUBMITTING", "SUBMITTED", "ACTIVE"].includes(pjob.state));
+            const pjobFailed = Boolean(pjob && pjob.state === "FAILED");
+            if (pjobActive) {
+                const cancelUpscaleButton = document.createElement("button");
+                cancelUpscaleButton.className = "mvb-button mvb-button-secondary mvb-button-small";
+                cancelUpscaleButton.type = "button";
+                cancelUpscaleButton.dataset.mvbRenderPostprocessCancel = scene.scene_id;
+                cancelUpscaleButton.textContent = "Cancel Upscale";
+                cancelUpscaleButton.disabled = Boolean(state.operation) || state.transitioning || state.closing;
+                actions.append(cancelUpscaleButton);
+            } else if (pjobFailed) {
+                const retryUpscaleButton = document.createElement("button");
+                retryUpscaleButton.className = "mvb-button mvb-button-secondary mvb-button-small";
+                retryUpscaleButton.type = "button";
+                retryUpscaleButton.dataset.mvbRenderPostprocessRetry = scene.scene_id;
+                retryUpscaleButton.textContent = "Retry Upscale";
+                retryUpscaleButton.disabled = Boolean(state.operation) || state.transitioning || state.closing || batchExecuting || upscaleUnavailable;
+                actions.append(retryUpscaleButton);
+            } else if (!pjob || pjob.state !== "SUCCEEDED" || prodSummary?.status !== "ready") {
+                if (prodCap?.state !== "UNAVAILABLE") {
+                    const upscaleButton = document.createElement("button");
+                    upscaleButton.className = "mvb-button mvb-button-secondary mvb-button-small";
+                    upscaleButton.type = "button";
+                    upscaleButton.dataset.mvbRenderPostprocessStart = scene.scene_id;
+                    upscaleButton.textContent = "Upscale Scene";
+                    upscaleButton.disabled = Boolean(job && renderJobIsActive(job)) || Boolean(state.operation) || state.transitioning || state.closing || batchExecuting;
+                    actions.append(upscaleButton);
+                }
+            }
         }
         const blockersList = document.createElement("ul");
         blockersList.className = "mvb-render-blockers";
@@ -3499,6 +3640,14 @@ async function loadRenderJobs(root, silent = false) {
         builderState.renderJobsMessage = Array.isArray(payload.warnings) && payload.warnings.length
             ? payload.warnings[0].message || "ComfyUI status is temporarily unavailable."
             : "";
+        try {
+            const prodPayload = await fetchJson(productionStatusPath(projectId), { method: "GET", cache: "no-store" });
+            if (prodPayload && prodPayload.project_id === projectId) {
+                builderState.renderProductionStatus = prodPayload;
+            }
+        } catch (error) {
+            // production status is non-blocking
+        }
         // The backend owns one shared WebSocket telemetry session. Keep the
         // durable HTTP reconciliation cadence bounded while live volatile
         // observations are overlaid without rebuilding the card shell.
@@ -3638,6 +3787,88 @@ async function finalizeRenderScene(root, jobId) {
     }
 }
 
+async function setUpscaleMethod(root, method) {
+    if (!isActive(root) || !builderState.currentProject) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    try {
+        const result = await fetchJson(productionSetMethodPath(projectId), {
+            method: "PUT",
+            body: JSON.stringify({ upscale_method: method }),
+        });
+        if (result?.production) {
+            builderState.currentProject.production = result.production;
+        }
+        builderState.renderMessage = "";
+        builderState.renderMessageState = "ready";
+        await loadRenderJobs(root, true);
+        await loadRenderPreflight(root, true);
+    } catch (error) {
+        console.error("[Music Video Builder] Setting upscale method failed.", error);
+        builderState.renderMessage = error instanceof Error ? error.message : "Could not update upscale method.";
+        builderState.renderMessageState = "error";
+        renderRenderState(root);
+    }
+}
+
+async function startScenePostprocess(root, sceneId) {
+    if (!isActive(root) || !builderState.currentProject) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    try {
+        await fetchJson(scenePostprocessStartPath(projectId, sceneId), {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        await loadRenderJobs(root, true);
+    } catch (error) {
+        console.error("[Music Video Builder] Postprocess start failed.", error);
+        builderState.renderMessage = error instanceof Error ? error.message : "Could not start post-processing.";
+        builderState.renderMessageState = "error";
+        renderRenderState(root);
+    }
+}
+
+async function cancelScenePostprocess(root, sceneId) {
+    if (!isActive(root) || !builderState.currentProject) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    try {
+        await fetchJson(scenePostprocessCancelPath(projectId, sceneId), {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        await loadRenderJobs(root, true);
+    } catch (error) {
+        console.error("[Music Video Builder] Postprocess cancel failed.", error);
+        builderState.renderMessage = error instanceof Error ? error.message : "Could not cancel post-processing.";
+        builderState.renderMessageState = "error";
+        renderRenderState(root);
+    }
+}
+
+async function retryScenePostprocess(root, sceneId) {
+    if (!isActive(root) || !builderState.currentProject) {
+        return;
+    }
+    const projectId = builderState.currentProject.project_id;
+    try {
+        await fetchJson(scenePostprocessRetryPath(projectId, sceneId), {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        await loadRenderJobs(root, true);
+    } catch (error) {
+        console.error("[Music Video Builder] Postprocess retry failed.", error);
+        builderState.renderMessage = error instanceof Error ? error.message : "Could not retry post-processing.";
+        builderState.renderMessageState = "error";
+        renderRenderState(root);
+    }
+}
+
 function renderBatchStageLabel(root, batch) {
     const current = batch?.current;
     if (!current || typeof current.scene_id !== "string") {
@@ -3653,6 +3884,9 @@ function renderBatchStageLabel(root, batch) {
     }
     if (current.disposition === "FINALIZING") {
         return sceneLabel ? `${sceneLabel} · Finalizing scene` : "Finalizing scene";
+    }
+    if (current.disposition === "POSTPROCESSING") {
+        return sceneLabel ? `${sceneLabel} · Upscaling production scene` : "Upscaling production scene";
     }
     if (sceneLabel && stage) {
         return `${sceneLabel} · ${stage}`;
@@ -3920,9 +4154,12 @@ async function enterBatchSelectionMode(root) {
         );
         builderState.renderBatchSelection = { selected: new Set(), actions };
     } catch (error) {
-        if (isActive(root)) {
-            builderState.renderMessage = error instanceof Error ? error.message : "Batch selection could not be prepared.";
-            builderState.renderMessageState = "error";
+        if (isActive(root) && builderState.currentProject?.project_id === projectId) {
+            const preflightScenes = Array.isArray(builderState.renderPreflight?.scenes) ? builderState.renderPreflight.scenes : [];
+            const actions = new Map(
+                preflightScenes.map((s) => [s.scene_id, s.preparation_ready ? "PREPARE_AND_RENDER" : "NOT_READY"]),
+            );
+            builderState.renderBatchSelection = { selected: new Set(), actions };
         }
     } finally {
         if (isActive(root)) {
@@ -3947,6 +4184,15 @@ async function openBatchConfirmation(root, selection) {
         return;
     }
     if (batchIsExecuting(builderState.renderBatch)) {
+        return;
+    }
+    const upscaleMethod = builderState.currentProject?.production?.upscale_method || "none";
+    const prodCap = builderState.renderProductionStatus?.capabilities?.[upscaleMethod];
+    if (upscaleMethod !== "none" && prodCap?.state === "UNAVAILABLE") {
+        const methodLabel = upscaleMethod === "rtx_vsr_fast" ? "RTX VSR" : (prodCap?.label || "SeedVR2");
+        builderState.renderMessage = `${methodLabel} is unavailable on this runtime. Select another upscale method or use a compatible production machine.`;
+        builderState.renderMessageState = "error";
+        renderRenderState(root);
         return;
     }
     const projectId = builderState.currentProject.project_id;
@@ -6307,6 +6553,15 @@ function openBuilder() {
                 <section class="mvb-render" data-mvb-render aria-labelledby="mvb-render-heading" hidden>
                     <header class="mvb-render-heading">
                         <h2 class="mvb-render-page-title" id="mvb-render-heading">Renders</h2>
+                        <div class="mvb-render-upscale-control">
+                            <label class="mvb-render-upscale-label" for="mvb-render-upscale-select">Upscale</label>
+                            <select class="mvb-select mvb-render-upscale-select" id="mvb-render-upscale-select" data-mvb-render-upscale-select>
+                                <option value="none">None</option>
+                                <option value="rtx_vsr_fast">RTX VSR — Fast</option>
+                                <option value="seedvr2_quality">SeedVR2 — Quality</option>
+                            </select>
+                            <span class="mvb-render-upscale-note" data-mvb-render-upscale-note></span>
+                        </div>
                         <span class="mvb-render-status" data-mvb-render-status aria-live="polite"></span>
                         <button class="mvb-button mvb-button-primary mvb-button-small" data-mvb-batch-all type="button">Render All Ready</button>
                         <button class="mvb-button mvb-button-secondary mvb-button-small" data-mvb-batch-select type="button">Select Scenes</button>
@@ -6893,6 +7148,11 @@ function openBuilder() {
             }
         });
         renderSection.addEventListener("change", (event) => {
+            const upscaleSelect = event.target.closest("[data-mvb-render-upscale-select]");
+            if (upscaleSelect) {
+                void setUpscaleMethod(root, upscaleSelect.value);
+                return;
+            }
             const checkbox = event.target.closest("[data-mvb-render-select-scene]");
             if (!checkbox || !builderState.renderBatchSelection) {
                 return;
@@ -6930,6 +7190,21 @@ function openBuilder() {
         const finalizeButton = event.target.closest("[data-mvb-render-finalize]");
         if (finalizeButton) {
             void finalizeRenderScene(root, finalizeButton.dataset.mvbRenderFinalize);
+            return;
+        }
+        const postprocessStartButton = event.target.closest("[data-mvb-render-postprocess-start]");
+        if (postprocessStartButton) {
+            void startScenePostprocess(root, postprocessStartButton.dataset.mvbRenderPostprocessStart);
+            return;
+        }
+        const postprocessCancelButton = event.target.closest("[data-mvb-render-postprocess-cancel]");
+        if (postprocessCancelButton) {
+            void cancelScenePostprocess(root, postprocessCancelButton.dataset.mvbRenderPostprocessCancel);
+            return;
+        }
+        const postprocessRetryButton = event.target.closest("[data-mvb-render-postprocess-retry]");
+        if (postprocessRetryButton) {
+            void retryScenePostprocess(root, postprocessRetryButton.dataset.mvbRenderPostprocessRetry);
         }
     });
     cancelClearStoryboardButton.addEventListener("click", () => closeStoryboardClearDialog(root));

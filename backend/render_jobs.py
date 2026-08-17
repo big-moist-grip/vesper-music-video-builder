@@ -1180,7 +1180,8 @@ class JobStore:
                 record = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError) as error:
                 raise RenderJobError("JOB_RECORD_INVALID", "The durable render job record could not be read.") from error
-            return _validate_job_record(record, project_id=canonical_project_id)
+            validated = _validate_job_record(record, project_id=canonical_project_id)
+            return sanitize_job_record_for_presentation(validated)
         raise RenderJobNotFound("JOB_NOT_FOUND", "Render job was not found.")
 
     def list_scene(self, project_id: object, scene_id: object) -> list[dict[str, object]]:
@@ -1193,7 +1194,8 @@ class JobStore:
                 continue
             try:
                 document = json.loads(path.read_text(encoding="utf-8"))
-                records.append(_validate_job_record(document, project_id=canonical_project_id, scene_id=canonical_scene_id))
+                validated = _validate_job_record(document, project_id=canonical_project_id, scene_id=canonical_scene_id)
+                records.append(sanitize_job_record_for_presentation(validated))
             except (OSError, UnicodeError, json.JSONDecodeError) as error:
                 raise RenderJobError("JOB_RECORD_INVALID", "A durable render job record could not be read.") from error
         return sorted(records, key=lambda item: (str(item.get("created_at", "")), str(item["job_id"])))
@@ -1611,6 +1613,123 @@ def _prompt_ids_in_queue(queue: Mapping[str, object], key: str) -> set[str]:
     return result
 
 
+UNSAFE_DIAGNOSTIC_SUBSTRINGS = (
+    "prompt_id",
+    "node_id",
+    "node_type",
+    "status_str",
+    "executed",
+    "Traceback (most recent call last):",
+    "exception_type",
+    "exception_message",
+)
+
+
+def sanitize_user_facing_message(
+    value: object,
+    fallback: str = "The render job failed.",
+) -> str:
+    """Centralized user-facing error and diagnostic sanitizer.
+
+    Guarantees that no raw Python dict reprs, JSON payloads, internal prompt IDs,
+    node IDs, telemetry arrays, timestamps, or execution tracebacks ever enter
+    product UI presentation text.
+    """
+    if value is None:
+        return fallback
+
+    if isinstance(value, Exception):
+        return sanitize_user_facing_message(str(value), fallback=fallback)
+
+    if isinstance(value, Mapping):
+        exc = value.get("exception_message") or value.get("message") or value.get("error") or value.get("reason")
+        if exc is not None and exc != value:
+            return sanitize_user_facing_message(exc, fallback=fallback)
+        return fallback
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            if isinstance(item, (list, tuple)) and len(item) > 1 and item[0] == "execution_error":
+                return sanitize_user_facing_message(item[1], fallback=fallback)
+        for item in value:
+            if isinstance(item, Mapping) and ("exception_message" in item or "message" in item):
+                return sanitize_user_facing_message(item, fallback=fallback)
+        return fallback
+
+    if not isinstance(value, str):
+        return fallback
+
+    text = value.strip()
+    if not text:
+        return fallback
+
+    # Check for raw Python dict repr or JSON object/array
+    if (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, Mapping):
+                return sanitize_user_facing_message(parsed, fallback=fallback)
+        except Exception:
+            pass
+        return fallback
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) > 1:
+        for line in reversed(lines):
+            if any(token in line for token in UNSAFE_DIAGNOSTIC_SUBSTRINGS):
+                continue
+            if line.startswith(("{", "[", "'", '"', "(")):
+                continue
+            if ":" in line:
+                exc_type, _, exc_msg = line.partition(":")
+                if (exc_type.endswith("Error") or exc_type.endswith("Exception")) and exc_msg.strip():
+                    return line
+        last = lines[-1]
+        if not any(token in last for token in UNSAFE_DIAGNOSTIC_SUBSTRINGS) and not last.startswith(("{", "[")):
+            return last
+        return fallback
+
+    has_unsafe = any(token in text for token in UNSAFE_DIAGNOSTIC_SUBSTRINGS)
+    if has_unsafe or "{'" in text or '{"' in text or "['" in text or '["' in text:
+        if ":" in text:
+            exc_type, _, exc_msg = text.partition(":")
+            if (exc_type.endswith("Error") or exc_type.endswith("Exception")) and exc_msg.strip():
+                return text
+        return fallback
+
+    return text
+
+
+def sanitize_job_record_for_presentation(record: Mapping[str, object]) -> dict[str, object]:
+    """Non-destructively sanitize a job record's user-facing messages for UI presentation."""
+    if not isinstance(record, Mapping):
+        return {}
+    job = deepcopy(dict(record))
+    failure = job.get("failure")
+    if isinstance(failure, Mapping):
+        f_copy = deepcopy(dict(failure))
+        if "message" in f_copy:
+            f_copy["message"] = sanitize_user_facing_message(f_copy.get("message"), fallback="The render job failed.")
+        job["failure"] = f_copy
+    output_disc = job.get("output_discovery")
+    if isinstance(output_disc, Mapping) and isinstance(output_disc.get("failure"), Mapping):
+        disc_copy = deepcopy(dict(output_disc))
+        disc_fail = deepcopy(dict(disc_copy["failure"]))
+        if "message" in disc_fail:
+            disc_fail["message"] = sanitize_user_facing_message(disc_fail.get("message"), fallback="Output discovery failed.")
+        disc_copy["failure"] = disc_fail
+        job["output_discovery"] = disc_copy
+    finalization = job.get("finalization")
+    if isinstance(finalization, Mapping) and isinstance(finalization.get("failure"), Mapping):
+        fin_copy = deepcopy(dict(finalization))
+        fin_fail = deepcopy(dict(fin_copy["failure"]))
+        if "message" in fin_fail:
+            fin_fail["message"] = sanitize_user_facing_message(fin_fail.get("message"), fallback="Final scene finalization failed; retry is available if inputs remain current.")
+        fin_copy["failure"] = fin_fail
+        job["finalization"] = fin_copy
+    return job
+
+
 def _history_status(entry: Mapping[str, object]) -> tuple[str | None, str | None]:
     status = entry.get("status")
     if not isinstance(status, Mapping):
@@ -1619,14 +1738,36 @@ def _history_status(entry: Mapping[str, object]) -> tuple[str | None, str | None
     messages = status.get("messages")
     message = None
     if isinstance(messages, list):
-        text_messages = []
         for item in messages:
             if isinstance(item, (list, tuple)) and len(item) > 1:
-                text_messages.append(str(item[1]))
-            elif isinstance(item, str):
-                text_messages.append(item)
-        if text_messages:
-            message = "; ".join(text_messages)[-1000:]
+                event_type, detail_val = item[0], item[1]
+                if event_type == "execution_error":
+                    if isinstance(detail_val, Mapping):
+                        exc = detail_val.get("exception_message") or detail_val.get("message")
+                        if isinstance(exc, str) and exc.strip():
+                            clean_exc = exc.strip().splitlines()[-1] if "\n" in exc else exc.strip()
+                            message = sanitize_user_facing_message(clean_exc, fallback="ComfyUI reported an execution error.")
+                            break
+                    elif isinstance(detail_val, str) and detail_val.strip():
+                        message = sanitize_user_facing_message(detail_val, fallback="ComfyUI reported an execution error.")
+                        break
+        if not message:
+            for item in messages:
+                if isinstance(item, (list, tuple)) and len(item) > 1:
+                    detail_val = item[1]
+                    if isinstance(detail_val, Mapping):
+                        exc = detail_val.get("exception_message") or detail_val.get("message")
+                        if isinstance(exc, str) and exc.strip():
+                            clean_exc = exc.strip().splitlines()[-1] if "\n" in exc else exc.strip()
+                            message = sanitize_user_facing_message(clean_exc, fallback="ComfyUI reported an execution error.")
+                            break
+                    elif isinstance(detail_val, str) and detail_val.strip():
+                        clean = sanitize_user_facing_message(detail_val, fallback="ComfyUI reported an execution error.")
+                        if clean != "The render job failed.":
+                            message = clean
+                            break
+        if not message and messages:
+            message = "ComfyUI reported an execution error."
     return status_name.casefold() if isinstance(status_name, str) else None, message
 
 

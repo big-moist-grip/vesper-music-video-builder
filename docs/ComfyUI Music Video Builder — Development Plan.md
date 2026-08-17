@@ -2570,17 +2570,124 @@ production contract.
 - Lazy capability probing detects node and model availability truthfully without
   globally blocking AMD dev hardware.
 
-### Manual Test Statuses (Phase 8E.1)
+### Manual Test Statuses (Phase 8E.2 Final Checkpoint)
 
+- MT-62 — PENDING_LIVE_COMPLETION
+- MT-76 — PENDING_LIVE_BATCH
 - MT-77 — Upscale Production Contract / Native Mode — PASS_STRUCTURAL
 - MT-78 — RTX VSR Fast Live Qualification — PENDING_RTX_LIVE
 - MT-79 — SeedVR2 Quality Live Qualification — PENDING_RTX_LIVE
 - MT-80 — Production Scene Currentness / Failure Isolation — PASS_STRUCTURAL
-- MT-81 — Production Upscale UI / Selection — PENDING_LATER_UI
+- MT-81 — Production Upscale UI / Selection — PASS
+- MT-82 — Production Scene Batch Integration — PASS_STRUCTURAL
+- MT-83 — Manual Post-Process Lifecycle — PASS_STRUCTURAL
+
+---
+
+## PHASE 8E.2 — Production Scene UI and Batch Integration (COMPLETE)
+
+### Delivered Capabilities
+
+1. **Renders UI Upscale Integration:**
+   - Exposed authoritative `production.upscale_method` selector in Renders header with exact options (`None`, `RTX VSR — Fast`, `SeedVR2 — Quality`).
+   - Clean, muted runtime capability notice (e.g. "RTX VSR unavailable on this runtime", "SeedVR2 qualification pending") without invasive popups or red alert fatigue.
+   - Disabled selector when a project batch is active (`RUNNING`, `PAUSE_REQUESTED`, `PAUSED`, `PAUSED_RECOVERY`).
+   - Added Production Scene tile in each scene row showing downstream status (`READY`, `NEEDS UPSCALE`, `PROCESSING`, `FAILED`, `STALE`, `UNAVAILABLE`, `NOT READY`), active postprocess duration, and candidate action buttons (Upscale, Cancel, Retry).
+
+2. **Manual Post-Process Lifecycle:**
+   - Direct manual per-scene start, interrupt/cancel, and retry endpoints through the central ComfyUI client.
+   - Preserves upstream Final Scene artifacts unconditionally on upscale failure or cancellation.
+
+3. **Sequential Batch Production Integration:**
+   - Extended `BatchRunner` with atomic postprocessing actions (`ACTION_POSTPROCESS_ONLY`, `ACTION_FINALIZE_AND_POSTPROCESS`).
+   - Normal production batch target is now **Production Scene READY** (with method `None` achieving ready status without redundant compute).
+   - Strict failure isolation: if a scene's upscale fails, Final Scene remains valid, the batch item records `POSTPROCESS_FAILED`, and the runner proceeds to the next scene.
+   - Retry Failed minimum-work semantics: retries skip completed H3 and Final Scene work to plan as `POSTPROCESS_ONLY`.
+   - Process restart recovery seamlessly re-tracks active postprocess jobs into `BATCH_RUNNING` or `BATCH_PAUSED_RECOVERY`.
+
+---
+
+## PHASE 8E.2A — Method Capability Enforcement and AMD RTX VSR Block (COMPLETE)
+
+### Delivered Capabilities
+
+1. **Truthful RTX VSR Hardware Execution Gate:**
+   - Scoped strictly to `rtx_vsr_fast`. Verifies CUDA runtime support and rejects ROCm/HIP/non-CUDA backends gracefully.
+   - On the AMD Radeon RX 7900 XT development runtime, RTX VSR truthfully reports `UNAVAILABLE` with reason `UNSUPPORTED_HARDWARE`.
+   - Preserves complete AMD usability: H3 generation, Storyboard, Visuals, Prompts, Final Scene creation, and None production mode remain 100% operational.
+   - Project preference (e.g. `rtx_vsr_fast`) persists across sessions without silent resets; capability is dynamically evaluated per machine.
+
+2. **Fail-Fast Batch & Manual Production Gating:**
+   - Batch preview and start block immediately when the project's selected upscale method is unavailable on the current runtime (`PRODUCTION_METHOD_UNAVAILABLE`).
+   - Zero compute wasted: prevents preparation, H3 rendering, and finalization when the pipeline endpoint cannot reach Production Scene READY.
+   - Manual `Render Scene` and `Upscale Scene` endpoints and UI buttons reject/disable operations when the selected upscale profile is unavailable.
+   - `UNQUALIFIED` semantics preserved: allows deliberate single-scene manual qualification while blocking large automated batches.
+
+3. **Mid-Batch Capability Loss Protection:**
+   - If runtime capability disappears during an active batch, the runner pauses systemically with `BATCH_PAUSED` and attention code `PRODUCTION_METHOD_UNAVAILABLE`.
+   - Upstream completed raw outputs and Final Scenes remain intact; scenes are not mass-failed.
+   - Resume fails while the blocker persists, but resumes cleanly once capability is restored.
+
+4. **Neutral Presentation:**
+   - Header displays neutral/muted notice (`RTX VSR unavailable on this runtime`), avoiding red error styling for standard hardware incompatibility.
+   - Switching to `None` immediately marks current Final Scenes as `Production Scene READY` without re-rendering.
+
+---
+
+## PHASE 8E.2B — Production Blocker UX, SeedVR2 Capability, and Debug Leak Remediation (COMPLETE)
+
+### Delivered Capabilities
+
+1. **Button Interactivity & Production Blocker UX:**
+   - `Select Scenes` is never disabled when an upscaler is unavailable; selection mode, inspect, and select all ready remain completely interactive.
+   - `Render All Ready` and `Render Selected` remain interactive and click to produce an explicit, clear red blocking warning explaining why the declared production profile cannot proceed, executing zero compute and creating zero phantom batch records.
+   - Switching upscaler to `None` immediately removes the production blocker, clears the red warning, and allows normal batch execution.
+
+2. **Selected Unavailable Profile Red Warning Styling:**
+   - Selected unavailable upscale method displays as a clear RED blocker (`--mvb-crimson` token with `data-state="error"`) in the Renders header.
+   - Qualification pending displays in non-error amber (`--mvb-amber` token with `data-state="warning"`).
+   - Switching back to `None` immediately clears the note and resets the status state.
+
+3. **Debug & Internal Object Leak Remediation:**
+   - Root cause resolved in `_history_status`: ComfyUI execution failure dictionaries are parsed cleanly to extract user-facing `exception_message` or standard fallback without leaking raw Python dict reprs (`{'prompt_id': ...}`).
+   - UI sanitization helper prevents rendering raw dict reprs, JSON diagnostic objects, or tracebacks in Scene cards.
+   - Backend structured logs retain technical identifiers (`job_id`, `prompt_id`, `node_id`, etc.) for debugging without leaking into product UI.
+
+4. **Independent SeedVR2 Runtime Capability on AMD:**
+   - SeedVR2 capability evaluated independently based on required custom nodes (`comfyui-seedvr2`), models (`seedvr2_ema_7b-Q4_K_M.gguf`, `ema_vae_fp16.safetensors`), and `sageattention` package.
+   - Does not inherit the NVIDIA-only hardware gate; on current AMD test environment, correctly reports `UNAVAILABLE` due to missing installed custom node files and model weights.
+   - Frozen profile parameters (`production_upscale_seedvr2_quality_v1`, 2.0x scale, 24 FPS) are preserved with zero automatic profile downgrade.
 
 ### Next Steps
 
-- **Phase 8E.2:** Production Upscale UI / Batch Orchestration Integration (frontend upscale selector, batch postprocess execution to Production Scene READY).
+- **Phase 8E.2C:** Legacy Diagnostic Sanitization and Presentation Boundary.
+
+---
+
+## PHASE 8E.2C — Legacy Diagnostic Sanitization and Presentation Boundary (COMPLETE)
+
+### Delivered Capabilities
+
+1. **Central User-Facing Message Sanitizer (`sanitize_user_facing_message`):**
+   - Authoritative sanitizer consolidates all user-facing message parsing across strings, dicts, lists, tuples, Exception objects, and None.
+   - Extracts concise, human-readable error messages from structured exception payloads while completely discarding internal execution telemetry, prompt IDs, node IDs, node types, and raw Python dict reprs.
+   - Preserves legitimate, actionable product errors verbatim ("Render failed.", "Render was interrupted.", "ComfyUI is unavailable.", "Required model is missing.", "Selected upscaler is unavailable on this runtime.", "Preparation is stale.").
+
+2. **Defense-in-Depth Write & Presentation Boundary Protection:**
+   - Both Write Boundary and Read/Presentation Boundaries are protected.
+   - Historical job records persisted on disk with legacy raw diagnostic strings load safely and expose clean presentation text in API responses without modifying or corrupting the underlying forensic records on disk.
+   - `JobStore.load()`, `JobStore.list_scene()`, `JobStore.list_project()`, and `reconcile_project_jobs()` sanitize failure messages at read time.
+   - `PostprocessJobStore` and `BatchStore` sanitize all post-processing and batch item failure messages at read/presentation time.
+
+3. **Frontend Fail-Safe UI Rendering:**
+   - `web/extension.js` presentation filters prevent raw dictionary reprs, JSON payloads, or technical identifiers from ever entering DOM textContent.
+   - Scene cards and Renders header display concise, actionable status copy.
+
+4. **Automated Verification:**
+   - 841 tests PASS across the entire codebase (602 Phase 8 tests PASS, 0 failures, 0 errors).
+
+### Next Steps
+
 - **Phase 8F:** Resolve handoff and final production export (scenes.csv, deterministic naming, concatenation).
 
 ---

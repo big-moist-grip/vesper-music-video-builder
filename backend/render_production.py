@@ -61,6 +61,7 @@ from .render_jobs import (
     ComfyUIClientError,
     discover_raw_output,
     RenderOutputDiscoveryError,
+    sanitize_user_facing_message,
 )
 from .workflows import (
     POSTPROCESS_METHOD_NONE,
@@ -338,21 +339,63 @@ def method_runtime_requirements(method: str) -> dict[str, object]:
     }
 
 
+def is_rtx_vsr_hardware_supported() -> bool:
+    """Check if the current runtime environment supports NVIDIA RTX VSR execution.
+
+    Scoped exclusively to rtx_vsr_fast. Checks for NVIDIA CUDA runtime
+    (torch.cuda with valid torch.version.cuda and non-HIP/non-ROCm backend).
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        if getattr(torch.version, "cuda", None) is None:
+            return False
+        if getattr(torch.version, "hip", None) is not None:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def production_method_availability(
     method: str,
     *,
-    node_types: set[str] | None,
+    node_types: set[str] | None = None,
     model_status: Mapping[str, str] | None = None,
+    hardware_supported: bool | None = None,
 ) -> dict[str, object]:
     """Truthful method availability.  Detection is lazy and method-specific.
 
-    No NVIDIA-only module is imported here; availability derives from the
-    active ComfyUI node registry (or injected evidence) only.
+    RTX VSR is verified against actual runtime CUDA/NVIDIA hardware capability.
+    SeedVR2 is evaluated independently on its own requirements.
+    None mode is always available.
     """
 
     canonical = validate_production_method(method)
     if canonical == POSTPROCESS_METHOD_NONE:
         return {"method": canonical, "state": METHOD_AVAILABLE, "missing_nodes": [], "missing_models": []}
+
+    if canonical == POSTPROCESS_METHOD_RTX_VSR_FAST:
+        hw_ok = is_rtx_vsr_hardware_supported() if hardware_supported is None else bool(hardware_supported)
+        if not hw_ok:
+            return {
+                "method": canonical,
+                "state": METHOD_UNAVAILABLE,
+                "reason": "UNSUPPORTED_HARDWARE",
+                "missing_nodes": [],
+                "missing_models": [],
+            }
+
+    if node_types is None:
+        try:
+            from .requirements import _load_active_node_types
+            active_nodes, _ = _load_active_node_types()
+            if active_nodes is not None:
+                node_types = active_nodes
+        except Exception:
+            pass
+
     if node_types is None:
         return {"method": canonical, "state": METHOD_NOT_DETERMINABLE, "missing_nodes": [], "missing_models": []}
     requirements = method_runtime_requirements(canonical)
@@ -490,7 +533,14 @@ def _read_production_current(root: Path, scene_id: str) -> dict[str, object] | N
     return dict(document)
 
 
-def _current_final_scene(storage: ProjectStorage, project_id: str, scene_id: str, *, preflight: Mapping[str, object] | None):
+def _current_final_scene(
+    storage: ProjectStorage,
+    project_id: str,
+    scene_id: str,
+    *,
+    preflight: Mapping[str, object] | None,
+    raw_output_root: Path | None = None,
+):
     """Return (finalization_summary, job) for the newest SUCCEEDED scene job."""
 
     from .render_jobs import JobStore
@@ -503,7 +553,7 @@ def _current_final_scene(storage: ProjectStorage, project_id: str, scene_id: str
     finalization = latest.get("finalization")
     if isinstance(finalization, Mapping) and finalization.get("state") == FINALIZATION_STATE_FINALIZED and finalization.get("raw_current") is True:
         return finalization, latest
-    summary = summarize_render_job_finalization(storage, latest, preflight=preflight)
+    summary = summarize_render_job_finalization(storage, latest, preflight=preflight, raw_output_root=raw_output_root)
     return summary, latest
 
 
@@ -514,6 +564,7 @@ def summarize_production_scene(
     *,
     method: str,
     preflight: Mapping[str, object] | None = None,
+    raw_output_root: Path | None = None,
 ) -> dict[str, object]:
     """Authoritative Production Scene state for one scene and method.
 
@@ -527,7 +578,13 @@ def summarize_production_scene(
     canonical_scene_id = validate_entity_id(scene_id, "Scene ID")
     canonical = validate_production_method(method)
     root = storage.project_directory(canonical_project_id).resolve(strict=True)
-    finalization, job = _current_final_scene(storage, canonical_project_id, canonical_scene_id, preflight=preflight)
+    finalization, job = _current_final_scene(
+        storage,
+        canonical_project_id,
+        canonical_scene_id,
+        preflight=preflight,
+        raw_output_root=raw_output_root,
+    )
     final_current = (
         isinstance(finalization, Mapping)
         and finalization.get("state") == FINALIZATION_STATE_FINALIZED
@@ -563,7 +620,10 @@ def summarize_production_scene(
         return result
     if current.get("state") == PRODUCTION_FAILED:
         result["state"] = PRODUCTION_FAILED
-        result["failure"] = deepcopy(current.get("failure")) if isinstance(current.get("failure"), Mapping) else None
+        failure_doc = deepcopy(current.get("failure")) if isinstance(current.get("failure"), Mapping) else None
+        if failure_doc and "message" in failure_doc:
+            failure_doc["message"] = sanitize_user_facing_message(failure_doc.get("message"), fallback="Production upscale failed; retry is available.")
+        result["failure"] = failure_doc
         result["postprocess_job_id"] = current.get("postprocess_job_id")
         return result
     if current.get("fingerprint") != fingerprint:
@@ -644,6 +704,17 @@ def transition_postprocess_job(
     return normalized
 
 
+def sanitize_postprocess_job_record_for_presentation(record: Mapping[str, object]) -> dict[str, object]:
+    pjob = deepcopy(dict(record))
+    failure = pjob.get("failure")
+    if isinstance(failure, Mapping):
+        f_copy = deepcopy(dict(failure))
+        if "message" in f_copy:
+            f_copy["message"] = sanitize_user_facing_message(f_copy.get("message"), fallback="Production upscale failed; retry is available.")
+        pjob["failure"] = f_copy
+    return pjob
+
+
 class PostprocessJobStore:
     """Durable per-scene post-process job records under project-owned runtime."""
 
@@ -687,7 +758,7 @@ class PostprocessJobStore:
             raise RenderProductionError("POSTPROCESS_JOB_INVALID", "The post-process job record could not be read.") from error
         if not isinstance(document, Mapping):
             raise RenderProductionError("POSTPROCESS_JOB_INVALID", "The post-process job record is invalid.")
-        return dict(document)
+        return sanitize_postprocess_job_record_for_presentation(dict(document))
 
     def list_scene(self, project_id: object, scene_id: object) -> list[dict[str, object]]:
         canonical_project_id = validate_project_id(project_id)
@@ -704,7 +775,7 @@ class PostprocessJobStore:
             except (OSError, UnicodeError, json.JSONDecodeError):
                 continue
             if isinstance(document, Mapping):
-                records.append(dict(document))
+                records.append(sanitize_postprocess_job_record_for_presentation(dict(document)))
         return sorted(records, key=lambda item: str(item.get("created_at", "")))
 
 
@@ -971,6 +1042,24 @@ def record_production_failure(
 # Execution (ComfyUI-backed methods), reusing the central client
 # ---------------------------------------------------------------------------
 
+def _probe_node_types(client: object | None, required_nodes: list[str]) -> set[str] | None:
+    if client is None:
+        return None
+    if hasattr(client, "get_object_info") and callable(client.get_object_info):
+        probed: set[str] = set()
+        for nt in required_nodes:
+            try:
+                info = client.get_object_info(nt)
+                if isinstance(info, dict) and info:
+                    probed.add(nt)
+            except Exception:
+                pass
+        return probed
+    if hasattr(client, "node_types") and isinstance(getattr(client, "node_types"), (set, list, tuple)):
+        return set(getattr(client, "node_types"))
+    return set(required_nodes)
+
+
 def submit_postprocess_job(
     storage: ProjectStorage,
     project_id: object,
@@ -982,6 +1071,9 @@ def submit_postprocess_job(
     output_prefix: str,
     node_types: set[str] | None = None,
     model_status: Mapping[str, str] | None = None,
+    hardware_supported: bool | None = None,
+    raw_output_root: Path | None = None,
+    preflight: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Create and submit one post-process job through the central ComfyUI client.
 
@@ -994,7 +1086,14 @@ def submit_postprocess_job(
     canonical = validate_production_method(method)
     if canonical == POSTPROCESS_METHOD_NONE:
         raise RenderProductionError("POSTPROCESS_JOB_NOT_APPLICABLE", "The None method performs no post-processing.")
-    availability = production_method_availability(canonical, node_types=node_types, model_status=model_status)
+    if node_types is None and client is not None:
+        node_types = _probe_node_types(client, method_runtime_requirements(canonical)["node_types"])
+    availability = production_method_availability(
+        canonical,
+        node_types=node_types,
+        model_status=model_status,
+        hardware_supported=hardware_supported,
+    )
     if availability["state"] not in {METHOD_AVAILABLE, METHOD_UNQUALIFIED}:
         raise ProductionMethodUnavailable(
             "POSTPROCESS_METHOD_UNAVAILABLE",
@@ -1010,7 +1109,14 @@ def submit_postprocess_job(
             "This scene already has an active post-process job.",
             details={"postprocess_job_id": active.get("postprocess_job_id")},
         )
-    summary = summarize_production_scene(storage, canonical_project_id, canonical_scene_id, method=canonical)
+    summary = summarize_production_scene(
+        storage,
+        canonical_project_id,
+        canonical_scene_id,
+        method=canonical,
+        raw_output_root=raw_output_root,
+        preflight=preflight,
+    )
     if summary["final_scene_current"] is not True:
         raise ProductionNotReady("POSTPROCESS_SOURCE_NOT_READY", "A current Final Scene is required before post-processing.")
     fingerprint = str(summary["fingerprint"])
@@ -1088,7 +1194,8 @@ def reconcile_postprocess_job(
         if error.details.get("http_status") != 404:
             return record
         history = {}
-    entry = history.get(prompt_id) if isinstance(history, Mapping) else None
+    from .render_jobs import _history_entry
+    entry = _history_entry(history, prompt_id) if isinstance(history, Mapping) else None
     if isinstance(entry, Mapping):
         status = entry.get("status")
         status_str = status.get("status_str") if isinstance(status, Mapping) else None
@@ -1276,7 +1383,9 @@ def materialize_final_scene_for_postprocess(
     project_id: object,
     scene_id: object,
     *,
-    input_root: Path,
+    input_root: Path | None = None,
+    raw_output_root: Path | None = None,
+    preflight: Mapping[str, object] | None = None,
 ) -> tuple[str, Path]:
     """Atomically stage the current Final Scene in the ComfyUI input directory.
 
@@ -1285,8 +1394,23 @@ def materialize_final_scene_for_postprocess(
 
     canonical_project_id = validate_project_id(project_id)
     canonical_scene_id = validate_entity_id(scene_id, "Scene ID")
+    if input_root is None:
+        try:
+            import folder_paths  # type: ignore
+            resolved_input_root = Path(folder_paths.get_input_directory())
+        except Exception:
+            resolved_input_root = storage.project_directory(canonical_project_id) / "input"
+    else:
+        resolved_input_root = input_root
     root = storage.project_directory(canonical_project_id).resolve(strict=True)
-    summary = summarize_production_scene(storage, canonical_project_id, canonical_scene_id, method=POSTPROCESS_METHOD_NONE)
+    summary = summarize_production_scene(
+        storage,
+        canonical_project_id,
+        canonical_scene_id,
+        method=POSTPROCESS_METHOD_NONE,
+        raw_output_root=raw_output_root,
+        preflight=preflight,
+    )
     if summary.get("state") != PRODUCTION_CURRENT or not isinstance(summary.get("output"), Mapping):
         raise ProductionNotReady("POSTPROCESS_SOURCE_NOT_READY", "A current Final Scene is required before post-processing.")
     output = summary["output"]
@@ -1298,7 +1422,7 @@ def materialize_final_scene_for_postprocess(
         raise ProductionNotReady("POSTPROCESS_SOURCE_NOT_READY", "Final Scene output file does not exist.")
 
     selector = f"music_video_builder/{canonical_project_id}/{canonical_scene_id}/final_scene.mp4"
-    staged_path = input_root / "music_video_builder" / canonical_project_id / canonical_scene_id / "final_scene.mp4"
+    staged_path = resolved_input_root / "music_video_builder" / canonical_project_id / canonical_scene_id / "final_scene.mp4"
     if staged_path.is_symlink():
         raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The staged input path is a symlink.")
     staged_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1384,6 +1508,7 @@ def finalize_postprocess_job(
     *,
     media_adapter: ProductionMediaAdapter | None = None,
     preflight: Mapping[str, object] | None = None,
+    raw_output_root: Path | None = None,
 ) -> dict[str, object]:
     """Finalize a SUCCEEDED post-process job: remux authoritative audio, validate candidate, and atomically promote.
 
@@ -1401,12 +1526,28 @@ def finalize_postprocess_job(
     output = record.get("output")
     if not isinstance(output, Mapping):
         raise RenderProductionError("POSTPROCESS_OUTPUT_MISSING", "The succeeded post-process job has no discovered output.")
-    raw_video_path = Path(str(output.get("local_path", "")))
-    if not raw_video_path.is_file():
+    raw_video_path = None
+    if isinstance(output.get("local_path"), str) and Path(str(output.get("local_path"))).is_file():
+        raw_video_path = Path(str(output["local_path"]))
+    elif isinstance(output.get("relative_path"), str):
+        try:
+            from .render_jobs import _default_comfy_output_root
+            output_root = raw_output_root or _default_comfy_output_root()
+        except Exception:
+            output_root = raw_output_root
+        if output_root is not None:
+            raw_video_path = output_root / str(output["relative_path"])
+    if raw_video_path is None or not raw_video_path.is_file():
         raise RenderProductionError("POSTPROCESS_OUTPUT_MISSING", "The upscaled output file does not exist.")
 
     root = storage.project_directory(canonical_project_id).resolve(strict=True)
-    summary, final_job = _current_final_scene(storage, canonical_project_id, canonical_scene_id, preflight=preflight)
+    summary, final_job = _current_final_scene(
+        storage,
+        canonical_project_id,
+        canonical_scene_id,
+        preflight=preflight,
+        raw_output_root=raw_output_root,
+    )
     if not isinstance(summary, Mapping) or summary.get("state") != FINALIZATION_STATE_FINALIZED or not isinstance(summary.get("output"), Mapping):
         raise ProductionNotReady("POSTPROCESS_SOURCE_NOT_READY", "The Final Scene is not current for finalization.")
     final_output = summary["output"]
@@ -1487,3 +1628,154 @@ def finalize_postprocess_job(
                 candidate_path.unlink()
         except OSError:
             pass
+
+
+def cancel_postprocess_job(
+    storage: ProjectStorage,
+    project_id: object,
+    scene_id: object,
+    job_id: object | None = None,
+    *,
+    client: ComfyUIClient | None = None,
+) -> dict[str, object]:
+    """Cancel an active post-process job. Preserves Raw H3 and Final Scene intact."""
+
+    canonical_project_id = validate_project_id(project_id)
+    canonical_scene_id = validate_entity_id(scene_id, "Scene ID")
+    store = PostprocessJobStore(storage)
+    if job_id is not None:
+        record = store.load(canonical_project_id, canonical_scene_id, job_id)
+    else:
+        existing = store.list_scene(canonical_project_id, canonical_scene_id)
+        record = _active_postprocess_job(existing)
+        if record is None:
+            raise RenderProductionError("POSTPROCESS_JOB_NOT_ACTIVE", "No active post-process job found to cancel.")
+
+    current_state = record.get("state")
+    if current_state not in POSTPROCESS_ACTIVE_STATES:
+        return record
+
+    prompt_id = record.get("comfy_prompt_id")
+    comfy = client or ComfyUIClient()
+    if isinstance(prompt_id, str) and prompt_id:
+        try:
+            comfy.interrupt(prompt_id)
+        except Exception:
+            LOGGER.warning("ComfyUI interrupt failed for postprocess prompt_id=%s", prompt_id)
+
+    cancelled = transition_postprocess_job(
+        record,
+        POSTPROCESS_CANCELLED,
+        reason="user_cancelled",
+        updates={"cancelled_at": _timestamp()},
+    )
+    return store.save(cancelled)
+
+
+def retry_postprocess_job(
+    storage: ProjectStorage,
+    project_id: object,
+    scene_id: object,
+    *,
+    client: ComfyUIClient | None = None,
+    final_scene_selector: str,
+    output_prefix: str,
+    node_types: set[str] | None = None,
+    model_status: Mapping[str, str] | None = None,
+    hardware_supported: bool | None = None,
+    raw_output_root: Path | None = None,
+) -> dict[str, object]:
+    """Retry post-processing for a scene without rerendering H3 or refinalizing Final Scene."""
+
+    canonical_project_id = validate_project_id(project_id)
+    canonical_scene_id = validate_entity_id(scene_id, "Scene ID")
+    project = storage.load_project(canonical_project_id)
+    method = resolve_project_production_method(project)
+    if method == POSTPROCESS_METHOD_NONE:
+        raise RenderProductionError("POSTPROCESS_JOB_NOT_APPLICABLE", "The None method performs no post-processing.")
+    return submit_postprocess_job(
+        storage,
+        canonical_project_id,
+        canonical_scene_id,
+        method=method,
+        client=client,
+        final_scene_selector=final_scene_selector,
+        output_prefix=output_prefix,
+        node_types=node_types,
+        model_status=model_status,
+        hardware_supported=hardware_supported,
+        raw_output_root=raw_output_root,
+    )
+
+
+def set_project_production_method(
+    storage: ProjectStorage,
+    project_id: object,
+    method: object,
+) -> dict[str, object]:
+    """Persist the project production upscale method, rejecting mutations if a batch is active."""
+
+    canonical_project_id = validate_project_id(project_id)
+    canonical_method = validate_production_method(method)
+
+    from .render_batch import BatchStore, OPEN_BATCH_STATES
+    batch = BatchStore(storage).load_active(canonical_project_id)
+    if batch is not None and batch.get("state") in OPEN_BATCH_STATES:
+        raise RenderProductionError(
+            "PROJECT_BATCH_ACTIVE_MUTATION_BLOCKED",
+            "Cannot change project upscale method while a batch is active.",
+        )
+
+    project = storage.load_project(canonical_project_id)
+    current_production = project.get("production") if isinstance(project.get("production"), Mapping) else {}
+    updated_production = {**current_production, "upscale_method": canonical_method}
+    updated_project = {**project, "production": updated_production}
+    saved = storage.save_project(canonical_project_id, updated_project)
+    return {"project_id": canonical_project_id, "production": saved.get("production")}
+
+
+def get_project_production_status(
+    storage: ProjectStorage,
+    project_id: object,
+    *,
+    node_types: set[str] | None = None,
+    model_status: Mapping[str, str] | None = None,
+    hardware_supported: bool | None = None,
+) -> dict[str, object]:
+    """Aggregate project production settings, runtime method capabilities, and per-scene summaries."""
+
+    canonical_project_id = validate_project_id(project_id)
+    project = storage.load_project(canonical_project_id)
+    resolved_method = resolve_project_production_method(project)
+
+    if node_types is None:
+        try:
+            from .requirements import _load_active_node_types
+            active_nodes, _ = _load_active_node_types()
+            if active_nodes is not None:
+                node_types = active_nodes
+        except Exception:
+            pass
+
+    capabilities = {}
+    for m in PRODUCTION_METHODS:
+        capabilities[m] = production_method_availability(
+            m,
+            node_types=node_types,
+            model_status=model_status,
+            hardware_supported=hardware_supported,
+        )
+
+    scenes = project.get("scenes") if isinstance(project.get("scenes"), list) else []
+    scene_summaries = []
+    for scene in scenes:
+        if isinstance(scene, Mapping) and isinstance(scene.get("scene_id"), str):
+            summary = summarize_production_scene(storage, canonical_project_id, scene["scene_id"], method=resolved_method)
+            scene_summaries.append(summary)
+
+    return {
+        "project_id": canonical_project_id,
+        "upscale_method": resolved_method,
+        "capabilities": capabilities,
+        "scenes": scene_summaries,
+    }

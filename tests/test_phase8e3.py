@@ -153,6 +153,7 @@ class TestPhase8ECompilationAndSubmission(Phase8ETestBase):
             final_scene_selector="music_video_builder/p/s/final_scene.mp4",
             output_prefix="prefix_s1",
             node_types=node_types,
+            hardware_supported=True,
         )
         self.assertEqual(submitted["state"], POSTPROCESS_SUBMITTED)
         self.assertEqual(submitted["comfy_prompt_id"], "prompt-test-456")
@@ -172,6 +173,7 @@ class TestPhase8ECompilationAndSubmission(Phase8ETestBase):
                 final_scene_selector="video.mp4",
                 output_prefix="prefix",
                 node_types={"VHS_LoadVideo", "VHS_VideoCombine"},
+                hardware_supported=True,
             )
 
     def test_submit_postprocess_job_conflict_when_active(self):
@@ -188,6 +190,7 @@ class TestPhase8ECompilationAndSubmission(Phase8ETestBase):
             final_scene_selector="video.mp4",
             output_prefix="prefix_1",
             node_types=node_types,
+            hardware_supported=True,
         )
 
         # Second submission while first is still SUBMITTED -> Conflict
@@ -201,6 +204,7 @@ class TestPhase8ECompilationAndSubmission(Phase8ETestBase):
                 final_scene_selector="video.mp4",
                 output_prefix="prefix_2",
                 node_types=node_types,
+                hardware_supported=True,
             )
 
 
@@ -221,6 +225,7 @@ class TestPhase8EReconciliation(Phase8ETestBase):
             final_scene_selector="video.mp4",
             output_prefix="owned_prefix_s1",
             node_types=node_types,
+            hardware_supported=True,
         )
         job_id = job["postprocess_job_id"]
 
@@ -276,6 +281,7 @@ class TestPhase8EReconciliation(Phase8ETestBase):
             final_scene_selector="video.mp4",
             output_prefix="prefix",
             node_types=node_types,
+            hardware_supported=True,
         )
         job_id = job["postprocess_job_id"]
 

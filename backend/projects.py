@@ -61,7 +61,9 @@ V3_PROJECT_FIELDS = (
 )
 V4_PROJECT_FIELDS = V3_PROJECT_FIELDS + ("story_direction", "storyboard")
 V5_PROJECT_FIELDS = V4_PROJECT_FIELDS + ("visuals",)
-PROJECT_FIELDS = V5_PROJECT_FIELDS + ("prompts",)
+V6_PROJECT_FIELDS = V5_PROJECT_FIELDS + ("prompts",)
+PROJECT_FIELDS = V6_PROJECT_FIELDS
+OPTIONAL_PROJECT_FIELDS = ("production",)
 SOURCE_FIELDS = ("master_audio", "lyrics_srt")
 MASTER_AUDIO_FIELDS = ("stored_name", "original_name", "duration_ms")
 LYRICS_SRT_FIELDS = ("stored_name", "original_name", "cue_count")
@@ -262,8 +264,15 @@ def utc_timestamp(value: datetime | None = None) -> str:
     return timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _validate_base_project(document: dict[str, object], fields: tuple[str, ...]) -> dict[str, object]:
-    if set(document) != set(fields):
+def _validate_base_project(
+    document: dict[str, object],
+    fields: tuple[str, ...],
+    optional_fields: tuple[str, ...] = (),
+) -> dict[str, object]:
+    doc_keys = set(document)
+    required = set(fields)
+    allowed = required | set(optional_fields)
+    if not (required <= doc_keys <= allowed):
         raise ProjectValidationError("Project document has unsupported or missing fields.")
 
     project_id = validate_project_id(document.get("project_id"))
@@ -710,6 +719,7 @@ def validate_project_document(
         base = _validate_base_project(
             document,
             V5_PROJECT_FIELDS if schema_version == LEGACY_SCHEMA_VERSION_5 else PROJECT_FIELDS,
+            optional_fields=OPTIONAL_PROJECT_FIELDS,
         )
         source = _validate_source(document.get("source"))
         scenes = document.get("scenes")
@@ -795,6 +805,8 @@ def validate_project_document(
                 legacy_v6=schema_version == LEGACY_SCHEMA_VERSION_6,
             )
         )
+        from .render_production import validate_production_settings
+
         normalized = {
             "schema_version": SCHEMA_VERSION,
             **base,
@@ -807,6 +819,9 @@ def validate_project_document(
             "visuals": visuals,
             "prompts": prompts,
         }
+        production_doc = document.get("production")
+        if production_doc is not None:
+            normalized["production"] = validate_production_settings(production_doc)
     else:
         raise ProjectValidationError("Unsupported project schema version.")
 

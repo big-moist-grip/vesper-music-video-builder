@@ -132,11 +132,11 @@ class TestPhase8ERuntimeAvailability(Phase8ETestBase):
 
     def test_rtx_vsr_availability(self):
         # Node types not determinable
-        avail = production_method_availability("rtx_vsr_fast", node_types=None)
+        avail = production_method_availability("rtx_vsr_fast", node_types=None, hardware_supported=True)
         self.assertEqual(avail["state"], METHOD_NOT_DETERMINABLE)
 
         # Missing RTXVideoSuperResolution
-        avail = production_method_availability("rtx_vsr_fast", node_types={"VHS_LoadVideo", "VHS_VideoCombine"})
+        avail = production_method_availability("rtx_vsr_fast", node_types={"VHS_LoadVideo", "VHS_VideoCombine"}, hardware_supported=True)
         self.assertEqual(avail["state"], METHOD_UNAVAILABLE)
         self.assertEqual(avail["missing_nodes"], ["RTXVideoSuperResolution"])
 
@@ -144,6 +144,7 @@ class TestPhase8ERuntimeAvailability(Phase8ETestBase):
         avail = production_method_availability(
             "rtx_vsr_fast",
             node_types={"VHS_LoadVideo", "RTXVideoSuperResolution", "VHS_VideoCombine"},
+            hardware_supported=True,
         )
         self.assertEqual(avail["state"], METHOD_AVAILABLE)
         self.assertEqual(avail["missing_nodes"], [])

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import uuid
 
 from .gpt_launcher import GptDirectorNotFoundError, GptLaunchError, launch_gpt_director
 from .scenes import SceneConstructionError, build_project_scenes
@@ -71,6 +72,24 @@ from .render_finalize import (
     RenderFinalizationError,
     enrich_render_jobs_with_finalization,
     finalize_render_job,
+)
+from .render_production import (
+    POSTPROCESS_METHOD_NONE,
+    PostprocessJobConflict,
+    PostprocessJobNotFound,
+    PostprocessJobStore,
+    ProductionMethodUnavailable,
+    ProductionNotReady,
+    RenderProductionError,
+    cancel_postprocess_job,
+    get_project_production_status,
+    materialize_final_scene_for_postprocess,
+    resolve_project_production_method,
+    retry_postprocess_job,
+    set_project_production_method,
+    submit_postprocess_job,
+    summarize_production_scene,
+    validate_production_method,
 )
 from .render_jobs import (
     RenderJobError,
@@ -261,7 +280,7 @@ def register_routes():
         payload = await read_json(request)
         if payload is not None and (not isinstance(payload, dict) or payload):
             return api_error("Render submission does not accept workflows, prompts, paths, hosts, or request fields.", 400)
-        blocker = await asyncio.to_thread(manual_action_blocker, PROJECT_STORAGE, project_id)
+        blocker = await asyncio.to_thread(manual_action_blocker, PROJECT_STORAGE, project_id, check_upscaler=True)
         if blocker is not None:
             return api_error(blocker, 409)
         try:
@@ -309,7 +328,7 @@ def register_routes():
         payload = await read_json(request)
         if payload is not None and (not isinstance(payload, dict) or payload):
             return api_error("Render retry does not accept prompt IDs, workflows, or request fields.", 400)
-        blocker = await asyncio.to_thread(manual_action_blocker, PROJECT_STORAGE, project_id)
+        blocker = await asyncio.to_thread(manual_action_blocker, PROJECT_STORAGE, project_id, check_upscaler=True)
         if blocker is not None:
             return api_error(blocker, 409)
         try:
@@ -353,6 +372,178 @@ def register_routes():
             LOGGER.exception("Could not persist finalization state.")
             return api_error("Finalization state could not be persisted.", 500)
         return web.json_response(result)
+
+    @PromptServer.instance.routes.get("/music-video-builder/projects/{project_id}/production/status")
+    async def music_video_builder_production_status(request):
+        project_id = request.match_info["project_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+        try:
+            status = await asyncio.to_thread(get_project_production_status, PROJECT_STORAGE, project_id)
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except RenderProductionError as error:
+            return render_job_error(error)
+        return web.json_response(status)
+
+    @PromptServer.instance.routes.put("/music-video-builder/projects/{project_id}/production/upscale-method")
+    async def music_video_builder_set_upscale_method(request):
+        project_id = request.match_info["project_id"]
+        try:
+            validate_project_id(project_id)
+        except ProjectValidationError:
+            return api_error("Invalid project ID.", 400)
+        payload = await read_json(request)
+        if not isinstance(payload, dict) or "upscale_method" not in payload:
+            return api_error("Payload must include upscale_method.", 400)
+        method = payload["upscale_method"]
+        try:
+            validate_production_method(method)
+        except ProjectValidationError as error:
+            return api_error(str(error), 400)
+        try:
+            result = await asyncio.to_thread(set_project_production_method, PROJECT_STORAGE, project_id, method)
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except RenderProductionError as error:
+            return render_job_error(error)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist project production settings.")
+            return api_error("Could not persist production settings.", 500)
+        return web.json_response(result)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/scenes/{scene_id}/render/postprocess/start")
+    async def music_video_builder_start_scene_postprocess(request):
+        project_id = request.match_info["project_id"]
+        scene_id = request.match_info["scene_id"]
+        try:
+            validate_project_id(project_id)
+            validate_entity_id(scene_id, "Scene ID")
+        except ProjectValidationError:
+            return api_error("Invalid project or scene ID.", 400)
+        payload = await read_json(request)
+        if payload is not None and (not isinstance(payload, dict) or payload):
+            return api_error("Postprocess start does not accept custom workflows or paths.", 400)
+        blocker = await asyncio.to_thread(lambda: manual_action_blocker(PROJECT_STORAGE, project_id))
+        if blocker is not None:
+            return api_error(blocker, 409)
+
+        async def _do_submit():
+            project = PROJECT_STORAGE.load_project(project_id)
+            method = resolve_project_production_method(project)
+            if method == POSTPROCESS_METHOD_NONE:
+                raise RenderProductionError("POSTPROCESS_JOB_NOT_APPLICABLE", "The None method performs no post-processing.")
+            selector, _ = materialize_final_scene_for_postprocess(PROJECT_STORAGE, project_id, scene_id)
+            output_prefix = f"mvb_{project_id}_{scene_id}_{uuid.uuid4().hex[:8]}"
+            return submit_postprocess_job(
+                PROJECT_STORAGE,
+                project_id,
+                scene_id,
+                method=method,
+                final_scene_selector=selector,
+                output_prefix=output_prefix,
+            )
+
+        try:
+            result = await asyncio.to_thread(_do_submit)
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except ProductionMethodUnavailable as error:
+            return render_job_error(error)
+        except PostprocessJobConflict as error:
+            return render_job_error(error)
+        except ProductionNotReady as error:
+            return render_job_error(error)
+        except RenderProductionError as error:
+            return render_job_error(error)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist postprocess job state.")
+            return api_error("Postprocess job state could not be persisted.", 500)
+        return web.json_response(result, status=202)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/scenes/{scene_id}/render/postprocess/cancel")
+    async def music_video_builder_cancel_scene_postprocess(request):
+        project_id = request.match_info["project_id"]
+        scene_id = request.match_info["scene_id"]
+        try:
+            validate_project_id(project_id)
+            validate_entity_id(scene_id, "Scene ID")
+        except ProjectValidationError:
+            return api_error("Invalid project or scene ID.", 400)
+        try:
+            result = await asyncio.to_thread(cancel_postprocess_job, PROJECT_STORAGE, project_id, scene_id)
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except RenderProductionError as error:
+            return render_job_error(error)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist cancelled postprocess job state.")
+            return api_error("Postprocess job state could not be persisted.", 500)
+        return web.json_response(result)
+
+    @PromptServer.instance.routes.post("/music-video-builder/projects/{project_id}/scenes/{scene_id}/render/postprocess/retry")
+    async def music_video_builder_retry_scene_postprocess(request):
+        project_id = request.match_info["project_id"]
+        scene_id = request.match_info["scene_id"]
+        try:
+            validate_project_id(project_id)
+            validate_entity_id(scene_id, "Scene ID")
+        except ProjectValidationError:
+            return api_error("Invalid project or scene ID.", 400)
+        blocker = await asyncio.to_thread(lambda: manual_action_blocker(PROJECT_STORAGE, project_id))
+        if blocker is not None:
+            return api_error(blocker, 409)
+
+        async def _do_retry():
+            selector, _ = materialize_final_scene_for_postprocess(PROJECT_STORAGE, project_id, scene_id)
+            output_prefix = f"mvb_{project_id}_{scene_id}_{uuid.uuid4().hex[:8]}"
+            return retry_postprocess_job(
+                PROJECT_STORAGE,
+                project_id,
+                scene_id,
+                final_scene_selector=selector,
+                output_prefix=output_prefix,
+            )
+
+        try:
+            result = await asyncio.to_thread(_do_retry)
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except ProductionMethodUnavailable as error:
+            return render_job_error(error)
+        except PostprocessJobConflict as error:
+            return render_job_error(error)
+        except ProductionNotReady as error:
+            return render_job_error(error)
+        except RenderProductionError as error:
+            return render_job_error(error)
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not persist retried postprocess job state.")
+            return api_error("Postprocess job state could not be persisted.", 500)
+        return web.json_response(result, status=202)
+
+    @PromptServer.instance.routes.get("/music-video-builder/projects/{project_id}/scenes/{scene_id}/render/postprocess")
+    async def music_video_builder_scene_postprocess_status(request):
+        project_id = request.match_info["project_id"]
+        scene_id = request.match_info["scene_id"]
+        try:
+            validate_project_id(project_id)
+            validate_entity_id(scene_id, "Scene ID")
+        except ProjectValidationError:
+            return api_error("Invalid project or scene ID.", 400)
+        try:
+            project = PROJECT_STORAGE.load_project(project_id)
+            method = resolve_project_production_method(project)
+            summary = summarize_production_scene(PROJECT_STORAGE, project_id, scene_id, method=method)
+            store = PostprocessJobStore(PROJECT_STORAGE)
+            jobs = store.list_scene(project_id, scene_id)
+        except ProjectNotFoundError:
+            return api_error("Project was not found.", 404)
+        except RenderProductionError as error:
+            return render_job_error(error)
+        return web.json_response({"summary": summary, "jobs": jobs, "method": method})
 
     async def read_batch_selection(request):
         """Accept either no body/{} (all ready) or exactly {scene_ids: [...]}."""

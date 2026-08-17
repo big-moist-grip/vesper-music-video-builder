@@ -121,7 +121,8 @@ class FakeMediaAdapter:
         }
 
     def probe(self, path):
-        name = Path(path).name
+        p = Path(path)
+        name = p.name
         if name == "scene_audio.wav":
             audio = self._audio_stream()
             audio["codec_name"] = "pcm_s16le"
@@ -135,6 +136,12 @@ class FakeMediaAdapter:
             }
         video = self._video_stream()
         audio = self._audio_stream()
+        if p.parent.name == "production" or name.startswith("production_") or (name.startswith("mvb_") and "final" not in p.parts):
+            video["width"] = int(VIDEO_WIDTH * 2)
+            video["height"] = int(VIDEO_HEIGHT * 2)
+        else:
+            video["width"] = VIDEO_WIDTH
+            video["height"] = VIDEO_HEIGHT
         return {
             "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration_ms": SCENE_DURATION_MS, "size": 1, "start_time": "0"},
             "streams": [video, audio],
@@ -151,6 +158,11 @@ class FakeMediaAdapter:
         candidate.parent.mkdir(parents=True, exist_ok=True)
         candidate.write_bytes(b"final-scene-mp4")
         return ["fake-ffmpeg", "-i", str(raw_video), str(candidate)]
+
+    def remux_authoritative_audio(self, upscaled_video, final_scene_video, candidate):
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_bytes(b"production-candidate-mp4")
+        return ["fake-ffmpeg", "-i", str(upscaled_video), "-i", str(final_scene_video), "-c", "copy", str(candidate)]
 
 
 class FakeComfyClient:
@@ -419,6 +431,7 @@ class Phase8DBase(unittest.TestCase):
             "raw_output_root": self.raw_root,
             "finalizer": self.finalizer,
             "preparer": self.preparer,
+            "media_adapter": self.media_adapter,
         }
 
     def runner_seams(self):
