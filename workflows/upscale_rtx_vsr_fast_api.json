@@ -1,0 +1,39 @@
+{
+  "1": {
+    "class_type": "VHS_LoadVideo",
+    "inputs": {
+      "video": "__PRODUCTION_FINAL_SCENE__",
+      "force_rate": 0,
+      "custom_width": 0,
+      "custom_height": 0,
+      "frame_load_cap": 0,
+      "skip_first_frames": 0,
+      "select_every_nth": 1
+    }
+  },
+  "2": {
+    "class_type": "RTXVideoSuperResolution",
+    "inputs": {
+      "images": ["1", 0],
+      "resize_type": "scale by multiplier",
+      "scale": 2.0,
+      "quality": "ULTRA"
+    }
+  },
+  "3": {
+    "class_type": "VHS_VideoCombine",
+    "inputs": {
+      "images": ["2", 0],
+      "frame_rate": 24,
+      "loop_count": 0,
+      "filename_prefix": "__PRODUCTION_OUTPUT_PREFIX__",
+      "format": "video/nvenc_h264-mp4",
+      "pix_fmt": "yuv420p",
+      "bitrate": 15,
+      "megabit": true,
+      "save_metadata": false,
+      "pingpong": false,
+      "save_output": true
+    }
+  }
+}

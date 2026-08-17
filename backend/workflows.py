@@ -647,3 +647,314 @@ def patch_reference_picture_slots(workflow: dict[str, object], image_names: list
         else:
             nodes.pop(loader_id, None)
     return patched
+
+
+# ---------------------------------------------------------------------------
+# Phase 8E — production post-processing (upscale) contracts
+# ---------------------------------------------------------------------------
+#
+# Method identities are stable.  Labels are the authoritative user-facing
+# production choices.  The graph evidence for each ComfyUI-backed method is
+# extracted from the reviewed community donor workflows and minimized to the
+# smallest stable production subgraph:
+#
+#   rtx_vsr_fast    <- minimaxH3EZTurboOptimalRTXUpscale_v35REMADE
+#                      VHS_LoadVideo -> RTXVideoSuperResolution -> VHS_VideoCombine
+#   seedvr2_quality <- minimaxH3WithSEEDVR2Upscaler_v4 (UPSCALE subgraph)
+#                      VHS_LoadVideo -> SeedVR2LoadDiTModel/SeedVR2LoadVAEModel
+#                      -> SeedVR2VideoUpscaler -> VHS_VideoCombine
+#
+# H3 generation, LTX refinement, RIFE/FILM interpolation, preview/debug
+# branches, and donor audio paths are deliberately excluded.  Authoritative
+# scene audio is remuxed by the Builder after picture post-processing and is
+# never taken from the post-processing graph.
+
+POSTPROCESS_METHOD_NONE = "none"
+POSTPROCESS_METHOD_RTX_VSR_FAST = "rtx_vsr_fast"
+POSTPROCESS_METHOD_SEEDVR2_QUALITY = "seedvr2_quality"
+
+POSTPROCESS_METHOD_LABELS = {
+    POSTPROCESS_METHOD_NONE: "None",
+    POSTPROCESS_METHOD_RTX_VSR_FAST: "RTX VSR — Fast",
+    POSTPROCESS_METHOD_SEEDVR2_QUALITY: "SeedVR2 — Quality",
+}
+
+PRODUCTION_POSTPROCESS_MANIFESTS = {
+    POSTPROCESS_METHOD_RTX_VSR_FAST: {
+        "method": POSTPROCESS_METHOD_RTX_VSR_FAST,
+        "label": POSTPROCESS_METHOD_LABELS[POSTPROCESS_METHOD_RTX_VSR_FAST],
+        "workflow_id": "production_upscale_rtx_vsr_fast_v1",
+        "workflow_file": "upscale_rtx_vsr_fast_api.json",
+        "donor_basis": ["minimaxH3EZTurboOptimalRTXUpscale_v35REMADE"],
+        "required_node_types": [
+            "VHS_LoadVideo",
+            "RTXVideoSuperResolution",
+            "VHS_VideoCombine",
+        ],
+        "required_models": [],
+        "inputs": {
+            "final_scene_video": {"node_id": "1", "input": "video", "placeholder": "__PRODUCTION_FINAL_SCENE__"},
+            "scale_mode": {"node_id": "2", "input": "resize_type"},
+            "scale": {"node_id": "2", "input": "scale"},
+            "quality": {"node_id": "2", "input": "quality"},
+            "fps": {"node_id": "3", "input": "frame_rate"},
+            "filename_prefix": {"node_id": "3", "input": "filename_prefix", "placeholder": "__PRODUCTION_OUTPUT_PREFIX__"},
+            "output": {"node_id": "3", "input": "images"},
+        },
+        "output_node_id": "3",
+        "frozen_settings": {
+            "resize_type": "scale by multiplier",
+            "scale": 2.0,
+            "quality": "ULTRA",
+            "frame_rate": 24,
+            "format": "video/nvenc_h264-mp4",
+            "pix_fmt": "yuv420p",
+            "bitrate": 15,
+            "megabit": True,
+            "save_metadata": False,
+            "save_output": True,
+        },
+        "runtime_policy": {
+            "execution": "RTX_REQUIRED",
+            "note": "RTXVideoSuperResolution executes through NVIDIA nvvfx/CUDA; on runtimes without it the method is truthfully unavailable.",
+        },
+        "structurally_frozen": [
+            "workflow file and method identity",
+            "node types and IDs",
+            "Final Scene video input patch point",
+            "scale-by-multiplier 2.0 ULTRA upscaler settings",
+            "24 fps nvenc H.264 output contract",
+            "no audio input into the graph (authoritative audio remuxed by the Builder)",
+        ],
+    },
+    POSTPROCESS_METHOD_SEEDVR2_QUALITY: {
+        "method": POSTPROCESS_METHOD_SEEDVR2_QUALITY,
+        "label": POSTPROCESS_METHOD_LABELS[POSTPROCESS_METHOD_SEEDVR2_QUALITY],
+        "workflow_id": "production_upscale_seedvr2_quality_v1",
+        "workflow_file": "upscale_seedvr2_quality_api.json",
+        "donor_basis": ["minimaxH3WithSEEDVR2Upscaler_v4"],
+        "required_node_types": [
+            "VHS_LoadVideo",
+            "SeedVR2LoadDiTModel",
+            "SeedVR2LoadVAEModel",
+            "SeedVR2VideoUpscaler",
+            "VHS_VideoCombine",
+        ],
+        "required_models": [
+            {
+                "role": "seedvr2_dit",
+                "category": "diffusion_models",
+                "filename": "seedvr2_ema_7b-Q4_K_M.gguf",
+                "node_id": "2",
+                "input": "model",
+                "node_type": "SeedVR2LoadDiTModel",
+            },
+            {
+                "role": "seedvr2_vae",
+                "category": "vae",
+                "filename": "ema_vae_fp16.safetensors",
+                "node_id": "3",
+                "input": "model",
+                "node_type": "SeedVR2LoadVAEModel",
+            },
+        ],
+        "inputs": {
+            "final_scene_video": {"node_id": "1", "input": "video", "placeholder": "__PRODUCTION_FINAL_SCENE__"},
+            "resolution": {"node_id": "4", "input": "resolution"},
+            "max_resolution": {"node_id": "4", "input": "max_resolution"},
+            "seed": {"node_id": "4", "input": "seed"},
+            "fps": {"node_id": "5", "input": "frame_rate"},
+            "filename_prefix": {"node_id": "5", "input": "filename_prefix", "placeholder": "__PRODUCTION_OUTPUT_PREFIX__"},
+            "output": {"node_id": "5", "input": "images"},
+        },
+        "output_node_id": "5",
+        "frozen_settings": {
+            "dit_device": "cuda:0",
+            "dit_blocks_to_swap": 36,
+            "dit_swap_io_components": True,
+            "dit_offload_device": "cpu",
+            "dit_cache_model": False,
+            "dit_attention_mode": "sageattn_2",
+            "vae_device": "cuda:0",
+            "vae_encode_tiled": True,
+            "vae_encode_tile_size": 512,
+            "vae_encode_tile_overlap": 64,
+            "vae_decode_tiled": True,
+            "vae_decode_tile_size": 512,
+            "vae_decode_tile_overlap": 64,
+            "vae_offload_device": "cpu",
+            "vae_cache_model": False,
+            "seed": 0,
+            "batch_size": 53,
+            "uniform_batch_size": False,
+            "color_correction": "lab",
+            "temporal_overlap": 4,
+            "prepend_frames": 0,
+            "input_noise_scale": 0,
+            "latent_noise_scale": 0,
+            "upscaler_offload_device": "cpu",
+            "enable_debug": False,
+            "frame_rate": 24,
+            "format": "video/nvenc_h264-mp4",
+            "pix_fmt": "yuv420p",
+            "bitrate": 15,
+            "megabit": True,
+            "save_metadata": False,
+            "save_output": True,
+        },
+        "resource_policy": {
+            "unload_before": "H3 models must be released/unloaded before SeedVR2 where the runtime requires it.",
+            "release_after_scene": "cache_model is frozen false; per-scene temporary workspaces are cleaned by the Builder.",
+            "qualification": "PENDING_RTX_LIVE on RTX 4080 SUPER 16 GB / 32 GB system RAM",
+        },
+        "runtime_policy": {
+            "execution": "RTX_QUALIFICATION_PENDING",
+            "note": "SeedVR2 remains structurally supported; live VRAM/quality qualification on the RTX production machine is required before production use.",
+        },
+        "structurally_frozen": [
+            "workflow file and method identity",
+            "node types and IDs",
+            "Final Scene video input patch point",
+            "donor DiT/VAE loader settings (Q4_K_M 7B GGUF, 36 block swaps, tiled VAE 512/64, CPU offload, sageattn_2)",
+            "24 fps nvenc H.264 output contract",
+            "no audio input into the graph (authoritative audio remuxed by the Builder)",
+        ],
+    },
+}
+
+
+def production_postprocess_manifest_registry() -> dict[str, dict[str, object]]:
+    return deepcopy(PRODUCTION_POSTPROCESS_MANIFESTS)
+
+
+def validate_postprocess_workflow_contract() -> dict[str, dict[str, object]]:
+    """Validate the frozen production post-processing templates and manifests."""
+
+    if set(PRODUCTION_POSTPROCESS_MANIFESTS) != {
+        POSTPROCESS_METHOD_RTX_VSR_FAST,
+        POSTPROCESS_METHOD_SEEDVR2_QUALITY,
+    }:
+        raise ProjectValidationError("Post-process manifest registry must contain exactly the two ComfyUI-backed upscale methods.")
+    validated: dict[str, dict[str, object]] = {}
+    for method, manifest in PRODUCTION_POSTPROCESS_MANIFESTS.items():
+        workflow = _load_workflow(manifest)
+        _validate_postprocess_workflow(manifest, workflow)
+        validated[method] = {
+            "workflow_id": manifest["workflow_id"],
+            "workflow_file": manifest["workflow_file"],
+            "node_count": len(workflow),
+            "required_node_types": list(manifest["required_node_types"]),
+            "required_models": deepcopy(manifest["required_models"]),
+            "output_node_id": manifest["output_node_id"],
+            "frozen_settings": deepcopy(manifest["frozen_settings"]),
+        }
+    return validated
+
+
+def _validate_postprocess_workflow(manifest: dict[str, object], workflow: dict[str, dict[str, object]]) -> None:
+    # Exact node inventory: no donor debug/preview/LTX/RIFE/generation branches.
+    expected_types = {str(node_id): node_type for node_id, node_type in zip(
+        [node_id for node_id in workflow],
+        [node["class_type"] for node in workflow.values()],
+    )}
+    if sorted(expected_types.values()) != sorted(manifest["required_node_types"]):
+        raise ProjectValidationError(f"{manifest['workflow_id']} node inventory does not match the frozen manifest.")
+
+    for mapping in manifest["inputs"].values():
+        _check_mapping(workflow, mapping, "Post-process input")
+
+    # The video input comes from the materialized Final Scene only.
+    video_mapping = manifest["inputs"]["final_scene_video"]
+    video_node = _node(workflow, video_mapping["node_id"], "Final Scene input")
+    if video_node["inputs"].get("video") != video_mapping["placeholder"]:
+        raise ProjectValidationError("Final Scene video input must remain the owned placeholder.")
+
+    # Output node contract.
+    output_node = _node(workflow, manifest["output_node_id"], "Post-process output")
+    if output_node["class_type"] != "VHS_VideoCombine":
+        raise ProjectValidationError("Post-process output node must be VHS_VideoCombine.")
+    frozen = manifest["frozen_settings"]
+    output_inputs = output_node["inputs"]
+    for input_name, expected in (
+        ("frame_rate", frozen["frame_rate"]),
+        ("format", frozen["format"]),
+        ("pix_fmt", frozen["pix_fmt"]),
+        ("bitrate", frozen["bitrate"]),
+        ("megabit", frozen["megabit"]),
+        ("save_metadata", frozen["save_metadata"]),
+        ("save_output", frozen["save_output"]),
+    ):
+        if output_inputs.get(input_name) != expected:
+            raise ProjectValidationError(f"Post-process output setting {input_name} is not frozen.")
+    if output_inputs.get("filename_prefix") != manifest["inputs"]["filename_prefix"]["placeholder"]:
+        raise ProjectValidationError("Post-process output prefix must remain the owned placeholder.")
+    if "audio" in output_inputs:
+        raise ProjectValidationError("Post-processing graphs must not carry audio; authoritative audio is remuxed by the Builder.")
+
+    # Method-specific frozen cores.
+    if manifest["method"] == POSTPROCESS_METHOD_RTX_VSR_FAST:
+        upscaler = _node(workflow, "2", "RTX VSR upscaler")
+        if upscaler["inputs"].get("images") != ["1", 0]:
+            raise ProjectValidationError("RTX VSR must consume the Final Scene frame stream.")
+        for input_name, expected in (
+            ("resize_type", frozen["resize_type"]),
+            ("scale", frozen["scale"]),
+            ("quality", frozen["quality"]),
+        ):
+            if upscaler["inputs"].get(input_name) != expected:
+                raise ProjectValidationError(f"RTX VSR setting {input_name} is not frozen.")
+    elif manifest["method"] == POSTPROCESS_METHOD_SEEDVR2_QUALITY:
+        upscaler = _node(workflow, "4", "SeedVR2 upscaler")
+        if upscaler["inputs"].get("image") != ["1", 0]:
+            raise ProjectValidationError("SeedVR2 must consume the Final Scene frame stream.")
+        if upscaler["inputs"].get("dit") != ["2", 0] or upscaler["inputs"].get("vae") != ["3", 0]:
+            raise ProjectValidationError("SeedVR2 must consume the frozen DiT/VAE loaders.")
+        for input_name, expected in (
+            ("seed", frozen["seed"]),
+            ("batch_size", frozen["batch_size"]),
+            ("uniform_batch_size", frozen["uniform_batch_size"]),
+            ("color_correction", frozen["color_correction"]),
+            ("temporal_overlap", frozen["temporal_overlap"]),
+            ("offload_device", frozen["upscaler_offload_device"]),
+            ("enable_debug", frozen["enable_debug"]),
+        ):
+            if upscaler["inputs"].get(input_name) != expected:
+                raise ProjectValidationError(f"SeedVR2 setting {input_name} is not frozen.")
+        dit = _node(workflow, "2", "SeedVR2 DiT loader")
+        for input_name, expected in (
+            ("model", manifest["required_models"][0]["filename"]),
+            ("blocks_to_swap", frozen["dit_blocks_to_swap"]),
+            ("swap_io_components", frozen["dit_swap_io_components"]),
+            ("offload_device", frozen["dit_offload_device"]),
+            ("cache_model", frozen["dit_cache_model"]),
+            ("attention_mode", frozen["dit_attention_mode"]),
+        ):
+            if dit["inputs"].get(input_name) != expected:
+                raise ProjectValidationError(f"SeedVR2 DiT loader setting {input_name} is not frozen.")
+        vae = _node(workflow, "3", "SeedVR2 VAE loader")
+        for input_name, expected in (
+            ("model", manifest["required_models"][1]["filename"]),
+            ("encode_tiled", frozen["vae_encode_tiled"]),
+            ("encode_tile_size", frozen["vae_encode_tile_size"]),
+            ("encode_tile_overlap", frozen["vae_encode_tile_overlap"]),
+            ("decode_tiled", frozen["vae_decode_tiled"]),
+            ("decode_tile_size", frozen["vae_decode_tile_size"]),
+            ("decode_tile_overlap", frozen["vae_decode_tile_overlap"]),
+            ("offload_device", frozen["vae_offload_device"]),
+            ("cache_model", frozen["vae_cache_model"]),
+        ):
+            if vae["inputs"].get(input_name) != expected:
+                raise ProjectValidationError(f"SeedVR2 VAE loader setting {input_name} is not frozen.")
+
+    # Forbidden donor branches must never appear in production post-processing.
+    forbidden_markers = ("ltx", "rife", "film", "interpol", "ollama", "lora", "rgthree", "preview", "markdown", "note")
+    for node in workflow.values():
+        class_type = str(node["class_type"]).lower()
+        for marker in forbidden_markers:
+            if marker in class_type:
+                raise ProjectValidationError(f"Post-processing workflow contains forbidden node type {node['class_type']}.")
+        for value in node["inputs"].values():
+            if isinstance(value, str):
+                lowered = value.lower()
+                if "ltx" in lowered or "rife" in lowered or "ollama" in lowered:
+                    raise ProjectValidationError("Post-processing workflow contains a forbidden donor branch reference.")

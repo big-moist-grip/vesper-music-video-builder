@@ -2511,7 +2511,77 @@ remains intentionally open: it requires natural real batch-production evidence
 proving a batch-owned H3 success auto-associates its raw output, auto-finalizes
 to Final Scene READY, and the batch advances to the next scene. Neither is a
 Phase 8D checkpoint blocker, and no long render is forced solely to close them.
-Phase 8E remains the Resolve/export production handoff and is not started.
+
+---
+
+## Phase 8E.1 — Upscale Workflow Qualification and Production Contract
+
+Phase 8E.1 establishes the authoritative post-processing and upscale workflow
+contracts, production resolution policy, and backend lifecycle foundation for
+the Vesper Music Video Builder.
+
+### Authoritative Post-Processing Methods
+
+The production pipeline defines exactly three supported options:
+1. `none` (`None`): Native resolution pass-through. Directly resolves to the
+   current Final Scene artifact without ComfyUI submission or re-encoding.
+2. `rtx_vsr_fast` (`RTX VSR — Fast`): Hardware-accelerated spatial upscaling
+   via NVIDIA RTX Video Super Resolution (`RTXVideoSuperResolution` node).
+   Produces exact 2× spatial upscale (1920x1088, multiple of 8) at 24 FPS.
+3. `seedvr2_quality` (`SeedVR2 — Quality`): High-quality diffusion-based
+   spatial upscaling via SeedVR2 DiT and VAE. Frozen configuration with 36
+   block CPU offloading, no cache, tiled VAE (512x512 with 64 overlap), and
+   temporal overlap of 4. Produces exact 2× spatial upscale (1920x1088) at 24 FPS.
+
+Alternative upscale algorithms (Real-ESRGAN, ESRGAN, Topaz, generic FFmpeg)
+and temporal interpolators (RIFE, FILM) are strictly excluded from the
+production contract.
+
+### Donor Provenance vs Installed Runtime Evidence
+
+- Named community donor workflows (`minimaxH3EZTurboOptimalRTXUpscale_v35REMADE`,
+  `minimaxH3WithSEEDVR2Upscaler_v4`, `minimaxH3Ref2vaAllInputsTurboMode_beta`)
+  are `NOT_LOCATED` as standalone files in the repository or accessible workspace.
+- Installed runtime contracts (`RTXVideoSuperResolution` in `comfyui_nvidia_rtx_nodes`
+  and `SeedVR2*` custom nodes) are directly verified and independently authoritative (`PASS`).
+
+### Production Resolution Policy
+
+- Native Source: 960x544, 24 FPS (source aspect ratio is mathematically 30:17).
+- Target Dimensions: 1920x1088 (exact 2.0× spatial multiplier, mathematically 30:17,
+  mod-8-safe dimensions).
+- Source aspect ratio (30:17) is strictly preserved with zero crop and zero stretch.
+- 24 FPS temporal authority is strictly enforced across all methods.
+- Temporal & Frame-Count Authority: Output video frame count must strictly match
+  Final Scene frame count (`output_frame_count == final_scene_frame_count`). Video
+  duration tolerance is bounded at most one video frame (≤ 42 ms at 24 FPS).
+- Audio Authority: Upscaled video candidates are remuxed with the source Final
+  Scene's AAC audio stream (`-map 0:v:0 -map 1:a:0 -c:v copy -c:a copy`) with
+  audio tolerance separately governed (2 AAC frames).
+
+### Backend Lifecycle & Failure Isolation
+
+- Production Scene is a distinct stage downstream of Final Scene:
+  `Raw H3` -> `Final Scene` -> `Production Scene`.
+- Modifying project upscale method invalidates only the Production Scene;
+  Raw H3 and Final Scene remain intact.
+- Upscale failure isolates to `renders/<scene_id>/production/production.json`
+  and does not invalidate Raw H3 or Final Scene.
+- Lazy capability probing detects node and model availability truthfully without
+  globally blocking AMD dev hardware.
+
+### Manual Test Statuses (Phase 8E.1)
+
+- MT-77 — Upscale Production Contract / Native Mode — PASS_STRUCTURAL
+- MT-78 — RTX VSR Fast Live Qualification — PENDING_RTX_LIVE
+- MT-79 — SeedVR2 Quality Live Qualification — PENDING_RTX_LIVE
+- MT-80 — Production Scene Currentness / Failure Isolation — PASS_STRUCTURAL
+- MT-81 — Production Upscale UI / Selection — PENDING_LATER_UI
+
+### Next Steps
+
+- **Phase 8E.2:** Production Upscale UI / Batch Orchestration Integration (frontend upscale selector, batch postprocess execution to Production Scene READY).
+- **Phase 8F:** Resolve handoff and final production export (scenes.csv, deterministic naming, concatenation).
 
 ---
 
