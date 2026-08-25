@@ -27,12 +27,15 @@ LEGACY_SCHEMA_VERSION_4 = 4
 LEGACY_SCHEMA_VERSION_5 = 5
 LEGACY_SCHEMA_VERSION_6 = 6
 PROJECT_FILENAME = "project.json"
-DEFAULT_PROJECTS_ROOT = Path(
+LEGACY_DEFAULT_PROJECTS_ROOT = Path(
     r"D:\User Folders\Documents\Projects\vesper-music-video-builder\projects"
 )
-DEFAULT_STATE_ROOT = Path(
+LEGACY_DEFAULT_STATE_ROOT = Path(
     r"D:\User Folders\Documents\Projects\vesper-music-video-builder\state"
 )
+DEFAULT_STORAGE_ROOT = Path.home() / ".vesper-music-video-builder"
+DEFAULT_PROJECTS_ROOT = DEFAULT_STORAGE_ROOT / "projects"
+DEFAULT_STATE_ROOT = DEFAULT_STORAGE_ROOT / "state"
 INVALID_PROJECT_STATE_FILENAME = "ignored_invalid_projects.json"
 INVALID_PROJECT_STATE_VERSION = 1
 REQUIRED_PROJECT_DIRECTORIES = (
@@ -81,6 +84,26 @@ PROMPT_FIELDS = LEGACY_PROMPT_FIELDS + ("relay_fingerprint",)
 PROMPT_SCENE_FIELDS = ("scene_id", "keyframe_i2v", "reference2video")
 PROMPTS_FIELDS = ("scenes",)
 PROMPT_MAX_LENGTH = 50_000
+
+
+def _legacy_default_root_is_available() -> bool:
+    """Return whether the old default contains an existing project root."""
+
+    root = LEGACY_DEFAULT_PROJECTS_ROOT
+    try:
+        if not root.is_absolute() or not Path(root.anchor).exists():
+            return False
+        return root.is_dir()
+    except OSError:
+        return False
+
+
+def _resolve_default_projects_root() -> Path:
+    """Prefer an existing legacy root; otherwise use the portable default."""
+
+    if _legacy_default_root_is_available():
+        return LEGACY_DEFAULT_PROJECTS_ROOT
+    return DEFAULT_PROJECTS_ROOT
 
 
 def _empty_story_direction() -> dict[str, str]:
@@ -884,12 +907,18 @@ class ProjectStorage:
 
     def __init__(
         self,
-        projects_root: str | Path = DEFAULT_PROJECTS_ROOT,
+        projects_root: str | Path | None = None,
         state_root: str | Path | None = None,
     ):
-        self.projects_root = Path(projects_root)
+        self.projects_root = (
+            _resolve_default_projects_root()
+            if projects_root is None
+            else Path(projects_root)
+        )
         if state_root is not None:
             self.state_root = Path(state_root)
+        elif self.projects_root == LEGACY_DEFAULT_PROJECTS_ROOT:
+            self.state_root = LEGACY_DEFAULT_STATE_ROOT
         elif self.projects_root == DEFAULT_PROJECTS_ROOT:
             self.state_root = DEFAULT_STATE_ROOT
         else:
@@ -931,7 +960,9 @@ class ProjectStorage:
             raise
         except OSError as error:
             self._clean_incomplete_directory(project_directory, project_file, created_directory)
-            raise ProjectPersistenceError("Could not create project storage.") from error
+            raise ProjectPersistenceError(
+                f"Could not create project storage at {self.projects_root}: {error}"
+            ) from error
 
     def project_directory(self, project_id: object) -> Path:
         canonical_id = validate_project_id(project_id)

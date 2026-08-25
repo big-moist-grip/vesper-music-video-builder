@@ -761,8 +761,15 @@ def register_routes():
             project = PROJECT_STORAGE.create_project(payload["name"])
         except ProjectValidationError as error:
             return api_error(str(error), 400)
-        except ProjectPersistenceError:
-            LOGGER.exception("Could not create Music Video Builder project.")
+        except ProjectPersistenceError as error:
+            LOGGER.exception(
+                "Could not create Music Video Builder project at projects_root=%s "
+                "(state_root=%s): %s; underlying=%r",
+                PROJECT_STORAGE.projects_root,
+                PROJECT_STORAGE.state_root,
+                error,
+                error.__cause__,
+            )
             return api_error("Project could not be created.", 500)
         return web.json_response(project, status=201)
 
