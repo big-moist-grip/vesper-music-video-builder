@@ -30,7 +30,7 @@ import re
 import shutil
 import subprocess
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping
 
 from .projects import (
@@ -59,6 +59,8 @@ from .render_jobs import (
     SUCCEEDED,
     ComfyUIClient,
     ComfyUIClientError,
+    _default_comfy_output_root,
+    _safe_relative_output,
     discover_raw_output,
     RenderOutputDiscoveryError,
     sanitize_user_facing_message,
@@ -140,6 +142,7 @@ POSTPROCESS_JOB_STATES = frozenset({
 })
 POSTPROCESS_ACTIVE_STATES = frozenset({POSTPROCESS_SUBMITTING, POSTPROCESS_SUBMITTED, POSTPROCESS_ACTIVE})
 POSTPROCESS_TERMINAL_STATES = frozenset({POSTPROCESS_SUCCEEDED, POSTPROCESS_FAILED, POSTPROCESS_CANCELLED})
+POSTPROCESS_ORPHAN_CONFIRMATION_ATTEMPTS = 2
 
 # Method availability states.
 METHOD_AVAILABLE = "AVAILABLE"
@@ -509,6 +512,83 @@ def _production_current_path(root: Path, scene_id: str) -> Path:
     return path
 
 
+def _safe_project_relative_path(root: Path, relative_path: object) -> tuple[Path, str]:
+    """Resolve a project-owned relative artifact path without following escapes."""
+
+    if not isinstance(relative_path, str) or not relative_path.strip():
+        raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The production scene output path is invalid.")
+    normalized = relative_path.replace("\\", "/").strip()
+    raw_parts = normalized.split("/")
+    path = PurePosixPath(normalized)
+    if (
+        path.is_absolute()
+        or not raw_parts
+        or any(not part or part in {".", ".."} for part in raw_parts)
+        or ":" in raw_parts[0]
+    ):
+        raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The production scene output path is unsafe.")
+    candidate = root.joinpath(*raw_parts)
+    current = root
+    for part in raw_parts:
+        current = current / part
+        if current.is_symlink():
+            raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The production scene output path contains a symlink.")
+    try:
+        resolved = candidate.resolve(strict=False)
+        root_resolved = root.resolve(strict=True)
+    except OSError as error:
+        raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The production scene output path could not be verified safely.") from error
+    if resolved != root_resolved and root_resolved not in resolved.parents:
+        raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The production scene output path is outside the project workspace.")
+    return candidate, "/".join(raw_parts)
+
+
+def _production_file_identity(path: Path, *, relative_path: str) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise RenderProductionError("PRODUCTION_OUTPUT_MISSING", "The Production Scene output file is missing or unsafe.")
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        size = path.stat().st_size
+    except OSError as error:
+        raise RenderProductionError("PRODUCTION_OUTPUT_UNREADABLE", "The Production Scene output file could not be read safely.") from error
+    return {"relative_path": relative_path, "size": size, "sha256": digest.hexdigest()}
+
+
+def _production_identity_matches(expected: object, actual: Mapping[str, object]) -> bool:
+    if not isinstance(expected, Mapping):
+        return False
+    return (
+        expected.get("relative_path") == actual.get("relative_path")
+        and expected.get("size") == actual.get("size")
+        and expected.get("sha256") == actual.get("sha256")
+    )
+
+
+def _postprocess_job_absence_confirmations(record: Mapping[str, object]) -> int:
+    transitions = record.get("transitions")
+    if not isinstance(transitions, list):
+        return 0
+    count = 0
+    for transition in reversed(transitions):
+        if not isinstance(transition, Mapping) or transition.get("reason") != "prompt_missing_from_queue_and_history":
+            break
+        count += 1
+    return count
+
+
+def _postprocess_failure_document(code: str, message: str, *, details: Mapping[str, object] | None = None) -> dict[str, object]:
+    result: dict[str, object] = {"category": "postprocess_reconciliation_failure", "code": code, "message": message}
+    if details:
+        result["details"] = deepcopy(dict(details))
+    return result
+
+
 def _postprocess_job_directory(root: Path, scene_id: str, *, create: bool = True) -> Path:
     production = _production_directory(root, scene_id, create=create)
     jobs = production / POSTPROCESS_JOB_DIRECTORY
@@ -591,6 +671,14 @@ def summarize_production_scene(
         and finalization.get("raw_current") is True
         and isinstance(finalization.get("output"), Mapping)
     )
+    if final_current:
+        final_output = finalization["output"]
+        try:
+            final_path, final_relative = _safe_project_relative_path(root, final_output.get("relative_path"))
+            final_identity = _production_file_identity(final_path, relative_path=final_relative)
+            final_current = _production_identity_matches(final_output.get("identity"), final_identity)
+        except RenderProductionError:
+            final_current = False
     result: dict[str, object] = {
         "production_schema_version": PRODUCTION_SCHEMA_VERSION,
         "project_id": canonical_project_id,
@@ -634,9 +722,16 @@ def summarize_production_scene(
     if not isinstance(output, Mapping) or not isinstance(output.get("relative_path"), str):
         result["state"] = PRODUCTION_NEEDS_POSTPROCESS
         return result
-    output_path = root / str(output["relative_path"])
-    if output_path.is_symlink() or not output_path.is_file():
-        result["state"] = PRODUCTION_NEEDS_POSTPROCESS
+    try:
+        output_path, output_relative = _safe_project_relative_path(root, output.get("relative_path"))
+        actual_identity = _production_file_identity(output_path, relative_path=output_relative)
+    except RenderProductionError as error:
+        result["state"] = PRODUCTION_NEEDS_POSTPROCESS if error.code == "PRODUCTION_OUTPUT_MISSING" else PRODUCTION_STALE
+        result["postprocess_job_id"] = current.get("postprocess_job_id")
+        return result
+    if not _production_identity_matches(output.get("identity"), actual_identity):
+        result["state"] = PRODUCTION_STALE
+        result["postprocess_job_id"] = current.get("postprocess_job_id")
         return result
     result["state"] = PRODUCTION_CURRENT
     result["output"] = deepcopy(dict(output))
@@ -704,8 +799,20 @@ def transition_postprocess_job(
     return normalized
 
 
+def _normalize_postprocess_job_record(record: Mapping[str, object]) -> dict[str, object]:
+    """Keep derived reconciliation/output projections transient without a schema bump."""
+
+    normalized = deepcopy(dict(record))
+    normalized.pop("reconciliation", None)
+    normalized.pop("output_association", None)
+    normalized.pop("source_association", None)
+    normalized.pop("source_current", None)
+    normalized.pop("finalization_allowed", None)
+    return normalized
+
+
 def sanitize_postprocess_job_record_for_presentation(record: Mapping[str, object]) -> dict[str, object]:
-    pjob = deepcopy(dict(record))
+    pjob = _normalize_postprocess_job_record(record)
     failure = pjob.get("failure")
     if isinstance(failure, Mapping):
         f_copy = deepcopy(dict(failure))
@@ -725,24 +832,25 @@ class PostprocessJobStore:
         return self.storage.project_directory(project_id).resolve(strict=True)
 
     def save(self, record: Mapping[str, object]) -> dict[str, object]:
-        project_id = validate_project_id(record.get("project_id"))
-        scene_id = validate_entity_id(record.get("scene_id"), "Scene ID")
-        job_id = record.get("postprocess_job_id")
+        normalized = _normalize_postprocess_job_record(record)
+        project_id = validate_project_id(normalized.get("project_id"))
+        scene_id = validate_entity_id(normalized.get("scene_id"), "Scene ID")
+        job_id = normalized.get("postprocess_job_id")
         if not isinstance(job_id, str) or not POSTPROCESS_JOB_FILENAME_PATTERN.fullmatch(f"{job_id}.json"):
             raise RenderProductionError("POSTPROCESS_JOB_INVALID", "The post-process job identity is invalid.")
-        if record.get("state") not in POSTPROCESS_JOB_STATES:
+        if normalized.get("state") not in POSTPROCESS_JOB_STATES:
             raise RenderProductionError("POSTPROCESS_JOB_INVALID", "The post-process job state is invalid.")
         directory = _postprocess_job_directory(self._root(project_id), scene_id)
         path = directory / f"{job_id}.json"
         if path.is_symlink():
             raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The post-process job record is a symlink.")
         try:
-            atomic_write_json(path, dict(record))
+            atomic_write_json(path, normalized)
         except ProjectPersistenceError:
             raise
         except OSError as error:
             raise ProjectPersistenceError("Could not persist the post-process job record atomically.") from error
-        return deepcopy(dict(record))
+        return deepcopy(normalized)
 
     def load(self, project_id: object, scene_id: object, job_id: object) -> dict[str, object]:
         canonical_project_id = validate_project_id(project_id)
@@ -959,13 +1067,31 @@ def promote_production_scene(
     canonical_scene_id = validate_entity_id(scene_id, "Scene ID")
     canonical = validate_production_method(method)
     root = storage.project_directory(canonical_project_id).resolve(strict=True)
-    canonical_path = root / relative_path
+    canonical_path, normalized_relative = _safe_project_relative_path(root, relative_path)
+    expected_prefix = f"renders/{canonical_scene_id}/{PRODUCTION_DIRECTORY}/"
+    if not normalized_relative.startswith(expected_prefix):
+        raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The production scene output path is not owned by this scene.")
+    candidate = Path(candidate_path)
+    if candidate.is_symlink() or not candidate.is_file():
+        raise RenderProductionError("PRODUCTION_PROMOTION_FAILED", "The production scene candidate is missing or unsafe.")
+    try:
+        candidate_resolved = candidate.resolve(strict=True)
+        root_resolved = root.resolve(strict=True)
+    except OSError as error:
+        raise RenderProductionError("PRODUCTION_PROMOTION_FAILED", "The production scene candidate could not be verified safely.") from error
+    if root_resolved not in candidate_resolved.parents:
+        raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The production scene candidate is outside the project workspace.")
+    current_candidate = candidate
+    while current_candidate != root:
+        if current_candidate.is_symlink():
+            raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The production scene candidate path contains a symlink.")
+        current_candidate = current_candidate.parent
     if canonical_path.is_symlink():
         raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The production scene output path is unsafe.")
     canonical_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = canonical_path.with_name(f".{canonical_path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with candidate_path.open("rb") as source, temporary_path.open("xb") as destination:
+        with candidate.open("rb") as source, temporary_path.open("xb") as destination:
             shutil.copyfileobj(source, destination, 1024 * 1024)
             destination.flush()
             if hasattr(os, "fsync"):
@@ -990,8 +1116,8 @@ def promote_production_scene(
         "postprocess_job_id": postprocess_job_id,
         "updated_at": _timestamp(),
         "output": {
-            "relative_path": relative_path,
-            "identity": {"relative_path": relative_path, "size": size, "sha256": sha256},
+            "relative_path": normalized_relative,
+            "identity": {"relative_path": normalized_relative, "size": size, "sha256": sha256},
             "format": "mp4",
         },
         "validation": dict(validation),
@@ -1155,6 +1281,130 @@ def submit_postprocess_job(
     return store.save(submitted)
 
 
+def _resolve_postprocess_output_path(
+    output: Mapping[str, object],
+    *,
+    raw_output_root: Path | None,
+) -> Path:
+    """Resolve a discovered post-process output without trusting host paths."""
+
+    output_root = Path(raw_output_root) if raw_output_root is not None else _default_comfy_output_root()
+    if output_root.is_symlink() or not output_root.is_dir():
+        raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The ComfyUI output root is unavailable or unsafe.")
+    output_root = output_root.resolve(strict=True)
+    if isinstance(output.get("local_path"), str):
+        relative_output = output.get("relative_path")
+        if not isinstance(relative_output, str):
+            raise RenderProductionError("POSTPROCESS_OUTPUT_UNSAFE", "The post-process output lacks an owned relative path.")
+        local_candidate = Path(str(output["local_path"]))
+        if not local_candidate.is_absolute():
+            local_candidate = output_root / local_candidate
+        if local_candidate.is_symlink() or not local_candidate.is_file():
+            raise RenderProductionError("POSTPROCESS_OUTPUT_MISSING", "The upscaled output file does not exist or is unsafe.")
+        try:
+            relative_candidate = local_candidate.relative_to(output_root)
+        except ValueError as error:
+            raise RenderProductionError("POSTPROCESS_OUTPUT_UNSAFE", "The post-process output is outside the ComfyUI output root.") from error
+        current = output_root
+        for part in relative_candidate.parts:
+            current = current / part
+            if current.is_symlink():
+                raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The post-process output path contains a symlink.")
+        resolved_candidate = local_candidate.resolve(strict=True)
+        if resolved_candidate == output_root or output_root not in resolved_candidate.parents:
+            raise RenderProductionError("PRODUCTION_PATH_UNSAFE", "The post-process output is outside the ComfyUI output root.")
+        normalized_relative = relative_output.replace("\\", "/")
+        try:
+            expected_path, expected_relative = _safe_relative_output(
+                output_root,
+                PurePosixPath(normalized_relative).parent.as_posix(),
+                PurePosixPath(normalized_relative).name,
+            )
+        except RenderOutputDiscoveryError as error:
+            raise RenderProductionError(error.code, error.message) from error
+        if expected_relative != normalized_relative or expected_path != resolved_candidate:
+            raise RenderProductionError("POSTPROCESS_OUTPUT_UNSAFE", "The post-process output path is not owned by its association.")
+        return resolved_candidate
+    if isinstance(output.get("relative_path"), str):
+        relative_output = str(output["relative_path"]).replace("\\", "/")
+        try:
+            resolved, _relative = _safe_relative_output(
+                output_root,
+                PurePosixPath(relative_output).parent.as_posix(),
+                PurePosixPath(relative_output).name,
+            )
+        except RenderOutputDiscoveryError as error:
+            raise RenderProductionError(error.code, error.message) from error
+        return resolved
+    raise RenderProductionError("POSTPROCESS_OUTPUT_MISSING", "The succeeded post-process job has no discovered output.")
+
+
+def _postprocess_output_projection(
+    record: Mapping[str, object],
+    *,
+    output_root: Path | None,
+) -> dict[str, object]:
+    output = record.get("output")
+    if not isinstance(output, Mapping):
+        return {"state": "MISSING", "usable": False, "failure": {"code": "POSTPROCESS_OUTPUT_MISSING", "message": "The succeeded post-process job has no discovered output."}}
+    try:
+        path = _resolve_postprocess_output_path(output, raw_output_root=output_root)
+    except (RenderProductionError, RenderOutputDiscoveryError) as error:
+        state = "STALE" if error.code in {"POSTPROCESS_OUTPUT_MISSING", "OUTPUT_MISSING"} else "UNSAFE" if "UNSAFE" in error.code or "PATH" in error.code else "UNKNOWN"
+        return {"state": state, "usable": False, "failure": {"code": error.code, "message": error.message}}
+    return {"state": "AVAILABLE", "usable": True, "failure": None, "relative_path": output.get("relative_path")}
+
+
+def _postprocess_source_projection(
+    storage: ProjectStorage,
+    record: Mapping[str, object],
+    *,
+    output_root: Path | None,
+) -> dict[str, object]:
+    try:
+        method = validate_production_method(record.get("method"))
+        summary = summarize_production_scene(
+            storage,
+            record.get("project_id"),
+            record.get("scene_id"),
+            method=method,
+            raw_output_root=output_root,
+        )
+        expected_fingerprint = summary.get("fingerprint") if isinstance(summary, Mapping) else None
+        current = summary.get("final_scene_current") is True and expected_fingerprint == record.get("production_fingerprint")
+        return {
+            "state": "CURRENT" if current else "STALE",
+            "usable": current,
+            "failure": None if current else {"code": "POSTPROCESS_SOURCE_STALE", "message": "The post-process job targets an older Final Scene or production method."},
+        }
+    except (ProjectNotFoundError, ProjectValidationError, ProductionMethodUnavailable, RenderProductionError):
+        return {
+            "state": "UNKNOWN",
+            "usable": False,
+            "failure": {"code": "POSTPROCESS_SOURCE_UNKNOWN", "message": "The post-process source could not be revalidated."},
+        }
+
+
+def _attach_postprocess_projection(
+    record: Mapping[str, object],
+    *,
+    output_root: Path | None,
+    storage: ProjectStorage | None = None,
+    reconciliation: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    projected = deepcopy(dict(record))
+    if projected.get("state") == POSTPROCESS_SUCCEEDED:
+        projected["output_association"] = _postprocess_output_projection(projected, output_root=output_root)
+        if storage is not None:
+            source = _postprocess_source_projection(storage, projected, output_root=output_root)
+            projected["source_association"] = source
+            projected["source_current"] = source.get("usable") is True
+            projected["finalization_allowed"] = projected["output_association"].get("usable") is True and projected["source_current"] is True
+    if reconciliation is not None:
+        projected["reconciliation"] = deepcopy(dict(reconciliation))
+    return projected
+
+
 def reconcile_postprocess_job(
     storage: ProjectStorage,
     project_id: object,
@@ -1175,7 +1425,7 @@ def reconcile_postprocess_job(
     store = PostprocessJobStore(storage)
     record = store.load(canonical_project_id, canonical_scene_id, job_id)
     if record.get("state") in POSTPROCESS_TERMINAL_STATES:
-        return record
+        return _attach_postprocess_projection(record, output_root=output_root, storage=storage)
     prompt_id = record.get("comfy_prompt_id")
     if not isinstance(prompt_id, str):
         return store.save(transition_postprocess_job(
@@ -1229,12 +1479,48 @@ def reconcile_postprocess_job(
                         updates["output"] = output
                 elif terminal == POSTPROCESS_FAILED:
                     updates["failure"] = {"category": "postprocess_execution_failure", "code": "COMFYUI_EXECUTION_FAILED", "message": "ComfyUI reported a post-processing execution failure."}
-                return store.save(transition_postprocess_job(record, terminal, reason="history_terminal_result", updates=updates))
+                saved = store.save(transition_postprocess_job(record, terminal, reason="history_terminal_result", updates=updates))
+                return _attach_postprocess_projection(saved, output_root=output_root, storage=storage)
     if prompt_id in running_ids:
-        return store.save(transition_postprocess_job(record, POSTPROCESS_ACTIVE, reason="queue_running"))
+        return store.save(transition_postprocess_job(
+            record,
+            POSTPROCESS_ACTIVE,
+            reason="queue_running",
+        ))
     if prompt_id in pending_ids:
-        return store.save(transition_postprocess_job(record, POSTPROCESS_SUBMITTED, reason="queue_pending"))
-    return record
+        return store.save(transition_postprocess_job(
+            record,
+            POSTPROCESS_SUBMITTED,
+            reason="queue_pending",
+        ))
+
+    absence_attempts = _postprocess_job_absence_confirmations(record) + 1
+    details = {
+        "absence_confirmations": absence_attempts,
+        "required_confirmations": POSTPROCESS_ORPHAN_CONFIRMATION_ATTEMPTS,
+        "last_evidence": "queue_absent_history_absent",
+    }
+    if absence_attempts >= POSTPROCESS_ORPHAN_CONFIRMATION_ATTEMPTS:
+        failed = transition_postprocess_job(
+            record,
+            POSTPROCESS_FAILED,
+            reason="prompt_absent_after_bounded_reconciliation",
+            updates={
+                "failure": _postprocess_failure_document(
+                    "POSTPROCESS_JOB_ORPHANED",
+                    "The previous ComfyUI post-process job is no longer available; retry is available.",
+                    details=details,
+                ),
+            },
+        )
+        saved = store.save(failed)
+        return _attach_postprocess_projection(saved, output_root=output_root, reconciliation={"state": "ORPHANED", **details})
+    saved = store.save(transition_postprocess_job(
+        record,
+        str(record.get("state")),
+        reason="prompt_missing_from_queue_and_history",
+    ))
+    return _attach_postprocess_projection(saved, output_root=output_root, reconciliation={"state": "RECONCILIATION_REQUIRED", **details})
 
 
 def _prompt_ids_in_queue(queue: Mapping[str, object], key: str) -> set[str]:
@@ -1250,6 +1536,60 @@ def _prompt_ids_in_queue(queue: Mapping[str, object], key: str) -> set[str]:
             candidate = item[1]
         if isinstance(candidate, str) and candidate:
             result.add(candidate)
+    return result
+
+
+def reconcile_scene_postprocess_jobs(
+    storage: ProjectStorage,
+    project_id: object,
+    scene_id: object,
+    *,
+    client: ComfyUIClient | None = None,
+    output_root: Path | None = None,
+) -> list[dict[str, object]]:
+    """Reconcile active scene jobs before exposing Production Scene status."""
+
+    canonical_project_id = validate_project_id(project_id)
+    canonical_scene_id = validate_entity_id(scene_id, "Scene ID")
+    store = PostprocessJobStore(storage)
+    records = store.list_scene(canonical_project_id, canonical_scene_id)
+    result: list[dict[str, object]] = []
+    for record in records:
+        if record.get("state") in POSTPROCESS_ACTIVE_STATES:
+            try:
+                record = reconcile_postprocess_job(
+                    storage,
+                    canonical_project_id,
+                    canonical_scene_id,
+                    record.get("postprocess_job_id"),
+                    client=client,
+                    output_root=output_root,
+                )
+            except (ComfyUIClientError, RenderProductionError, ProjectPersistenceError) as error:
+                LOGGER.warning(
+                    "Could not reconcile postprocess status project_id=%s scene_id=%s code=%s",
+                    canonical_project_id,
+                    canonical_scene_id,
+                    getattr(error, "code", type(error).__name__),
+                )
+        elif record.get("state") == POSTPROCESS_SUCCEEDED:
+            try:
+                record = reconcile_postprocess_job(
+                    storage,
+                    canonical_project_id,
+                    canonical_scene_id,
+                    record.get("postprocess_job_id"),
+                    client=client,
+                    output_root=output_root,
+                )
+            except (ComfyUIClientError, RenderProductionError, ProjectPersistenceError) as error:
+                LOGGER.warning(
+                    "Could not revalidate terminal postprocess status project_id=%s scene_id=%s code=%s",
+                    canonical_project_id,
+                    canonical_scene_id,
+                    getattr(error, "code", type(error).__name__),
+                )
+        result.append(record)
     return result
 
 
@@ -1417,7 +1757,10 @@ def materialize_final_scene_for_postprocess(
     relative_path = output.get("relative_path")
     if not isinstance(relative_path, str):
         raise ProductionNotReady("POSTPROCESS_SOURCE_NOT_READY", "Final Scene output path is invalid.")
-    final_scene_path = root / relative_path
+    try:
+        final_scene_path, _normalized_relative = _safe_project_relative_path(root, relative_path)
+    except RenderProductionError as error:
+        raise ProductionNotReady("POSTPROCESS_SOURCE_NOT_READY", "Final Scene output path is unsafe.") from error
     if not final_scene_path.is_file() or final_scene_path.is_symlink():
         raise ProductionNotReady("POSTPROCESS_SOURCE_NOT_READY", "Final Scene output file does not exist.")
 
@@ -1526,19 +1869,7 @@ def finalize_postprocess_job(
     output = record.get("output")
     if not isinstance(output, Mapping):
         raise RenderProductionError("POSTPROCESS_OUTPUT_MISSING", "The succeeded post-process job has no discovered output.")
-    raw_video_path = None
-    if isinstance(output.get("local_path"), str) and Path(str(output.get("local_path"))).is_file():
-        raw_video_path = Path(str(output["local_path"]))
-    elif isinstance(output.get("relative_path"), str):
-        try:
-            from .render_jobs import _default_comfy_output_root
-            output_root = raw_output_root or _default_comfy_output_root()
-        except Exception:
-            output_root = raw_output_root
-        if output_root is not None:
-            raw_video_path = output_root / str(output["relative_path"])
-    if raw_video_path is None or not raw_video_path.is_file():
-        raise RenderProductionError("POSTPROCESS_OUTPUT_MISSING", "The upscaled output file does not exist.")
+    raw_video_path = _resolve_postprocess_output_path(output, raw_output_root=raw_output_root)
 
     root = storage.project_directory(canonical_project_id).resolve(strict=True)
     summary, final_job = _current_final_scene(
@@ -1551,12 +1882,28 @@ def finalize_postprocess_job(
     if not isinstance(summary, Mapping) or summary.get("state") != FINALIZATION_STATE_FINALIZED or not isinstance(summary.get("output"), Mapping):
         raise ProductionNotReady("POSTPROCESS_SOURCE_NOT_READY", "The Final Scene is not current for finalization.")
     final_output = summary["output"]
+    final_identity = final_output.get("identity")
+    current_production_fingerprint = build_production_fingerprint(
+        final_scene_identity=final_identity,
+        method=method,
+    ) if isinstance(final_identity, Mapping) else None
+    if current_production_fingerprint != fingerprint:
+        raise ProductionNotReady("POSTPROCESS_SOURCE_STALE", "The post-process job was prepared for an older Final Scene or production method.")
     final_relative = final_output.get("relative_path")
     if not isinstance(final_relative, str):
         raise ProductionNotReady("POSTPROCESS_SOURCE_NOT_READY", "Final Scene output path is missing.")
-    final_scene_path = root / final_relative
-    if not final_scene_path.is_file():
+    try:
+        final_scene_path, _normalized_final_relative = _safe_project_relative_path(root, final_relative)
+    except RenderProductionError as error:
+        raise ProductionNotReady("POSTPROCESS_SOURCE_NOT_READY", "Final Scene output path is unsafe.") from error
+    if not final_scene_path.is_file() or final_scene_path.is_symlink():
         raise ProductionNotReady("POSTPROCESS_SOURCE_NOT_READY", "Final Scene output file is missing.")
+    try:
+        actual_final_identity = _production_file_identity(final_scene_path, relative_path=_normalized_final_relative)
+    except RenderProductionError as error:
+        raise ProductionNotReady("POSTPROCESS_SOURCE_STALE", "The Final Scene artifact could not be revalidated safely.") from error
+    if not _production_identity_matches(final_identity, actual_final_identity):
+        raise ProductionNotReady("POSTPROCESS_SOURCE_STALE", "The post-process job was prepared for an older Final Scene artifact.")
 
     adapter = media_adapter or ProductionMediaAdapter()
     final_probe = adapter.probe(final_scene_path)
@@ -1657,17 +2004,90 @@ def cancel_postprocess_job(
 
     prompt_id = record.get("comfy_prompt_id")
     comfy = client or ComfyUIClient()
+    cancel_doc: dict[str, object] = {
+        "requested_at": _timestamp(),
+        "api_acknowledged": False,
+        "confirmed": False,
+        "confirmation_state": "UNCONFIRMED",
+        "outcome": "UNCONFIRMED",
+        "evidence": "prompt_id_missing",
+        "mode": "prompt_missing",
+        "api_scope": "none",
+        "error": None,
+    }
     if isinstance(prompt_id, str) and prompt_id:
+        cancel_doc["mode"] = "not_present"
+        cancel_doc["evidence"] = "queue_absent"
         try:
-            comfy.interrupt(prompt_id)
-        except Exception:
-            LOGGER.warning("ComfyUI interrupt failed for postprocess prompt_id=%s", prompt_id)
+            queue = comfy.get_queue()
+            pending_ids = _prompt_ids_in_queue(queue, "queue_pending")
+            running_ids = _prompt_ids_in_queue(queue, "queue_running")
+            if prompt_id in pending_ids:
+                comfy.delete_queued(prompt_id)
+                cancel_doc.update({
+                    "mode": "queued_delete",
+                    "api_acknowledged": True,
+                    "confirmed": True,
+                    "confirmation_state": "CONFIRMED",
+                    "outcome": "CONFIRMED",
+                    "evidence": "queued_delete_acknowledged",
+                    "api_scope": "queued_delete",
+                })
+            elif prompt_id in running_ids:
+                comfy.interrupt_running(prompt_id)
+                cancel_doc.update({
+                    "mode": "running_interrupt",
+                    "api_acknowledged": True,
+                    "confirmed": True,
+                    "confirmation_state": "CONFIRMED",
+                    "outcome": "CONFIRMED",
+                    "evidence": "running_interrupt_acknowledged",
+                    "api_scope": "global_engine_interrupt_targeted_by_prompt_id",
+                })
+            else:
+                try:
+                    from .render_jobs import _history_entry
+                    history = comfy.get_history(prompt_id)
+                    history_entry = _history_entry(history, prompt_id) if isinstance(history, Mapping) else None
+                    if isinstance(history_entry, Mapping):
+                        cancel_doc.update({
+                            "evidence": "history_terminal",
+                            "confirmation_state": "HISTORY_TERMINAL",
+                            "outcome": "NOT_CANCELLED_HISTORY_TERMINAL",
+                        })
+                    else:
+                        cancel_doc["evidence"] = "queue_and_history_absent"
+                except ComfyUIClientError as error:
+                    if error.details.get("http_status") == 404:
+                        cancel_doc["evidence"] = "queue_and_history_absent"
+                    else:
+                        cancel_doc["evidence"] = "history_unavailable"
+                        cancel_doc["outcome"] = "UNCONFIRMED"
+                        cancel_doc["error"] = {"code": error.code, "message": error.message, "transient": error.transient}
+        except ComfyUIClientError as error:
+            cancel_doc["evidence"] = "cancel_operation_failed"
+            cancel_doc["outcome"] = "UNCONFIRMED"
+            cancel_doc["error"] = {"code": error.code, "message": error.message, "transient": error.transient}
+            LOGGER.warning("ComfyUI postprocess cancellation failed prompt_id=%s code=%s", prompt_id, error.code)
+        except Exception as error:  # pragma: no cover - defensive client boundary
+            cancel_doc["evidence"] = "cancel_operation_failed"
+            cancel_doc["outcome"] = "UNCONFIRMED"
+            cancel_doc["error"] = {"code": "COMFYUI_CANCEL_FAILED", "message": "The ComfyUI cancellation operation failed."}
+            LOGGER.warning("ComfyUI postprocess cancellation failed prompt_id=%s: %s", prompt_id, error)
 
+    if cancel_doc.get("confirmed") is not True:
+        reason = "cancel_prompt_absent_history_terminal" if cancel_doc.get("outcome") == "NOT_CANCELLED_HISTORY_TERMINAL" else "cancel_not_confirmed"
+        return store.save(transition_postprocess_job(
+            record,
+            str(current_state),
+            reason=reason,
+            updates={"cancel": cancel_doc},
+        ))
     cancelled = transition_postprocess_job(
         record,
         POSTPROCESS_CANCELLED,
         reason="user_cancelled",
-        updates={"cancelled_at": _timestamp()},
+        updates={"cancelled_at": _timestamp(), "cancel": cancel_doc},
     )
     return store.save(cancelled)
 
@@ -1741,8 +2161,10 @@ def get_project_production_status(
     node_types: set[str] | None = None,
     model_status: Mapping[str, str] | None = None,
     hardware_supported: bool | None = None,
+    client: ComfyUIClient | None = None,
+    raw_output_root: Path | None = None,
 ) -> dict[str, object]:
-    """Aggregate project production settings, runtime method capabilities, and per-scene summaries."""
+    """Aggregate project production settings, reconciling active jobs first."""
 
     canonical_project_id = validate_project_id(project_id)
     project = storage.load_project(canonical_project_id)
@@ -1770,7 +2192,21 @@ def get_project_production_status(
     scene_summaries = []
     for scene in scenes:
         if isinstance(scene, Mapping) and isinstance(scene.get("scene_id"), str):
-            summary = summarize_production_scene(storage, canonical_project_id, scene["scene_id"], method=resolved_method)
+            scene_id = scene["scene_id"]
+            reconcile_scene_postprocess_jobs(
+                storage,
+                canonical_project_id,
+                scene_id,
+                client=client,
+                output_root=raw_output_root,
+            )
+            summary = summarize_production_scene(
+                storage,
+                canonical_project_id,
+                scene_id,
+                method=resolved_method,
+                raw_output_root=raw_output_root,
+            )
             scene_summaries.append(summary)
 
     return {

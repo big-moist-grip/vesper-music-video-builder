@@ -137,6 +137,7 @@ class Phase8CFixture(unittest.TestCase):
                     "format": "video/h264-mp4",
                     "raw_h3_output": True,
                 },
+                "output_discovery": {"state": "AVAILABLE", "failure": None},
             },
         )
         return JobStore(self.storage).save(record)
@@ -251,6 +252,86 @@ class SyntheticFinalizationTests(Phase8CFixture):
         )
         self.assertEqual(state["state"], FINALIZATION_STATE_RAW_READY)
         self.assertTrue(state["eligible"])
+
+    def test_successful_history_without_builder_output_cannot_finalize(self):
+        self._make_audio()
+        record = new_job_record(
+            self.project_id,
+            self.scene_id,
+            "keyframe_i2v",
+            self.preparation_fingerprint,
+            output_node_id="20",
+            expected_filename_prefix="music_video_builder",
+            output_format="video/h264-mp4",
+        )
+        record = transition_job(record, "SUBMITTING", reason="test")
+        record = transition_job(record, "QUEUED", reason="test", updates={"comfy_prompt_id": "missing-output-prompt"})
+        record = transition_job(record, SUCCEEDED, reason="history_success_without_output")
+        JobStore(self.storage).save(record)
+        with self.assertRaises(RenderFinalizationError) as context:
+            finalize_render_job(
+                self.storage,
+                self.project_id,
+                record["job_id"],
+                preflight=self.preflight,
+                raw_output_root=self.raw_root,
+            )
+        self.assertEqual(context.exception.code, "RAW_OUTPUT_UNAVAILABLE")
+        self.assertFalse((self.project_root / "renders" / self.scene_id / "final").exists())
+
+    def test_failed_or_unknown_output_association_cannot_finalize(self):
+        self._make_audio()
+        self._make_raw()
+        store = JobStore(self.storage)
+        for index, discovery in enumerate((
+            {"state": "FAILED", "failure": {"code": "OUTPUT_NODE_MISSING", "message": "missing"}},
+            {"state": "UNKNOWN", "failure": {"code": "OUTPUT_ASSOCIATION_UNKNOWN", "message": "unknown"}},
+        ), start=1):
+            record = new_job_record(
+                self.project_id,
+                self.scene_id,
+                "keyframe_i2v",
+                self.preparation_fingerprint,
+                output_node_id="20",
+                expected_filename_prefix="music_video_builder",
+                output_format="video/h264-mp4",
+            )
+            record = transition_job(record, "SUBMITTING", reason="test")
+            prompt_id = f"association-prompt-{index}"
+            record = transition_job(record, "QUEUED", reason="test", updates={"comfy_prompt_id": prompt_id})
+            record = transition_job(
+                record,
+                SUCCEEDED,
+                reason="test",
+                updates={
+                    "output": {
+                        "prompt_id": prompt_id,
+                        "output_node_id": "20",
+                        "relative_path": self.raw_relative.as_posix(),
+                        "filename": self.raw_path.name,
+                        "subfolder": self.raw_relative.parent.as_posix(),
+                        "format": "video/h264-mp4",
+                        "raw_h3_output": True,
+                    },
+                    "output_discovery": discovery,
+                },
+            )
+            store.save(record)
+            with self.assertRaises(RenderFinalizationError) as context:
+                finalize_render_job(
+                    self.storage,
+                    self.project_id,
+                    record["job_id"],
+                    preflight=self.preflight,
+                    raw_output_root=self.raw_root,
+                )
+            self.assertEqual(context.exception.code, "RAW_OUTPUT_UNAVAILABLE")
+            self.assertEqual(context.exception.details["job_id"], record["job_id"])
+            self.assertEqual(context.exception.details["scene_id"], self.scene_id)
+            expected_state = "MISSING" if discovery["failure"]["code"] == "OUTPUT_NODE_MISSING" else "UNKNOWN"
+            self.assertEqual(context.exception.details["association_state"], expected_state)
+            self.assertIn("failure_reason", context.exception.details)
+            self.assertFalse(context.exception.details["retry_available"])
 
     def test_probe_captures_container_video_audio_dimensions_fps_and_duration(self):
         self._make_audio()
@@ -459,6 +540,9 @@ class SyntheticFinalizationTests(Phase8CFixture):
         self.assertIn("Finalize Scene", extension)
         self.assertIn("FINALIZED", extension)
         self.assertIn("H3 plan", extension)
+        self.assertIn("finalization_error_details", routes)
+        for field in ("job_id", "scene_id", "association_state", "failure_reason", "retry_available"):
+            self.assertIn(field, routes)
 
 
 class ProbeContractTests(unittest.TestCase):

@@ -3,6 +3,7 @@
 import uuid
 from pathlib import Path
 
+from backend.render_jobs import ComfyUIClientError
 from backend.render_production import (
     POSTPROCESS_ACTIVE,
     POSTPROCESS_CANCELLED,
@@ -20,9 +21,11 @@ from backend.render_production import (
     ProductionMethodUnavailable,
     ProductionNotReady,
     RenderProductionError,
+    cancel_postprocess_job,
     compile_postprocess_workflow,
     new_postprocess_job_record,
     reconcile_postprocess_job,
+    reconcile_scene_postprocess_jobs,
     submit_postprocess_job,
     transition_postprocess_job,
 )
@@ -94,8 +97,12 @@ class TestPhase8EJobLifecycleAndStore(Phase8ETestBase):
             "rtx_vsr_fast",
             production_fingerprint="f" * 64,
         )
+        record["reconciliation"] = {"state": "RECONCILIATION_REQUIRED"}
+        record["output_association"] = {"state": "AVAILABLE", "usable": True}
         saved = store.save(record)
         self.assertEqual(saved["postprocess_job_id"], record["postprocess_job_id"])
+        self.assertNotIn("reconciliation", saved)
+        self.assertNotIn("output_association", saved)
 
         loaded = store.load(self.project_id, self.scene_1_id, record["postprocess_job_id"])
         self.assertEqual(loaded["postprocess_job_id"], record["postprocess_job_id"])
@@ -266,6 +273,36 @@ class TestPhase8EReconciliation(Phase8ETestBase):
         self.assertEqual(reconciled_done["state"], POSTPROCESS_SUCCEEDED)
         self.assertIsNotNone(reconciled_done["output"])
         self.assertEqual(reconciled_done["output"]["filename"], "owned_prefix_s1_00001_.mp4")
+        self.assertEqual(reconciled_done["output_association"]["state"], "AVAILABLE")
+        self.assertTrue(reconciled_done["source_current"])
+        self.assertTrue(reconciled_done["finalization_allowed"])
+        final_scene = self.storage.project_directory(self.project_id) / "renders" / self.scene_1_id / "final" / "final_scene.mp4"
+        final_scene.write_bytes(b"CHANGED_FINAL_SCENE")
+        stale_source = reconcile_postprocess_job(
+            self.storage,
+            self.project_id,
+            self.scene_1_id,
+            job_id,
+            client=client,
+            output_root=self.output_root,
+        )
+        self.assertFalse(stale_source["source_current"])
+        self.assertFalse(stale_source["finalization_allowed"])
+        raw_video.unlink()
+        stale = reconcile_postprocess_job(
+            self.storage,
+            self.project_id,
+            self.scene_1_id,
+            job_id,
+            client=client,
+            output_root=self.output_root,
+        )
+        self.assertEqual(stale["state"], POSTPROCESS_SUCCEEDED)
+        self.assertEqual(stale["output_association"]["state"], "STALE")
+        self.assertFalse(stale["output_association"]["usable"])
+        persisted = PostprocessJobStore(self.storage).load(self.project_id, self.scene_1_id, job_id)
+        self.assertNotIn("output_association", persisted)
+        self.assertNotIn("reconciliation", persisted)
 
     def test_reconcile_failure_in_history(self):
         self._setup_final_scene(self.scene_1_id)
@@ -292,3 +329,135 @@ class TestPhase8EReconciliation(Phase8ETestBase):
         reconciled = reconcile_postprocess_job(self.storage, self.project_id, self.scene_1_id, job_id, client=client)
         self.assertEqual(reconciled["state"], POSTPROCESS_FAILED)
         self.assertEqual(reconciled["failure"]["code"], "COMFYUI_EXECUTION_FAILED")
+
+    def test_missing_queue_and_history_becomes_retryable_after_bounded_confirmations(self):
+        self._setup_final_scene(self.scene_1_id)
+        client = FakeComfyClientForPostprocess(prompt_id="prompt-orphan-1")
+        job = submit_postprocess_job(
+            self.storage,
+            self.project_id,
+            self.scene_1_id,
+            method="rtx_vsr_fast",
+            client=client,
+            final_scene_selector="video.mp4",
+            output_prefix="orphan_prefix",
+            node_types={"VHS_LoadVideo", "RTXVideoSuperResolution", "VHS_VideoCombine"},
+            hardware_supported=True,
+        )
+        first = reconcile_postprocess_job(self.storage, self.project_id, self.scene_1_id, job["postprocess_job_id"], client=client)
+        self.assertEqual(first["state"], POSTPROCESS_SUBMITTED)
+        self.assertEqual(first["reconciliation"]["absence_confirmations"], 1)
+
+        second = reconcile_postprocess_job(self.storage, self.project_id, self.scene_1_id, job["postprocess_job_id"], client=client)
+        self.assertEqual(second["state"], POSTPROCESS_FAILED)
+        self.assertEqual(second["failure"]["code"], "POSTPROCESS_JOB_ORPHANED")
+        self.assertEqual(second["reconciliation"]["state"], "ORPHANED")
+
+    def test_cancellation_uses_running_operation_and_persists_transport_failure(self):
+        self._setup_final_scene(self.scene_1_id)
+        client = FakeComfyClientForPostprocess(prompt_id="prompt-cancel-1")
+        job = submit_postprocess_job(
+            self.storage,
+            self.project_id,
+            self.scene_1_id,
+            method="rtx_vsr_fast",
+            client=client,
+            final_scene_selector="video.mp4",
+            output_prefix="cancel_prefix",
+            node_types={"VHS_LoadVideo", "RTXVideoSuperResolution", "VHS_VideoCombine"},
+            hardware_supported=True,
+        )
+        client.queue_running = [{"prompt_id": job["comfy_prompt_id"]}]
+        cancelled = cancel_postprocess_job(self.storage, self.project_id, self.scene_1_id, client=client)
+        self.assertEqual(cancelled["state"], POSTPROCESS_CANCELLED)
+        self.assertEqual(client.interrupt_calls, [job["comfy_prompt_id"]])
+        self.assertEqual(cancelled["cancel"]["mode"], "running_interrupt")
+        self.assertTrue(cancelled["cancel"]["confirmed"])
+        self.assertEqual(cancelled["cancel"]["confirmation_state"], "CONFIRMED")
+
+        class FailingInterruptClient(FakeComfyClientForPostprocess):
+            def interrupt_running(self, prompt_id):
+                raise ComfyUIClientError("COMFYUI_INTERRUPT_FAILED", "interrupt failed", transient=True)
+
+        retry_client = FailingInterruptClient(prompt_id="prompt-cancel-2")
+        retry_job = submit_postprocess_job(
+            self.storage,
+            self.project_id,
+            self.scene_1_id,
+            method="rtx_vsr_fast",
+            client=retry_client,
+            final_scene_selector="video.mp4",
+            output_prefix="cancel_prefix_2",
+            node_types={"VHS_LoadVideo", "RTXVideoSuperResolution", "VHS_VideoCombine"},
+            hardware_supported=True,
+        )
+        retry_client.queue_running = [{"prompt_id": retry_job["comfy_prompt_id"]}]
+        cancelled_with_error = cancel_postprocess_job(self.storage, self.project_id, self.scene_1_id, client=retry_client)
+        self.assertEqual(cancelled_with_error["state"], POSTPROCESS_SUBMITTED)
+        self.assertEqual(cancelled_with_error["cancel"]["error"]["code"], "COMFYUI_INTERRUPT_FAILED")
+        self.assertFalse(cancelled_with_error["cancel"]["confirmed"])
+        self.assertEqual(cancelled_with_error["cancel"]["outcome"], "UNCONFIRMED")
+
+    def test_absent_prompt_is_cancelled_with_unconfirmed_evidence(self):
+        self._setup_final_scene(self.scene_1_id)
+        client = FakeComfyClientForPostprocess(prompt_id="prompt-cancel-absent")
+        job = submit_postprocess_job(
+            self.storage,
+            self.project_id,
+            self.scene_1_id,
+            method="rtx_vsr_fast",
+            client=client,
+            final_scene_selector="video.mp4",
+            output_prefix="cancel_absent",
+            node_types={"VHS_LoadVideo", "RTXVideoSuperResolution", "VHS_VideoCombine"},
+            hardware_supported=True,
+        )
+        cancelled = cancel_postprocess_job(self.storage, self.project_id, self.scene_1_id, client=client)
+        self.assertEqual(cancelled["state"], POSTPROCESS_SUBMITTED)
+        self.assertFalse(cancelled["cancel"]["confirmed"])
+        self.assertEqual(cancelled["cancel"]["confirmation_state"], "UNCONFIRMED")
+        self.assertEqual(cancelled["cancel"]["outcome"], "UNCONFIRMED")
+        self.assertEqual(cancelled["cancel"]["evidence"], "queue_and_history_absent")
+        self.assertEqual(cancelled["comfy_prompt_id"], job["comfy_prompt_id"])
+
+    def test_terminal_history_is_not_overwritten_by_cancel(self):
+        self._setup_final_scene(self.scene_1_id)
+        client = FakeComfyClientForPostprocess(prompt_id="prompt-cancel-history")
+        job = submit_postprocess_job(
+            self.storage,
+            self.project_id,
+            self.scene_1_id,
+            method="rtx_vsr_fast",
+            client=client,
+            final_scene_selector="video.mp4",
+            output_prefix="cancel_history",
+            node_types={"VHS_LoadVideo", "RTXVideoSuperResolution", "VHS_VideoCombine"},
+            hardware_supported=True,
+        )
+        client.history_records[job["comfy_prompt_id"]] = {"status": {"status_str": "success", "completed": True}}
+        result = cancel_postprocess_job(self.storage, self.project_id, self.scene_1_id, client=client)
+        self.assertEqual(result["state"], POSTPROCESS_SUBMITTED)
+        self.assertFalse(result["cancel"]["confirmed"])
+        self.assertEqual(result["cancel"]["confirmation_state"], "HISTORY_TERMINAL")
+        self.assertEqual(result["cancel"]["outcome"], "NOT_CANCELLED_HISTORY_TERMINAL")
+
+    def test_scene_status_reconciles_active_job_before_summary(self):
+        self._setup_final_scene(self.scene_1_id)
+        client = FakeComfyClientForPostprocess(prompt_id="prompt-status-1")
+        job = submit_postprocess_job(
+            self.storage,
+            self.project_id,
+            self.scene_1_id,
+            method="rtx_vsr_fast",
+            client=client,
+            final_scene_selector="video.mp4",
+            output_prefix="status_prefix",
+            node_types={"VHS_LoadVideo", "RTXVideoSuperResolution", "VHS_VideoCombine"},
+            hardware_supported=True,
+        )
+        client.history_records[job["comfy_prompt_id"]] = {
+            "status": {"status_str": "error", "completed": True},
+        }
+        records = reconcile_scene_postprocess_jobs(self.storage, self.project_id, self.scene_1_id, client=client)
+        self.assertEqual(records[0]["state"], POSTPROCESS_FAILED)
+        self.assertEqual(records[0]["failure"]["code"], "COMFYUI_EXECUTION_FAILED")

@@ -2939,13 +2939,59 @@ function renderFinalizationLabel(state) {
     }[state] || "NOT AVAILABLE";
 }
 
+function renderCompletionProjection(job) {
+    return job?.completion && typeof job.completion === "object" ? job.completion : null;
+}
+
+function renderCompletionProjectionIsValid(job) {
+    const completion = renderCompletionProjection(job);
+    const rawOutput = completion?.raw_output;
+    return Boolean(completion)
+        && typeof completion.state === "string"
+        && typeof completion.finalization_allowed === "boolean"
+        && rawOutput
+        && typeof rawOutput === "object"
+        && typeof rawOutput.state === "string"
+        && typeof rawOutput.usable === "boolean";
+}
+
+function renderRawOutputProjection(job) {
+    const completion = renderCompletionProjection(job);
+    if (completion?.raw_output && typeof completion.raw_output === "object") {
+        return completion.raw_output;
+    }
+    const finalization = job?.finalization;
+    return finalization?.output_association && typeof finalization.output_association === "object"
+        ? finalization.output_association
+        : { state: "UNKNOWN", usable: false, failure: null };
+}
+
+function renderRawOutputAssociationState(job) {
+    const state = renderRawOutputProjection(job).state;
+    return typeof state === "string" ? state : "UNKNOWN";
+}
+
+function renderRawOutputAssociationLabel(state) {
+    return {
+        AVAILABLE: "AVAILABLE",
+        MISSING: "MISSING",
+        STALE: "STALE",
+        UNSAFE: "UNSAFE",
+        FOREIGN: "FOREIGN",
+        AMBIGUOUS: "AMBIGUOUS",
+        UNKNOWN: "UNKNOWN",
+    }[state] || "UNKNOWN";
+}
+
 function renderFinalizationState(job) {
     return job?.finalization?.state || "NOT_AVAILABLE";
 }
 
 function renderFinalizationEligible(job) {
+    const completion = renderCompletionProjection(job);
     const state = renderFinalizationState(job);
     return job?.state === "SUCCEEDED"
+        && completion?.finalization_allowed === true
         && job?.finalization?.eligible === true
         && ["RAW_READY", "STALE", "FAILED"].includes(state);
 }
@@ -2956,7 +3002,10 @@ function renderProductionSceneLabel(scene, job, state) {
     const jobCurrent = Boolean(job)
         && scene.preparation_status === "current"
         && job.preparation_fingerprint === scene.preparation_fingerprint;
-    const finalReady = job?.state === "SUCCEEDED" && finalizationState === "FINALIZED" && jobCurrent;
+    const finalReady = job?.state === "SUCCEEDED"
+        && renderCompletionProjection(job)?.finalization_allowed === true
+        && finalizationState === "FINALIZED"
+        && jobCurrent;
 
     if (upscaleMethod === "none") {
         return finalReady ? "READY" : "NOT READY";
@@ -3340,6 +3389,12 @@ function renderRenderState(root) {
         const jobCurrent = Boolean(job)
             && scene.preparation_status === "current"
             && job.preparation_fingerprint === scene.preparation_fingerprint;
+        const completion = renderCompletionProjection(job);
+        const rawAssociation = renderRawOutputProjection(job);
+        const rawAssociationState = renderRawOutputAssociationState(job);
+        const rawOutputLabel = completion?.state === "SUCCEEDED" && rawAssociation.usable === true
+            ? (jobCurrent ? "CURRENT" : "HISTORICAL")
+            : renderRawOutputAssociationLabel(rawAssociationState);
         const blockers = [...(Array.isArray(scene.blockers) ? scene.blockers : []), ...prompt.diagnostics];
         const ready = Boolean(scene.preparation_ready) && prompt.ready;
         const executionEligible = scene.execution_eligibility?.eligible === true;
@@ -3394,7 +3449,7 @@ function renderRenderState(root) {
             ["Requirements", scene.requirements_ready ? "READY" : "BLOCKED"],
             ["Preparation", scene.preparation_status === "current" ? "PREPARED" : scene.preparation_status === "stale" ? "RE-PREPARE" : ready ? "READY" : "BLOCKED"],
             ["Render job", job ? `${renderJobLabel(job.state)}${job.state === "SUCCEEDED" && !jobCurrent ? " · HISTORICAL" : ""}` : "NOT QUEUED"],
-            ["Raw H3", job?.output?.raw_h3_output && job.state === "SUCCEEDED" ? (jobCurrent ? "CURRENT" : "HISTORICAL") : "NOT AVAILABLE"],
+            ["Raw H3", rawOutputLabel],
             ["Final scene", renderFinalizationLabel(renderFinalizationState(job))],
             ["Production scene", renderProductionSceneLabel(scene, job, state)],
         ]) {
@@ -3430,16 +3485,15 @@ function renderRenderState(root) {
             detail.textContent = "Historical raw render retained; final scene output is stale for current scene inputs.";
         } else if (job?.state === "SUCCEEDED" && finalizationState === "RAW_READY") {
             detail.textContent = "Raw H3 output ready for finalization.";
-        } else if (job?.state === "SUCCEEDED" && job.output_discovery?.state === "FAILED") {
-            detail.textContent = job.output_discovery.failure?.message
-                ? `ComfyUI reported success, but raw H3 output discovery failed: ${job.output_discovery.failure.message}`
-                : "ComfyUI reported success, but raw H3 output discovery failed.";
+        } else if (job?.state === "SUCCEEDED" && completion?.finalization_allowed !== true) {
+            const failureMessage = rawAssociation.failure?.message || "Raw H3 output association is not usable.";
+            detail.textContent = `ComfyUI reported success, but raw H3 association is ${renderRawOutputAssociationLabel(rawAssociationState).toLowerCase()}: ${failureMessage}`;
         } else if (job?.state === "SUCCEEDED") {
-            detail.textContent = job.output?.relative_path && jobCurrent
+            detail.textContent = rawAssociation.usable === true && jobCurrent
                 ? "Raw H3 output ready."
-                : job.output?.relative_path
+                : rawAssociation.usable === true
                     ? "Historical raw H3 output retained."
-                    : "ComfyUI reported success, but no output association is available.";
+                    : "ComfyUI reported success, but no usable output association is available.";
         } else if (job?.state === "FAILED") {
             detail.textContent = job.failure?.message || "The render job failed.";
         } else if (job?.state === "UNKNOWN") {
@@ -3493,7 +3547,9 @@ function renderRenderState(root) {
             : executionEligible
                 ? "Submit the current project-owned preparation package to local ComfyUI."
                 : (scene.execution_eligibility?.blockers?.[0]?.message || "Current scene execution requirements are not ready.");
-        const retryableJob = Boolean(job && ["FAILED", "CANCELLED", "INTERRUPTED", "ORPHANED"].includes(job.state));
+        const retryableJob = Boolean(job
+            && completion?.retry_available === true
+            && ["FAILED", "CANCELLED", "INTERRUPTED", "ORPHANED"].includes(job.state));
         if (!retryableJob) {
             actions.append(renderButton);
         }
@@ -3630,6 +3686,9 @@ async function loadRenderJobs(root, silent = false) {
         }
         if (!payload || payload.project_id !== projectId || !Array.isArray(payload.jobs)) {
             throw new Error("Render jobs response was invalid.");
+        }
+        if (payload.jobs.some((job) => job && typeof job.scene_id === "string" && typeof job.job_id === "string" && !renderCompletionProjectionIsValid(job))) {
+            throw new Error("Render lifecycle projection was invalid; refresh the Builder backend.");
         }
         builderState.renderJobs = Object.fromEntries(
             payload.jobs

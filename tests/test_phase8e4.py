@@ -189,7 +189,7 @@ class TestPhase8EFinalizationAndPromotion(Phase8ETestBase):
             record,
             POSTPROCESS_SUCCEEDED,
             reason="done",
-            updates={"output": {"local_path": str(raw_upscale), "filename": "upscaled_raw.mp4"}},
+            updates={"output": {"local_path": str(raw_upscale), "relative_path": "upscaled_raw.mp4", "filename": "upscaled_raw.mp4"}},
         )
         store.save(record)
 
@@ -200,6 +200,7 @@ class TestPhase8EFinalizationAndPromotion(Phase8ETestBase):
             self.scene_1_id,
             record["postprocess_job_id"],
             media_adapter=adapter,
+            raw_output_root=self.output_root,
         )
 
         self.assertEqual(promoted["state"], "FINALIZED")
@@ -210,6 +211,58 @@ class TestPhase8EFinalizationAndPromotion(Phase8ETestBase):
         summary = summarize_production_scene(self.storage, self.project_id, self.scene_1_id, method="rtx_vsr_fast")
         self.assertEqual(summary["state"], "CURRENT")
         self.assertIsNotNone(summary["output"])
+
+    def test_stale_final_scene_rejects_postprocess_finalization(self):
+        self._setup_final_scene(self.scene_1_id)
+        raw_upscale = self.output_root / "stale_source_raw.mp4"
+        raw_upscale.write_bytes(b"UPSCALED_RAW_VIDEO")
+        fingerprint = summarize_production_scene(self.storage, self.project_id, self.scene_1_id, method="rtx_vsr_fast")["fingerprint"]
+        record = new_postprocess_job_record(self.project_id, self.scene_1_id, "rtx_vsr_fast", production_fingerprint=fingerprint)
+        record = transition_postprocess_job(
+            record,
+            POSTPROCESS_SUCCEEDED,
+            reason="done",
+            updates={"output": {"local_path": str(raw_upscale), "relative_path": "stale_source_raw.mp4", "filename": "stale_source_raw.mp4"}},
+        )
+        PostprocessJobStore(self.storage).save(record)
+        final_file = self.storage.project_directory(self.project_id) / "renders" / self.scene_1_id / "final" / "final_scene.mp4"
+        final_file.write_bytes(b"CHANGED_FINAL_SCENE")
+        with self.assertRaises(ProductionNotReady) as context:
+            finalize_postprocess_job(
+                self.storage,
+                self.project_id,
+                self.scene_1_id,
+                record["postprocess_job_id"],
+                media_adapter=FakeProductionMediaAdapter(),
+                raw_output_root=self.output_root,
+            )
+        self.assertEqual(context.exception.code, "POSTPROCESS_SOURCE_STALE")
+
+    def test_legacy_local_path_must_remain_inside_owned_output_root(self):
+        self._setup_final_scene(self.scene_1_id)
+        raw_upscale = self.output_root / "upscaled_raw.mp4"
+        raw_upscale.write_bytes(b"UPSCALED_RAW_VIDEO")
+        outside = Path(self.temp_dir.name) / "outside.mp4"
+        outside.write_bytes(b"FOREIGN_HOST_FILE")
+        fingerprint = summarize_production_scene(self.storage, self.project_id, self.scene_1_id, method="rtx_vsr_fast")["fingerprint"]
+        record = new_postprocess_job_record(self.project_id, self.scene_1_id, "rtx_vsr_fast", production_fingerprint=fingerprint)
+        record = transition_postprocess_job(
+            record,
+            POSTPROCESS_SUCCEEDED,
+            reason="done",
+            updates={"output": {"local_path": str(outside), "relative_path": "upscaled_raw.mp4", "filename": "upscaled_raw.mp4"}},
+        )
+        PostprocessJobStore(self.storage).save(record)
+        with self.assertRaises(RenderProductionError) as context:
+            finalize_postprocess_job(
+                self.storage,
+                self.project_id,
+                self.scene_1_id,
+                record["postprocess_job_id"],
+                media_adapter=FakeProductionMediaAdapter(),
+                raw_output_root=self.output_root,
+            )
+        self.assertEqual(context.exception.code, "POSTPROCESS_OUTPUT_UNSAFE")
 
     def test_failure_isolation_leaves_final_scene_intact(self):
         self._setup_final_scene(self.scene_1_id, content=b"PROTECTED_FINAL_SCENE")
@@ -225,7 +278,7 @@ class TestPhase8EFinalizationAndPromotion(Phase8ETestBase):
             record,
             POSTPROCESS_SUCCEEDED,
             reason="done",
-            updates={"output": {"local_path": str(raw_upscale), "filename": "upscaled_raw.mp4"}},
+            updates={"output": {"local_path": str(raw_upscale), "relative_path": "upscaled_raw.mp4", "filename": "upscaled_raw.mp4"}},
         )
         store.save(record)
 
@@ -238,6 +291,7 @@ class TestPhase8EFinalizationAndPromotion(Phase8ETestBase):
                 self.scene_1_id,
                 record["postprocess_job_id"],
                 media_adapter=adapter,
+                raw_output_root=self.output_root,
             )
 
         # Production summary is FAILED

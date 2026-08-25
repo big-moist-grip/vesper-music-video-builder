@@ -1,5 +1,6 @@
 import json
 import tempfile
+from copy import deepcopy
 import unittest
 import uuid
 from pathlib import Path
@@ -29,7 +30,10 @@ from backend.render_jobs import (
     TargetHardwareQualification,
     cancel_render_job,
     discover_raw_output,
+    evaluate_raw_output_association,
+    is_raw_output_usable,
     new_job_record,
+    render_completion_summary,
     reconcile_project_jobs,
     retry_render_job,
     submit_render_job,
@@ -459,6 +463,72 @@ class Phase8BTestCase(unittest.TestCase):
         self.assertIsNone(job["failure"])
         self.assertEqual(job["output_discovery"]["state"], "FAILED")
         self.assertEqual(job["output_discovery"]["failure"]["code"], "OUTPUT_NODE_MISSING")
+        self.assertEqual(job["completion"]["state"], "SUCCEEDED_OUTPUT_UNAVAILABLE")
+        self.assertEqual(job["completion"]["association_state"], "MISSING")
+        self.assertEqual(job["completion"]["raw_output"]["state"], "MISSING")
+        self.assertFalse(job["completion"]["finalization_allowed"])
+        self.assertFalse(is_raw_output_usable(job, output_root=Path(self.temp_directory.name)))
+
+    def test_discovered_output_becomes_stale_when_file_is_removed(self):
+        submitted = self._submit()
+        relative = f"{submitted['production_output']['filename_prefix']}_00001_.mp4"
+        output_root, target = self._write_output(relative)
+        self.client.pending.remove(submitted["comfy_prompt_id"])
+        self.client.history[submitted["comfy_prompt_id"]] = self._success_history(submitted["comfy_prompt_id"], relative=relative)
+        result = reconcile_project_jobs(self.storage, self.project_id, client=self.client, output_root=output_root)
+        job = result["jobs"][0]
+        self.assertEqual(evaluate_raw_output_association(job, output_root=output_root)["state"], "AVAILABLE")
+        target.unlink()
+        association = evaluate_raw_output_association(job, output_root=output_root)
+        self.assertEqual(association["state"], "STALE")
+        self.assertFalse(association["usable"])
+
+    def test_association_projection_preserves_required_failure_states(self):
+        root = Path(self.temp_directory.name)
+        base = {
+            "state": SUCCEEDED,
+            "comfy_prompt_id": "owned-prompt",
+            "production_output": {"node_id": "20"},
+            "output_discovery": {"state": "AVAILABLE", "failure": None},
+            "output": {
+                "raw_h3_output": True,
+                "prompt_id": "owned-prompt",
+                "output_node_id": "20",
+                "filename": "owned.mp4",
+                "subfolder": "",
+                "relative_path": "owned.mp4",
+            },
+        }
+        cases = {
+            "MISSING": {"output_discovery": {"state": "FAILED", "failure": {"code": "OUTPUT_NODE_MISSING", "message": "missing"}}},
+            "STALE": {},
+            "UNSAFE": {"output": {"subfolder": ".."}},
+            "FOREIGN": {"output": {"prompt_id": "foreign-prompt"}},
+            "AMBIGUOUS": {"output_discovery": {"state": "FAILED", "failure": {"code": "OUTPUT_AMBIGUOUS", "message": "ambiguous"}}},
+            "UNKNOWN": {"output_discovery": None},
+        }
+        for expected, patch in cases.items():
+            job = deepcopy(base)
+            if "output_discovery" in patch:
+                job["output_discovery"] = patch["output_discovery"]
+            if "output" in patch:
+                job["output"].update(patch["output"])
+            association = evaluate_raw_output_association(job, output_root=root)
+            self.assertEqual(association["state"], expected, expected)
+            self.assertFalse(association["usable"])
+
+    def test_default_output_root_is_checked_when_callers_omit_it(self):
+        submitted = self._submit()
+        relative = f"{submitted['production_output']['filename_prefix']}_00001_.mp4"
+        output_root, target = self._write_output(relative)
+        self.client.pending.remove(submitted["comfy_prompt_id"])
+        self.client.history[submitted["comfy_prompt_id"]] = self._success_history(submitted["comfy_prompt_id"], relative=relative)
+        result = reconcile_project_jobs(self.storage, self.project_id, client=self.client, output_root=output_root)
+        job = result["jobs"][0]
+        with patch("backend.render_jobs._default_comfy_output_root", return_value=output_root):
+            self.assertTrue(is_raw_output_usable(job))
+            target.unlink()
+            self.assertFalse(is_raw_output_usable(job))
 
     def test_queued_cancel_uses_owned_prompt_id_and_reconciles_cancelled(self):
         submitted = self._submit()

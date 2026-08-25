@@ -4,9 +4,12 @@ import inspect
 from pathlib import Path
 
 from backend.projects import ProjectStorage
+from backend.routes import parse_batch_selection_payload
 from backend.render_batch import (
     BATCH_PAUSED,
     BATCH_RUNNING,
+    BATCH_TICK_TRANSITION_BUDGET,
+    ITEM_RENDERING,
     BatchStore,
     RenderBatchConflict,
     RenderBatchError,
@@ -134,6 +137,42 @@ class BatchSecurityTests(Phase8DBase):
                     "updated_at",
                 },
             )
+
+
+class V20BatchLifecycleTests(Phase8DBase):
+    def test_selected_scene_uses_selected_readiness_not_unrelated_global_gate(self):
+        self.global_workflow_ready = False
+        self.scene_overrides[self.scene_ids[0]] = {"workflow_ready": True}
+        self.scene_overrides[self.scene_ids[1]] = {"workflow_ready": False}
+        self.start(scene_ids=[self.scene_ids[0]])
+        runner = self.make_runner()
+        record = runner.tick()
+        self.assertEqual(record["state"], BATCH_RUNNING)
+        self.assertEqual(self.item_by_scene(record, self.scene_ids[0])["disposition"], ITEM_RENDERING)
+
+    def test_tick_transition_drain_is_bounded_without_recursion(self):
+        self.start(scene_ids=[self.scene_ids[0]])
+        runner = self.make_runner()
+        calls = []
+        original_record = runner._store().load_active(self.project_id)
+
+        def synthetic_tick_once():
+            calls.append(len(calls))
+            if len(calls) < BATCH_TICK_TRANSITION_BUDGET + 5:
+                runner._request_next_tick(original_record)
+            return original_record
+
+        runner._tick_once = synthetic_tick_once
+        result = runner.tick()
+        self.assertIs(result, original_record)
+        self.assertEqual(len(calls), BATCH_TICK_TRANSITION_BUDGET)
+        self.assertEqual(runner._last_tick_steps, BATCH_TICK_TRANSITION_BUDGET)
+
+    def test_malformed_batch_body_is_not_treated_as_all_ready(self):
+        with self.assertRaises(ValueError):
+            parse_batch_selection_payload(None, body_present=True)
+        self.assertIsNone(parse_batch_selection_payload(None, body_present=False))
+        self.assertIsNone(parse_batch_selection_payload({}, body_present=True))
 
 
 class ManualActionGateTests(Phase8DBase):

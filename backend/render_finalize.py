@@ -40,6 +40,7 @@ from .render_jobs import (
     SUCCEEDED,
     JobStore,
     RenderOutputDiscoveryError,
+    evaluate_raw_output_association,
     _default_comfy_output_root,
     _safe_relative_output,
     _scene_lock,
@@ -83,6 +84,16 @@ NON_RETRYABLE_RAW_FAILURE_CODES = frozenset({
     "RAW_VIDEO_INVALID",
     "RAW_VIDEO_FPS_UNSUPPORTED",
     "RAW_VIDEO_DURATION_UNKNOWN",
+})
+FINALIZATION_RETRYABLE_ERROR_CODES = frozenset({
+    "FINALIZATION_OUTPUT_FAILED",
+    "MEDIA_PROBE_FAILED",
+    "MEDIA_PROBE_TIMEOUT",
+    "MEDIA_TOOL_MISSING",
+    "MEDIA_TOOL_UNAVAILABLE",
+    "FINALIZATION_TIMEOUT",
+    "FINALIZATION_ENCODE_FAILED",
+    "FINAL_METADATA_WRITE_FAILED",
 })
 
 
@@ -425,30 +436,122 @@ def _relative_project_path(path: Path, root: Path) -> str:
         raise RenderFinalizationError("FINAL_PATH_UNSAFE", "The final scene output is outside the project workspace.") from error
 
 
+def _structured_finalization_error(
+    job: Mapping[str, object],
+    code: str,
+    message: str,
+    *,
+    output_root: Path | None,
+    details: Mapping[str, object] | None = None,
+) -> RenderFinalizationError:
+    error = RenderFinalizationError(code, message, details=dict(details or {}))
+    error.details.update(finalization_error_details(job, error, output_root=output_root))
+    return error
+
+
 def _resolve_raw_path(job: Mapping[str, object], *, output_root: Path | None) -> tuple[Path, str]:
+    association = evaluate_raw_output_association(job, output_root=output_root)
+    if association.get("usable") is not True:
+        failure = association.get("failure") if isinstance(association.get("failure"), Mapping) else {}
+        association_state = association.get("state")
+        failure_code = failure.get("code") if isinstance(failure.get("code"), str) else "RAW_OUTPUT_UNAVAILABLE"
+        code = failure_code if association_state in {"UNSAFE", "FOREIGN", "AMBIGUOUS"} else "RAW_OUTPUT_UNAVAILABLE"
+        message = failure.get("message") if isinstance(failure.get("message"), str) else "A usable Builder-owned raw H3 output is required before finalization."
+        raise _structured_finalization_error(
+            job,
+            code,
+            message,
+            output_root=output_root,
+            details={"output_association": association},
+        )
     output = job.get("output")
     prompt_id = job.get("comfy_prompt_id")
     if not isinstance(output, Mapping) or output.get("raw_h3_output") is not True or not isinstance(prompt_id, str):
-        raise RenderFinalizationError("RAW_OUTPUT_UNAVAILABLE", "A successful raw H3 output is required before finalization.")
+        raise _structured_finalization_error(
+            job,
+            "RAW_OUTPUT_UNAVAILABLE",
+            "A successful raw H3 output is required before finalization.",
+            output_root=output_root,
+            details={"output_association": association},
+        )
     if output.get("prompt_id") != prompt_id:
-        raise RenderFinalizationError("RAW_OUTPUT_PROMPT_MISMATCH", "The raw output is not associated with the owning render job.")
+        raise _structured_finalization_error(
+            job,
+            "RAW_OUTPUT_PROMPT_MISMATCH",
+            "The raw output is not associated with the owning render job.",
+            output_root=output_root,
+            details={"output_association": association},
+        )
     production_output = job.get("production_output")
     expected_node_id = production_output.get("node_id") if isinstance(production_output, Mapping) else None
     if isinstance(expected_node_id, str) and output.get("output_node_id") != expected_node_id:
-        raise RenderFinalizationError("RAW_OUTPUT_NODE_MISMATCH", "The raw output is not associated with the prepared production output node.")
+        raise _structured_finalization_error(
+            job,
+            "RAW_OUTPUT_NODE_MISMATCH",
+            "The raw output is not associated with the prepared production output node.",
+            output_root=output_root,
+            details={"output_association": association},
+        )
     filename = output.get("filename")
     subfolder = output.get("subfolder", "")
     recorded_relative = output.get("relative_path")
     if not isinstance(filename, str) or not isinstance(subfolder, str) or not isinstance(recorded_relative, str):
-        raise RenderFinalizationError("RAW_OUTPUT_RECORD_INVALID", "The durable raw output association is incomplete.")
+        raise _structured_finalization_error(
+            job,
+            "RAW_OUTPUT_RECORD_INVALID",
+            "The durable raw output association is incomplete.",
+            output_root=output_root,
+            details={"output_association": association},
+        )
     root = output_root or _default_comfy_output_root()
     try:
         resolved, relative = _safe_relative_output(root, subfolder, filename)
     except RenderOutputDiscoveryError as error:
-        raise RenderFinalizationError(error.code, error.message) from error
+        raise _structured_finalization_error(
+            job,
+            error.code,
+            error.message,
+            output_root=output_root,
+            details={"output_association": association},
+        ) from error
     if relative != recorded_relative.replace("\\", "/"):
-        raise RenderFinalizationError("RAW_OUTPUT_RECORD_INVALID", "The durable raw output association does not match ComfyUI history.")
+        raise _structured_finalization_error(
+            job,
+            "RAW_OUTPUT_RECORD_INVALID",
+            "The durable raw output association does not match ComfyUI history.",
+            output_root=output_root,
+            details={"output_association": association},
+        )
     return resolved, relative
+
+
+def finalization_error_details(
+    job: Mapping[str, object] | None,
+    error: RenderFinalizationError,
+    *,
+    output_root: Path | None = None,
+) -> dict[str, object]:
+    """Build a stable route-facing finalization failure projection."""
+
+    record = job if isinstance(job, Mapping) else {}
+    association = error.details.get("output_association") if isinstance(error.details, Mapping) else None
+    if not isinstance(association, Mapping):
+        association = evaluate_raw_output_association(record, output_root=output_root)
+    association_state = association.get("state") if isinstance(association.get("state"), str) else "UNKNOWN"
+    retry_available = association_state == "AVAILABLE" and error.code in FINALIZATION_RETRYABLE_ERROR_CODES
+    return {
+        "job_id": record.get("job_id"),
+        "scene_id": record.get("scene_id"),
+        "association_state": association_state,
+        "output_association": deepcopy(dict(association)),
+        "failure_reason": {
+            "code": error.code,
+            "message": error.message,
+            "details": deepcopy(dict(error.details)),
+        },
+        "retry_available": retry_available,
+        "retry_action": "RETRY_FINALIZATION" if retry_available else ("RENDER_SCENE" if association_state != "AVAILABLE" else None),
+    }
 
 
 def _scene_preflight(preflight: Mapping[str, object], scene_id: str) -> dict[str, object]:
@@ -806,6 +909,11 @@ def _current_finalization_state(
         "output": None,
         "failure": None,
     }
+    association = evaluate_raw_output_association(job, output_root=raw_output_root)
+    response["output_association"] = deepcopy(dict(association))
+    response["association_state"] = association.get("state", "UNKNOWN")
+    response["retry_available"] = False
+    response["finalization_allowed"] = False
     response["raw_current"] = False
     response["eligible"] = False
     if job.get("state") != SUCCEEDED or not isinstance(current, Mapping):
@@ -836,6 +944,7 @@ def _current_finalization_state(
             return response
         response["raw_current"] = True
         response["eligible"] = True
+        response["finalization_allowed"] = True
         timing = preparation.get("timing") if isinstance(preparation, Mapping) else None
         target_duration_ms = current.get("target_duration_ms", current.get("duration_ms"))
         if not isinstance(target_duration_ms, int) and isinstance(timing, Mapping):
@@ -862,7 +971,18 @@ def _current_finalization_state(
         failure = response.get("failure")
         if response["state"] == FINALIZATION_STATE_FAILED and isinstance(failure, Mapping) and failure.get("code") in NON_RETRYABLE_RAW_FAILURE_CODES:
             response["eligible"] = False
-    except RenderFinalizationError:
+            response["finalization_allowed"] = False
+    except RenderFinalizationError as error:
+        association = evaluate_raw_output_association(job, output_root=raw_output_root)
+        response["output_association"] = deepcopy(dict(association))
+        response["association_state"] = association.get("state", "UNKNOWN")
+        response["failure"] = {
+            "code": error.code,
+            "message": error.message,
+            **deepcopy(dict(error.details)),
+        }
+        response["retry_available"] = finalization_error_details(job, error, output_root=raw_output_root)["retry_available"]
+        response["finalization_allowed"] = False
         response["state"] = FINALIZATION_STATE_STALE if existing else FINALIZATION_STATE_NOT_AVAILABLE
     return response
 
@@ -1101,6 +1221,7 @@ def finalize_render_job(
 
 __all__ = [
     "FINALIZATION_POLICY_VERSION",
+    "FINALIZATION_RETRYABLE_ERROR_CODES",
     "FINALIZATION_SCHEMA_VERSION",
     "FINALIZATION_STATE_FAILED",
     "FINALIZATION_STATE_FINALIZED",
@@ -1114,6 +1235,7 @@ __all__ = [
     "MediaProbeAdapter",
     "RenderFinalizationError",
     "enrich_render_jobs_with_finalization",
+    "finalization_error_details",
     "finalize_render_job",
     "summarize_render_job_finalization",
 ]

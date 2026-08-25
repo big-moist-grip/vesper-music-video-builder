@@ -386,9 +386,14 @@ class Phase8C6FrontendContractTests(unittest.TestCase):
         self.assertNotIn("ComfyUI no longer reports this prompt; reconcile before retrying.", self.extension)
         self.assertIn("Boolean(job && renderJobIsActive(job))", self.extension)
 
-    def test_missed_completion_stops_polling_and_updates_raw_output_surface(self):
-        self.assertIn('job?.state === "SUCCEEDED" && job.output_discovery?.state === "FAILED"', self.extension)
-        self.assertIn('job.state === "SUCCEEDED"', self.extension)
+    def test_completion_projection_drives_raw_output_surface(self):
+        self.assertIn("function renderCompletionProjection(job)", self.extension)
+        self.assertIn("completion?.finalization_allowed === true", self.extension)
+        self.assertIn("renderRawOutputAssociationState(job)", self.extension)
+        self.assertIn("renderCompletionProjectionIsValid(job)", self.extension)
+        self.assertIn("Render lifecycle projection was invalid", self.extension)
+        self.assertNotIn("job.output_discovery", self.extension)
+        self.assertNotIn("job?.output", self.extension)
         self.assertIn('job?.state === "UNKNOWN"', self.extension)
 
 

@@ -71,19 +71,19 @@ from .render_batch import (
 from .render_finalize import (
     RenderFinalizationError,
     enrich_render_jobs_with_finalization,
+    finalization_error_details,
     finalize_render_job,
 )
 from .render_production import (
     POSTPROCESS_METHOD_NONE,
     PostprocessJobConflict,
-    PostprocessJobNotFound,
-    PostprocessJobStore,
     ProductionMethodUnavailable,
     ProductionNotReady,
     RenderProductionError,
     cancel_postprocess_job,
     get_project_production_status,
     materialize_final_scene_for_postprocess,
+    reconcile_scene_postprocess_jobs,
     resolve_project_production_method,
     retry_postprocess_job,
     set_project_production_method,
@@ -92,6 +92,7 @@ from .render_production import (
     validate_production_method,
 )
 from .render_jobs import (
+    JobStore,
     RenderJobError,
     RenderJobNotFound,
     cancel_render_job,
@@ -126,6 +127,48 @@ def health_payload():
         "service": "music-video-builder",
         "phase": 0,
     }
+
+
+def _request_has_body(request) -> bool:
+    """Distinguish an absent/empty request body from malformed non-empty JSON."""
+
+    content_length = getattr(request, "content_length", None)
+    if isinstance(content_length, int):
+        return content_length > 0
+    can_read_body = getattr(request, "can_read_body", None)
+    if isinstance(can_read_body, bool):
+        return can_read_body
+    headers = getattr(request, "headers", {})
+    if hasattr(headers, "get"):
+        length = headers.get("Content-Length")
+        if length is not None:
+            try:
+                return int(length) > 0
+            except (TypeError, ValueError):
+                return True
+    # An object that cannot expose any body metadata is safest to treat as
+    # containing a body when JSON parsing failed. Real aiohttp requests expose
+    # content_length or can_read_body, so empty bodies retain the all-ready path.
+    return True
+
+
+def parse_batch_selection_payload(payload: object, *, body_present: bool) -> list[str] | None:
+    """Validate the batch body while preserving empty-body all-ready semantics."""
+
+    if payload is None:
+        if body_present:
+            raise ValueError("Batch request body must contain valid JSON.")
+        return None
+    if not isinstance(payload, dict):
+        raise ValueError("Batch requests must be a JSON object.")
+    if not payload:
+        return None
+    if set(payload) != {"scene_ids"}:
+        raise ValueError("Batch selection accepts only scene_ids.")
+    scene_ids = payload["scene_ids"]
+    if not isinstance(scene_ids, list) or not scene_ids or any(not isinstance(item, str) or not item for item in scene_ids):
+        raise ValueError("scene_ids must be a non-empty list of scene identifiers.")
+    return scene_ids
 
 
 def register_routes():
@@ -167,7 +210,7 @@ def register_routes():
             payload["preflight"] = preflight
         return web.json_response(payload, status=status)
 
-    def render_job_error(error):
+    def render_job_error(error, *, extra_details=None):
         status = getattr(error, "status", 422)
         payload = {
             "error_code": error.code,
@@ -176,6 +219,9 @@ def register_routes():
         details = getattr(error, "details", None)
         if isinstance(details, dict):
             payload.update(details)
+        if isinstance(extra_details, dict):
+            payload.update(extra_details)
+            payload["details"] = dict(extra_details)
         return web.json_response(payload, status=status)
 
     @PromptServer.instance.routes.get("/music-video-builder/projects/{project_id}/render/preflight")
@@ -353,6 +399,8 @@ def register_routes():
         except ProjectValidationError:
             return api_error("Invalid project ID.", 400)
         payload = await read_json(request)
+        if payload is None and _request_has_body(request):
+            return api_error("Finalization request body must contain valid JSON.", 400)
         if payload is not None and (not isinstance(payload, dict) or payload):
             return api_error("Finalization does not accept raw paths, audio paths, or request fields.", 400)
         blocker = await asyncio.to_thread(manual_action_blocker, PROJECT_STORAGE, project_id)
@@ -367,7 +415,24 @@ def register_routes():
         except RenderJobError as error:
             return render_job_error(error)
         except RenderFinalizationError as error:
-            return render_job_error(error)
+            job_record = None
+            try:
+                job_record = await asyncio.to_thread(JobStore(PROJECT_STORAGE).find, project_id, job_id)
+            except (ProjectNotFoundError, ProjectValidationError, RenderJobError):
+                pass
+            if job_record is not None:
+                details = finalization_error_details(job_record, error)
+            else:
+                details = {
+                    "job_id": job_id,
+                    "scene_id": None,
+                    "association_state": "UNKNOWN",
+                    "output_association": {"state": "UNKNOWN", "usable": False, "failure": None},
+                    "failure_reason": {"code": error.code, "message": error.message, "details": dict(error.details)},
+                    "retry_available": False,
+                    "retry_action": None,
+                }
+            return render_job_error(error, extra_details=details)
         except ProjectPersistenceError:
             LOGGER.exception("Could not persist finalization state.")
             return api_error("Finalization state could not be persisted.", 500)
@@ -430,7 +495,7 @@ def register_routes():
         if blocker is not None:
             return api_error(blocker, 409)
 
-        async def _do_submit():
+        def _do_submit():
             project = PROJECT_STORAGE.load_project(project_id)
             method = resolve_project_production_method(project)
             if method == POSTPROCESS_METHOD_NONE:
@@ -496,7 +561,7 @@ def register_routes():
         if blocker is not None:
             return api_error(blocker, 409)
 
-        async def _do_retry():
+        def _do_retry():
             selector, _ = materialize_final_scene_for_postprocess(PROJECT_STORAGE, project_id, scene_id)
             output_prefix = f"mvb_{project_id}_{scene_id}_{uuid.uuid4().hex[:8]}"
             return retry_postprocess_job(
@@ -533,37 +598,32 @@ def register_routes():
             validate_entity_id(scene_id, "Scene ID")
         except ProjectValidationError:
             return api_error("Invalid project or scene ID.", 400)
-        try:
+        def _do_status():
             project = PROJECT_STORAGE.load_project(project_id)
             method = resolve_project_production_method(project)
+            jobs = reconcile_scene_postprocess_jobs(PROJECT_STORAGE, project_id, scene_id)
             summary = summarize_production_scene(PROJECT_STORAGE, project_id, scene_id, method=method)
-            store = PostprocessJobStore(PROJECT_STORAGE)
-            jobs = store.list_scene(project_id, scene_id)
+            return {"summary": summary, "jobs": jobs, "method": method}
+
+        try:
+            result = await asyncio.to_thread(_do_status)
         except ProjectNotFoundError:
             return api_error("Project was not found.", 404)
         except RenderProductionError as error:
             return render_job_error(error)
-        return web.json_response({"summary": summary, "jobs": jobs, "method": method})
+        except ProjectPersistenceError:
+            LOGGER.exception("Could not reconcile scene postprocess status.")
+            return api_error("Scene postprocess status could not be loaded.", 500)
+        return web.json_response(result)
 
     async def read_batch_selection(request):
         """Accept either no body/{} (all ready) or exactly {scene_ids: [...]}."""
 
         payload = await read_json(request)
-        if payload is None:
-            payload = {}
-        if not isinstance(payload, dict):
-            return None, api_error("Batch requests must be a JSON object.", 400)
-        if not payload:
-            return None, None
-        if set(payload) != {"scene_ids"}:
-            return None, api_error("Batch selection accepts only scene_ids.", 400)
-        scene_ids = payload["scene_ids"]
-        if (
-            not isinstance(scene_ids, list)
-            or not scene_ids
-            or any(not isinstance(item, str) or not item for item in scene_ids)
-        ):
-            return None, api_error("scene_ids must be a non-empty list of scene identifiers.", 400)
+        try:
+            scene_ids = parse_batch_selection_payload(payload, body_present=_request_has_body(request))
+        except ValueError as error:
+            return None, api_error(str(error), 400)
         return scene_ids, None
 
     async def run_batch_operation(request, operation, *, read_selection=False):
@@ -579,6 +639,8 @@ def register_routes():
                 return error_response
         else:
             payload = await read_json(request)
+            if payload is None and _request_has_body(request):
+                return api_error("Batch request body must contain valid JSON.", 400)
             if payload is not None and (not isinstance(payload, dict) or payload):
                 return api_error("Batch controls do not accept batch IDs, scene objects, or request fields.", 400)
         try:

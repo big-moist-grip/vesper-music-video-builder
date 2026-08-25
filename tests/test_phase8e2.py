@@ -26,6 +26,7 @@ from backend.render_production import (
     PRODUCTION_NEEDS_POSTPROCESS,
     PRODUCTION_NOT_AVAILABLE,
     PRODUCTION_STALE,
+    RenderProductionError,
     build_production_fingerprint,
     plan_production_scene,
     promote_production_scene,
@@ -130,6 +131,49 @@ class TestPhase8ENoneModeAndCurrentness(Phase8ETestBase):
         # Production is now STALE
         stale_summary = summarize_production_scene(self.storage, self.project_id, self.scene_1_id, method="rtx_vsr_fast")
         self.assertEqual(stale_summary["state"], PRODUCTION_STALE)
+
+    def test_tampered_production_output_is_not_current(self):
+        self._setup_final_scene(self.scene_1_id)
+        root = self.storage.project_directory(self.project_id)
+        summary = summarize_production_scene(self.storage, self.project_id, self.scene_1_id, method="rtx_vsr_fast")
+        candidate = root / "temp_candidate.mp4"
+        candidate.write_bytes(b"UPSCALED_OUTPUT")
+        promote_production_scene(
+            self.storage,
+            self.project_id,
+            self.scene_1_id,
+            method="rtx_vsr_fast",
+            fingerprint=summary["fingerprint"],
+            postprocess_job_id="00000000-0000-0000-0000-000000000001",
+            candidate_path=candidate,
+            relative_path=f"renders/{self.scene_1_id}/production/production_rtx_vsr_fast.mp4",
+            validation={"width": 1920, "height": 1088},
+        )
+        candidate.unlink()
+        output_path = root / "renders" / self.scene_1_id / "production" / "production_rtx_vsr_fast.mp4"
+        output_path.write_bytes(b"TAMPERED_OUTPUT")
+        tampered = summarize_production_scene(self.storage, self.project_id, self.scene_1_id, method="rtx_vsr_fast")
+        self.assertEqual(tampered["state"], PRODUCTION_STALE)
+
+    def test_promotion_rejects_traversal_output_path(self):
+        self._setup_final_scene(self.scene_1_id)
+        root = self.storage.project_directory(self.project_id)
+        candidate = root / "temp_candidate.mp4"
+        candidate.write_bytes(b"UPSCALED_OUTPUT")
+        summary = summarize_production_scene(self.storage, self.project_id, self.scene_1_id, method="rtx_vsr_fast")
+        with self.assertRaises(RenderProductionError) as context:
+            promote_production_scene(
+                self.storage,
+                self.project_id,
+                self.scene_1_id,
+                method="rtx_vsr_fast",
+                fingerprint=summary["fingerprint"],
+                postprocess_job_id="00000000-0000-0000-0000-000000000001",
+                candidate_path=candidate,
+                relative_path="../escape.mp4",
+                validation={},
+            )
+        self.assertEqual(context.exception.code, "PRODUCTION_PATH_UNSAFE")
 
 
 class TestPhase8EActionPlanning(Phase8ETestBase):

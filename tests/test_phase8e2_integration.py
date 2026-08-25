@@ -142,10 +142,12 @@ class TestPhase8E2ManualPostprocessLifecycle(Phase8ETestBase):
         self.assertEqual(job["state"], POSTPROCESS_SUBMITTED)
         self.assertEqual(job["method"], "rtx_vsr_fast")
 
-        # Cancel job
-        with patch.object(client, "interrupt", return_value=True, create=True):
-            cancelled = cancel_postprocess_job(self.storage, self.project_id, self.scene_1_id, client=client)
-            self.assertEqual(cancelled["state"], POSTPROCESS_CANCELLED)
+        # Cancel job through the queue-aware client operation.
+        client.queue_pending = [(0, job["comfy_prompt_id"])]
+        cancelled = cancel_postprocess_job(self.storage, self.project_id, self.scene_1_id, client=client)
+        self.assertEqual(cancelled["state"], POSTPROCESS_CANCELLED)
+        self.assertEqual(client.delete_calls, [job["comfy_prompt_id"]])
+        self.assertEqual(cancelled["cancel"]["mode"], "queued_delete")
 
         # Retry job
         client2 = FakeComfyClientForPostprocess(prompt_id="prompt-p1-retry")
@@ -161,6 +163,15 @@ class TestPhase8E2ManualPostprocessLifecycle(Phase8ETestBase):
         )
         self.assertEqual(retried["state"], POSTPROCESS_SUBMITTED)
         self.assertEqual(retried["comfy_prompt_id"], "prompt-p1-retry")
+
+    def test_postprocess_route_workers_are_sync_thread_targets(self):
+        routes = (Path(__file__).parents[1] / "backend" / "routes.py").read_text(encoding="utf-8")
+        self.assertIn("def _do_submit():", routes)
+        self.assertIn("def _do_retry():", routes)
+        self.assertIn("def _do_status():", routes)
+        self.assertIn("result = await asyncio.to_thread(_do_status)", routes)
+        self.assertNotIn("async def _do_submit():", routes)
+        self.assertNotIn("async def _do_retry():", routes)
 
 
 class TestPhase8E2BatchPlanningAndExecution(Phase8DBase):

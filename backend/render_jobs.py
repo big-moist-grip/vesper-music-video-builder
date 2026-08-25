@@ -111,6 +111,22 @@ LOCAL_API_DEFAULT_HOST = "127.0.0.1"
 LOCAL_API_DEFAULT_PORT = 8188
 LOCAL_API_TIMEOUT_MAX_SECONDS = 60.0
 OUTPUT_VIDEO_SUFFIXES = frozenset({".mp4", ".webm", ".mov", ".mkv"})
+RAW_OUTPUT_ASSOCIATION_AVAILABLE = "AVAILABLE"
+RAW_OUTPUT_ASSOCIATION_MISSING = "MISSING"
+RAW_OUTPUT_ASSOCIATION_STALE = "STALE"
+RAW_OUTPUT_ASSOCIATION_UNSAFE = "UNSAFE"
+RAW_OUTPUT_ASSOCIATION_FOREIGN = "FOREIGN"
+RAW_OUTPUT_ASSOCIATION_AMBIGUOUS = "AMBIGUOUS"
+RAW_OUTPUT_ASSOCIATION_UNKNOWN = "UNKNOWN"
+RAW_OUTPUT_ASSOCIATION_STATES = frozenset({
+    RAW_OUTPUT_ASSOCIATION_AVAILABLE,
+    RAW_OUTPUT_ASSOCIATION_MISSING,
+    RAW_OUTPUT_ASSOCIATION_STALE,
+    RAW_OUTPUT_ASSOCIATION_UNSAFE,
+    RAW_OUTPUT_ASSOCIATION_FOREIGN,
+    RAW_OUTPUT_ASSOCIATION_AMBIGUOUS,
+    RAW_OUTPUT_ASSOCIATION_UNKNOWN,
+})
 COMFYUI_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
 COMFYUI_ERROR_RESPONSE_MAX_BYTES = 64 * 1024
 COMFYUI_OBJECT_INFO_MAX_BYTES = 2 * 1024 * 1024
@@ -1843,6 +1859,21 @@ def _fallback_failure_document(error: RenderOutputDiscoveryError) -> dict[str, o
     }
 
 
+def _with_completion_summaries(
+    records: list[Mapping[str, object]],
+    *,
+    output_root: Path | None,
+) -> list[dict[str, object]]:
+    """Add derived raw-output completion state without mutating job records."""
+
+    result: list[dict[str, object]] = []
+    for record in records:
+        item = deepcopy(dict(record))
+        item["completion"] = render_completion_summary(item, output_root=output_root)
+        result.append(item)
+    return result
+
+
 def reconcile_project_jobs(
     storage: ProjectStorage,
     project_id: object,
@@ -1871,7 +1902,7 @@ def reconcile_project_jobs(
                 records = store.list_project(canonical_project_id)
                 return {
                     "project_id": canonical_project_id,
-                    "jobs": _overlay_telemetry_jobs(records, comfy),
+                    "jobs": _with_completion_summaries(_overlay_telemetry_jobs(records, comfy), output_root=output_root),
                     "warnings": warnings,
                     "capabilities": comfy.cancellation_capabilities(),
                 }
@@ -2135,7 +2166,7 @@ def reconcile_project_jobs(
         current_records = store.list_project(canonical_project_id)
         return {
             "project_id": canonical_project_id,
-            "jobs": _overlay_telemetry_jobs(current_records, comfy),
+            "jobs": _with_completion_summaries(_overlay_telemetry_jobs(current_records, comfy), output_root=output_root),
             "warnings": warnings,
             "capabilities": comfy.cancellation_capabilities(),
         }
@@ -2470,9 +2501,167 @@ def discover_raw_output(
     return next(iter(candidates.values()))
 
 
+def _raw_output_association_state(code: object, *, physical_check: bool = False) -> str:
+    """Map discovery failures to stable presentation/currentness states."""
+
+    normalized = str(code or "").upper()
+    if "AMBIGUOUS" in normalized:
+        return RAW_OUTPUT_ASSOCIATION_AMBIGUOUS
+    if normalized in {"OUTPUT_PROMPT_MISMATCH", "OUTPUT_NODE_MISMATCH", "OUTPUT_FOREIGN", "OUTPUT_PROMPT_ID_INVALID"} or "FOREIGN" in normalized:
+        return RAW_OUTPUT_ASSOCIATION_FOREIGN
+    if normalized in {"OUTPUT_PATH_UNSAFE", "OUTPUT_ROOT_INVALID", "OUTPUT_TYPE_INVALID"} or "UNSAFE" in normalized:
+        return RAW_OUTPUT_ASSOCIATION_UNSAFE
+    if normalized in {"OUTPUT_MISSING", "OUTPUT_NOT_FOUND", "OUTPUT_NODE_MISSING", "OUTPUT_ROOT_MISSING"} or "NOT_FOUND" in normalized:
+        return RAW_OUTPUT_ASSOCIATION_STALE if physical_check else RAW_OUTPUT_ASSOCIATION_MISSING
+    if normalized in {"OUTPUT_ROOT_UNAVAILABLE", "OUTPUT_ASSOCIATION_UNKNOWN", "OUTPUT_RECORD_INVALID"}:
+        return RAW_OUTPUT_ASSOCIATION_UNKNOWN
+    if "MISSING" in normalized:
+        return RAW_OUTPUT_ASSOCIATION_STALE if physical_check else RAW_OUTPUT_ASSOCIATION_MISSING
+    if "PATH" in normalized or "RECORD" in normalized:
+        return RAW_OUTPUT_ASSOCIATION_UNSAFE
+    return RAW_OUTPUT_ASSOCIATION_UNKNOWN
+
+
+def _raw_output_association_failure(
+    state: str,
+    code: str,
+    message: str,
+    *,
+    source_state: object = None,
+) -> dict[str, object]:
+    result = {
+        "state": state if state in RAW_OUTPUT_ASSOCIATION_STATES else RAW_OUTPUT_ASSOCIATION_UNKNOWN,
+        "usable": False,
+        "failure": {"code": code, "message": message},
+    }
+    if isinstance(source_state, str):
+        result["source_state"] = source_state
+    return result
+
+
+def evaluate_raw_output_association(
+    job: Mapping[str, object],
+    *,
+    output_root: Path | None = None,
+) -> dict[str, object]:
+    """Project the usable raw-output association for one successful job.
+
+    ComfyUI history success is intentionally separate from Builder output
+    usability.  The durable job remains a historical technical-success record,
+    while this derived result is the gate consumed by finalization and batch
+    orchestration.
+    """
+
+    if not isinstance(job, Mapping) or job.get("state") != SUCCEEDED:
+        return {"state": "NOT_APPLICABLE", "usable": False, "failure": None}
+    discovery = job.get("output_discovery")
+    if not isinstance(discovery, Mapping):
+        return _raw_output_association_failure(
+            RAW_OUTPUT_ASSOCIATION_UNKNOWN,
+            "OUTPUT_ASSOCIATION_UNKNOWN",
+            "Raw H3 output association has not been proved.",
+        )
+    discovery_state = discovery.get("state")
+    if discovery_state != RAW_OUTPUT_ASSOCIATION_AVAILABLE:
+        failure = discovery.get("failure") if isinstance(discovery.get("failure"), Mapping) else {}
+        failure_code = failure.get("code") if isinstance(failure.get("code"), str) else "OUTPUT_ASSOCIATION_UNKNOWN"
+        failure_message = failure.get("message") if isinstance(failure.get("message"), str) else "Raw H3 output association could not be established."
+        return _raw_output_association_failure(
+            _raw_output_association_state(failure_code),
+            failure_code,
+            failure_message,
+            source_state=discovery_state,
+        )
+    output = job.get("output")
+    prompt_id = job.get("comfy_prompt_id")
+    production_output = job.get("production_output")
+    if (
+        not isinstance(output, Mapping)
+        or output.get("raw_h3_output") is not True
+        or not isinstance(prompt_id, str)
+    ):
+        return _raw_output_association_failure(
+            RAW_OUTPUT_ASSOCIATION_UNKNOWN,
+            "OUTPUT_RECORD_INVALID",
+            "The recorded raw H3 output association is invalid.",
+        )
+    if output.get("prompt_id") != prompt_id:
+        return _raw_output_association_failure(
+            RAW_OUTPUT_ASSOCIATION_FOREIGN,
+            "OUTPUT_PROMPT_MISMATCH",
+            "The raw H3 output is not associated with the owning render job.",
+        )
+    expected_node = production_output.get("node_id") if isinstance(production_output, Mapping) else None
+    if isinstance(expected_node, str) and output.get("output_node_id") != expected_node:
+        return _raw_output_association_failure(
+            RAW_OUTPUT_ASSOCIATION_FOREIGN,
+            "OUTPUT_NODE_MISMATCH",
+            "The raw H3 output is not associated with the prepared output node.",
+        )
+    filename = output.get("filename")
+    subfolder = output.get("subfolder", "")
+    recorded_relative = output.get("relative_path")
+    if not isinstance(filename, str) or not isinstance(subfolder, str) or not isinstance(recorded_relative, str):
+        return _raw_output_association_failure(
+            RAW_OUTPUT_ASSOCIATION_UNKNOWN,
+            "OUTPUT_RECORD_INVALID",
+            "The recorded raw H3 output path is incomplete.",
+        )
+    try:
+        root = Path(output_root) if output_root is not None else _default_comfy_output_root()
+        _resolved, relative = _safe_relative_output(root, subfolder, filename)
+    except RenderOutputDiscoveryError as error:
+        return _raw_output_association_failure(
+            _raw_output_association_state(error.code, physical_check=True),
+            error.code,
+            error.message,
+        )
+    if relative != recorded_relative.replace("\\", "/"):
+        return _raw_output_association_failure(
+            RAW_OUTPUT_ASSOCIATION_UNSAFE,
+            "OUTPUT_RECORD_INVALID",
+            "The recorded raw H3 output path does not match its association fields.",
+        )
+    return {"state": RAW_OUTPUT_ASSOCIATION_AVAILABLE, "usable": True, "failure": None, "relative_path": recorded_relative.replace("\\", "/")}
+
+
+def is_raw_output_usable(job: Mapping[str, object], *, output_root: Path | None = None) -> bool:
+    """Return whether a successful Render Job has a usable Builder-owned output."""
+
+    return evaluate_raw_output_association(job, output_root=output_root).get("usable") is True
+
+
+def render_completion_summary(job: Mapping[str, object], *, output_root: Path | None = None) -> dict[str, object]:
+    """Return a derived completion state that never conflates history success with readiness."""
+
+    association = evaluate_raw_output_association(job, output_root=output_root)
+    job_state = job.get("state") if isinstance(job, Mapping) else None
+    if job_state == SUCCEEDED and association.get("usable") is True:
+        state = "SUCCEEDED"
+    elif job_state == SUCCEEDED:
+        state = "SUCCEEDED_OUTPUT_UNAVAILABLE"
+    else:
+        state = job_state if isinstance(job_state, str) else "UNKNOWN"
+    return {
+        "state": state,
+        "job_state": job_state,
+        "raw_output": association,
+        "association_state": association.get("state", RAW_OUTPUT_ASSOCIATION_UNKNOWN),
+        "finalization_allowed": association.get("usable") is True,
+        "retry_available": job_state in {FAILED, CANCELLED, INTERRUPTED, ORPHANED},
+    }
+
+
 __all__ = [
     "ACTIVE_STATES",
     "CANCELLED",
+    "RAW_OUTPUT_ASSOCIATION_AMBIGUOUS",
+    "RAW_OUTPUT_ASSOCIATION_AVAILABLE",
+    "RAW_OUTPUT_ASSOCIATION_FOREIGN",
+    "RAW_OUTPUT_ASSOCIATION_MISSING",
+    "RAW_OUTPUT_ASSOCIATION_STALE",
+    "RAW_OUTPUT_ASSOCIATION_UNKNOWN",
+    "RAW_OUTPUT_ASSOCIATION_UNSAFE",
     "CANCEL_REQUESTED",
     "ComfyUIClient",
     "ComfyUIClientError",
@@ -2501,9 +2690,12 @@ __all__ = [
     "cancel_render_job",
     "default_target_hardware_qualification",
     "discover_raw_output",
+    "evaluate_raw_output_association",
     "discover_raw_output_fallback",
+    "is_raw_output_usable",
     "new_job_record",
     "reconcile_project_jobs",
+    "render_completion_summary",
     "retry_render_job",
     "submit_render_job",
     "transition_job",

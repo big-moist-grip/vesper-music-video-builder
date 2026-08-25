@@ -58,6 +58,7 @@ from .render_jobs import (
     ComfyUIClientError,
     JobStore,
     RenderExecutionBlocked,
+    is_raw_output_usable,
     RenderJobConflict,
     RenderJobError,
     RenderJobSubmissionError,
@@ -223,6 +224,7 @@ RETRYABLE_ITEM_DISPOSITIONS = frozenset({
 })
 
 RECONCILIATION_FAILURE_PAUSE_THRESHOLD = 15
+BATCH_TICK_TRANSITION_BUDGET = 64
 SYSTEMIC_COMFYUI_CODES = frozenset({
     "COMFYUI_UNAVAILABLE",
     "COMFYUI_TRANSPORT_FAILED",
@@ -909,6 +911,8 @@ class BatchRunner:
         self._thread: threading.Thread | None = None
         self._reconcile_failures = 0
         self._post_recovery_hold = False
+        self._tick_requested = False
+        self._last_tick_steps = 0
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -997,13 +1001,15 @@ class BatchRunner:
         self,
         preflight: Mapping[str, object],
         *,
+        scene_preflight: Mapping[str, object] | None = None,
         needs_finalization: bool,
         upscale_method: str = "none",
     ) -> tuple[str, str] | None:
-        if preflight.get("workflow_ready") is not True:
-            return ("WORKFLOW_CONTRACT_INVALID", "Batch paused: the production workflow contract is not ready.")
-        if preflight.get("runtime_requirements_ready") is not True:
-            return ("RUNTIME_REQUIREMENTS_CHANGED", "Batch paused: runtime requirements changed.")
+        readiness = scene_preflight if isinstance(scene_preflight, Mapping) else preflight
+        if readiness.get("workflow_ready") is not True:
+            return ("WORKFLOW_CONTRACT_INVALID", "Batch paused: the selected scene workflow contract is not ready.")
+        if readiness.get("runtime_requirements_ready") is not True:
+            return ("RUNTIME_REQUIREMENTS_CHANGED", "Batch paused: the selected scene runtime requirements are not ready.")
         if needs_finalization and find_ffmpeg() is None:
             return ("MEDIA_TOOL_MISSING", "Batch paused: FFmpeg is not available for finalization.")
         if upscale_method != POSTPROCESS_METHOD_NONE:
@@ -1054,23 +1060,40 @@ class BatchRunner:
     # -- tick: one bounded orchestration step -------------------------------
 
     def tick(self) -> dict[str, object] | None:
-        """Advance the batch by one bounded step and return the fresh record.
+        """Advance the batch through a bounded iterative transition drain.
 
-        Tests drive this directly for deterministic structural evidence; the
-        production thread loop calls it repeatedly.
+        A stable item may request another local transition, but those requests
+        are serviced by this loop rather than by recursive calls.  The runner
+        thread will continue on the next poll when the per-tick budget is
+        exhausted.
         """
 
         with self.lock:
-            store = self._store()
-            record = store.load_active(self.project_id)
-            if record is None or record["state"] not in EXECUTING_BATCH_STATES:
-                return record
-            if record.get("pause_requested") is True and not self._has_active_item(record):
-                return self._enter_paused(record)
-            item_index = self._current_active_item_index(record)
-            if item_index is None:
-                return self._select_and_dispatch_next(record)
-            return self._advance_active_item(record, item_index)
+            record: dict[str, object] | None = None
+            self._last_tick_steps = 0
+            for step in range(BATCH_TICK_TRANSITION_BUDGET):
+                self._tick_requested = False
+                record = self._tick_once()
+                self._last_tick_steps = step + 1
+                if not self._tick_requested:
+                    break
+            return record
+
+    def _tick_once(self) -> dict[str, object] | None:
+        store = self._store()
+        record = store.load_active(self.project_id)
+        if record is None or record["state"] not in EXECUTING_BATCH_STATES:
+            return record
+        if record.get("pause_requested") is True and not self._has_active_item(record):
+            return self._enter_paused(record)
+        item_index = self._current_active_item_index(record)
+        if item_index is None:
+            return self._select_and_dispatch_next(record)
+        return self._advance_active_item(record, item_index)
+
+    def _request_next_tick(self, record: dict[str, object]) -> dict[str, object]:
+        self._tick_requested = True
+        return record
 
     def _has_active_item(self, record: Mapping[str, object]) -> bool:
         if self._current_active_item_index(record) is not None:
@@ -1149,7 +1172,7 @@ class BatchRunner:
             record["items"][resume_index] = resume_item
             record["current_index"] = None
             saved = store.save(record)
-            return self.tick() if saved["state"] in EXECUTING_BATCH_STATES else saved
+            return self._request_next_tick(saved) if saved["state"] in EXECUTING_BATCH_STATES else saved
 
         next_index = None
         if isinstance(items, list):
@@ -1181,15 +1204,6 @@ class BatchRunner:
             preflight = self._current_preflight()
         except (ProjectPersistenceError, ProjectNotFoundError, OSError):
             return self._pause_for_attention(record, "STORAGE_UNAVAILABLE", "Batch paused: project state could not be read.")
-        method = record.get("production_profile", {}).get("upscale_method", "none")
-        systemic = self._systemic_runtime_check(
-            preflight,
-            needs_finalization=item.get("action") in {ACTION_FINALIZE_RAW, ACTION_RENDER_PREPARED, ACTION_PREPARE_AND_RENDER, ACTION_FINALIZE_AND_POSTPROCESS},
-            upscale_method=method,
-        )
-        if systemic is not None:
-            return self._pause_for_attention(record, systemic[0], systemic[1])
-
         scene_preflight = self._scene_preflight_entry(preflight, scene_id)
         if not isinstance(scene_preflight, Mapping):
             item["disposition"] = ITEM_SKIPPED
@@ -1198,7 +1212,17 @@ class BatchRunner:
             items[next_index] = item
             record["items"] = items
             saved = store.save(record)
-            return self.tick() if saved["state"] in EXECUTING_BATCH_STATES else saved
+            return self._request_next_tick(saved) if saved["state"] in EXECUTING_BATCH_STATES else saved
+
+        method = record.get("production_profile", {}).get("upscale_method", "none")
+        systemic = self._systemic_runtime_check(
+            preflight,
+            scene_preflight=scene_preflight,
+            needs_finalization=item.get("action") in {ACTION_FINALIZE_RAW, ACTION_RENDER_PREPARED, ACTION_PREPARE_AND_RENDER, ACTION_FINALIZE_AND_POSTPROCESS},
+            upscale_method=method,
+        )
+        if systemic is not None:
+            return self._pause_for_attention(record, systemic[0], systemic[1])
 
         reconciled = self._reconcile_scene(scene_id)
         jobs = reconciled["jobs"]
@@ -1241,7 +1265,7 @@ class BatchRunner:
                 reason,
             )
             saved = store.save(record)
-            return self.tick() if saved["state"] in EXECUTING_BATCH_STATES else saved
+            return self._request_next_tick(saved) if saved["state"] in EXECUTING_BATCH_STATES else saved
 
         if action == ACTION_ALREADY_COMPLETE:
             item["disposition"] = ITEM_ALREADY_COMPLETE
@@ -1250,7 +1274,7 @@ class BatchRunner:
             items[next_index] = item
             record["items"] = items
             saved = store.save(record)
-            return self.tick() if saved["state"] in EXECUTING_BATCH_STATES else saved
+            return self._request_next_tick(saved) if saved["state"] in EXECUTING_BATCH_STATES else saved
 
         record["current_index"] = next_index
         record = store.save(record)
@@ -1371,7 +1395,7 @@ class BatchRunner:
             item["disposition"] = ITEM_PENDING
             record["items"][index] = item
             saved = self._store().save(record)
-            return self.tick() if saved["state"] in EXECUTING_BATCH_STATES else saved
+            return self._request_next_tick(saved) if saved["state"] in EXECUTING_BATCH_STATES else saved
         # ITEM_RENDERING: reconcile the owned job through Phase 8B authority.
         job_id = item.get("job_id")
         job = self._find_job_record(job_id)
@@ -1428,6 +1452,14 @@ class BatchRunner:
     def _on_render_succeeded(self, record: dict[str, object], index: int, job: Mapping[str, object]) -> dict[str, object]:
         item = dict(record["items"][index])
         scene_id = str(item["scene_id"])
+        if not is_raw_output_usable(job, output_root=self.raw_output_root):
+            return self._fail_item(
+                record,
+                index,
+                "RAW_OUTPUT_UNAVAILABLE",
+                "ComfyUI reported render success, but no usable Builder-owned raw H3 output is available.",
+                disposition=ITEM_FINALIZATION_FAILED,
+            )
         # Currentness before automatic finalization: a scene edited while its
         # H3 job ran keeps the historical raw output without false promotion.
         try:
@@ -1474,9 +1506,20 @@ class BatchRunner:
         if job_id is None:
             # FINALIZE_RAW dispatch: select the newest current successful raw job.
             scene_jobs = jobs if jobs is not None else JobStore(self.storage).list_scene(self.project_id, scene_id)
-            succeeded = [job for job in scene_jobs if job.get("state") == SUCCEEDED]
+            succeeded = [
+                job
+                for job in scene_jobs
+                if job.get("state") == SUCCEEDED
+                and is_raw_output_usable(job, output_root=self.raw_output_root)
+            ]
             if not succeeded:
-                return self._fail_item(record, index, "RAW_OUTPUT_MISSING", "No successful raw H3 render is available to finalize.")
+                return self._fail_item(
+                    record,
+                    index,
+                    "RAW_OUTPUT_UNAVAILABLE",
+                    "No successful raw H3 render with a usable Builder-owned output is available to finalize.",
+                    disposition=ITEM_FINALIZATION_FAILED,
+                )
             job_id = str(succeeded[-1].get("job_id"))
         if find_ffmpeg() is None:
             return self._pause_for_attention(record, "MEDIA_TOOL_MISSING", "Batch paused: FFmpeg is not available for finalization.")
@@ -1748,7 +1791,7 @@ class BatchRunner:
             return self._enter_paused(record)
         if self._stop.is_set():
             return record
-        return self.tick()
+        return self._request_next_tick(record)
 
 
 # ---------------------------------------------------------------------------
@@ -2018,10 +2061,6 @@ def start_batch(
         project = storage.load_project(canonical_project_id)
         preflight = dict(preflight_builder(project, storage))
         systemic = None
-        if preflight.get("workflow_ready") is not True:
-            systemic = ("WORKFLOW_CONTRACT_INVALID", "Batch paused: the production workflow contract is not ready.")
-        elif preflight.get("runtime_requirements_ready") is not True:
-            systemic = ("RUNTIME_REQUIREMENTS_CHANGED", "Batch paused: runtime requirements changed.")
         reconciled = _reconcile_for_preview(storage, canonical_project_id, client, raw_output_root)
         plan = plan_batch(
             storage,
@@ -2032,6 +2071,30 @@ def start_batch(
             raw_output_root=raw_output_root,
             hardware_supported=hardware_supported,
         )
+        if scene_ids is None:
+            if preflight.get("workflow_ready") is not True:
+                systemic = ("WORKFLOW_CONTRACT_INVALID", "Batch paused: the production workflow contract is not ready.")
+            elif preflight.get("runtime_requirements_ready") is not True:
+                systemic = ("RUNTIME_REQUIREMENTS_CHANGED", "Batch paused: runtime requirements changed.")
+        else:
+            preflight_by_scene = {
+                entry.get("scene_id"): entry
+                for entry in preflight.get("scenes", [])
+                if isinstance(entry, Mapping)
+            }
+            eligible_scene_ids = {
+                entry.get("scene_id")
+                for entry in plan.get("scenes", [])
+                if isinstance(entry, Mapping) and entry.get("action") in ELIGIBLE_BATCH_ACTIONS
+            }
+            for selected_scene_id in eligible_scene_ids:
+                scene_preflight = preflight_by_scene.get(selected_scene_id)
+                if not isinstance(scene_preflight, Mapping) or scene_preflight.get("workflow_ready") is not True:
+                    systemic = ("WORKFLOW_CONTRACT_INVALID", "Batch paused: the selected scene workflow contract is not ready.")
+                    break
+                if scene_preflight.get("runtime_requirements_ready") is not True:
+                    systemic = ("RUNTIME_REQUIREMENTS_CHANGED", "Batch paused: the selected scene runtime requirements are not ready.")
+                    break
         eligible_entries = [entry for entry in plan["scenes"] if entry["action"] in ELIGIBLE_BATCH_ACTIONS]
         if not eligible_entries:
             raise RenderBatchError(

@@ -142,6 +142,8 @@ class FakeComfyClientForPostprocess:
         self.history_records: dict[str, dict[str, object]] = {}
         self.queue_pending: list[object] = []
         self.queue_running: list[object] = []
+        self.delete_calls: list[str] = []
+        self.interrupt_calls: list[str] = []
 
     def submit_prompt(self, workflow: dict[str, object]) -> dict[str, object]:
         if self.fail_submit:
@@ -161,6 +163,16 @@ class FakeComfyClientForPostprocess:
             entry = self.history_records.get(prompt_id)
             return {prompt_id: deepcopy(entry)} if entry is not None else {}
         return deepcopy(self.history_records)
+
+    def delete_queued(self, prompt_id: str):
+        self.delete_calls.append(prompt_id)
+        self.queue_pending = [item for item in self.queue_pending if not (isinstance(item, (list, tuple)) and len(item) > 1 and item[1] == prompt_id)]
+        return {"deleted": [prompt_id]}
+
+    def interrupt_running(self, prompt_id: str):
+        self.interrupt_calls.append(prompt_id)
+        self.queue_running = [item for item in self.queue_running if not (isinstance(item, (list, tuple)) and len(item) > 1 and item[1] == prompt_id)]
+        return {"interrupted": True}
 
 
 class Phase8ETestBase(unittest.TestCase):

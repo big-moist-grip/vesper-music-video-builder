@@ -573,6 +573,7 @@ class Phase8DBase(unittest.TestCase):
                     "format": "video/h264-mp4",
                     "raw_h3_output": True,
                 },
+                "output_discovery": {"state": "AVAILABLE", "failure": None},
             },
         )
         record["production_output"]["filename_prefix"] = f"{prefix}/{record['job_id']}"
